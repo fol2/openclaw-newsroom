@@ -1,44 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
+try:
+    from .._util import ALLOWED_FAILURE_TYPES, ValidationResult, as_int, is_non_empty_str
+except (ImportError, SystemError):
+    # Fallback for dynamic file-based loading (no parent package context).
+    import importlib.util as _iu
+    from pathlib import Path as _P
+    _spec = _iu.spec_from_file_location("_util", str(_P(__file__).resolve().parent.parent / "_util.py"))
+    _mod = _iu.module_from_spec(_spec)  # type: ignore[arg-type]
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    ALLOWED_FAILURE_TYPES = _mod.ALLOWED_FAILURE_TYPES  # type: ignore[assignment]
+    ValidationResult = _mod.ValidationResult  # type: ignore[assignment,misc]
+    as_int = _mod.as_int
+    is_non_empty_str = _mod.is_non_empty_str
 
-ALLOWED_FAILURE_TYPES = {
-    "discord_429",
-    "discord_403",
-    "discord_error",
-    "http_429",
-    "http_503",
-    "timeout",
-    "paywall",
-    "missing_data",
-    "validation_failed",
-    "unknown",
-}
-
-
-@dataclass(frozen=True)
-class ValidationResult:
-    ok: bool
-    errors: list[str]
-
-
-def _is_non_empty_str(v: Any) -> bool:
-    return isinstance(v, str) and v.strip() != ""
-
-
-def _as_int(v: Any) -> int | None:
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str) and v.strip().isdigit():
-        try:
-            return int(v.strip())
-        except ValueError:
-            return None
-    return None
+# Keep module-private aliases so call-sites stay unchanged.
+_is_non_empty_str = is_non_empty_str
+_as_int = as_int
 
 
 def validate(result_json: dict[str, Any], job: dict[str, Any]) -> ValidationResult:

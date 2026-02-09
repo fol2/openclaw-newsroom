@@ -11,7 +11,9 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+_RESERVATION_SECONDS = 600  # 10 minutes
 
 _DEFAULT_TTL_SECONDS = 48 * 3600  # 48 hours
 
@@ -106,6 +108,10 @@ class NewsPoolDB:
 
         if schema <= 4:
             self._migrate_to_v5(cur, from_version=schema)
+            schema = 5
+
+        if schema == 5:
+            self._migrate_to_v6(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -202,7 +208,7 @@ class NewsPoolDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_runs_state_key_run_ts ON pool_runs(state_key, run_ts);")
 
     def _create_events_table_v5(self, cur: sqlite3.Cursor) -> None:
-        """Create the new event-centric events table (v5)."""
+        """Create the new event-centric events table (v5+v6 columns)."""
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -224,7 +230,8 @@ class NewsPoolDB:
               posted_at_ts INTEGER,
               thread_id TEXT,
               run_id TEXT,
-              model TEXT
+              model TEXT,
+              reserved_until_ts INTEGER
             );
             """
         )
@@ -320,6 +327,11 @@ class NewsPoolDB:
                     "migrated_from_v4",
                 ),
             )
+
+    def _migrate_to_v6(self, cur: sqlite3.Cursor) -> None:
+        """Migrate from schema v5 to v6: add reserved_until_ts column."""
+        if not self._column_exists(cur, "events", "reserved_until_ts"):
+            cur.execute("ALTER TABLE events ADD COLUMN reserved_until_ts INTEGER;")
 
     @staticmethod
     def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
@@ -595,6 +607,50 @@ class NewsPoolDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def prune_expired_events(self, *, max_age_hours: int = 72, now_ts: int | None = None) -> int:
+        """Delete events that are expired AND older than max_age_hours.
+
+        Returns the number of pruned events.
+        Only prunes events with status != 'posted' (keep posted for audit trail).
+        Also nullifies event_id on orphaned links (no CASCADE on FK).
+        """
+        now = now_ts if now_ts is not None else _utc_now_ts()
+        age_cutoff = now - max_age_hours * 3600
+        cur = self._conn.cursor()
+
+        # Find event IDs to prune.
+        rows = cur.execute(
+            """
+            SELECT id FROM events
+            WHERE status != 'posted'
+              AND expires_at_ts < ?
+              AND created_at_ts < ?
+            """,
+            (now, age_cutoff),
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+
+        # Nullify event_id on orphaned links.
+        cur.execute(
+            f"UPDATE links SET event_id = NULL WHERE event_id IN ({placeholders})",
+            ids,
+        )
+
+        # Delete the expired events.
+        cur.execute(
+            f"DELETE FROM events WHERE id IN ({placeholders})",
+            ids,
+        )
+
+        n = len(ids)
+        logger.info("Pruned %d expired events (max_age_hours=%d)", n, max_age_hours)
+        return n
+
     def get_daily_candidates(self, *, limit: int = 15, now_ts: int | None = None) -> list[dict[str, Any]]:
         """Select events for daily posting with category balance and HK guarantee.
 
@@ -604,23 +660,49 @@ class NewsPoolDB:
         - Finance categories capped at 2
         - No single category > 3
         - Reserve 1-2 slots for jurisdiction='HK'
+        - Selected events are reserved for 10 minutes to prevent concurrent planners
+          from picking the same events.
         """
         now = now_ts if now_ts is not None else _utc_now_ts()
+        self.prune_expired_events(now_ts=now)
         cur = self._conn.cursor()
-        rows = cur.execute(
-            """
-            SELECT id, parent_event_id, category, jurisdiction, summary_en,
-                   development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts
-            FROM events
-            WHERE status IN ('new', 'active')
-              AND expires_at_ts > ?
-            ORDER BY link_count DESC, best_published_ts DESC
-            """,
-            (now,),
-        ).fetchall()
-        candidates = [dict(r) for r in rows]
-        selected = self._apply_daily_selection(candidates, limit=limit)
+
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+
+            rows = cur.execute(
+                """
+                SELECT id, parent_event_id, category, jurisdiction, summary_en,
+                       development, title, primary_url, link_count, best_published_ts,
+                       status, created_at_ts, updated_at_ts, expires_at_ts
+                FROM events
+                WHERE status IN ('new', 'active')
+                  AND expires_at_ts > ?
+                  AND (reserved_until_ts IS NULL OR reserved_until_ts < ?)
+                ORDER BY link_count DESC, best_published_ts DESC
+                """,
+                (now, now),
+            ).fetchall()
+            candidates = [dict(r) for r in rows]
+            selected = self._apply_daily_selection(candidates, limit=limit)
+
+            if selected:
+                reserve_ts = now + _RESERVATION_SECONDS
+                ids = [c["id"] for c in selected]
+                placeholders = ",".join("?" for _ in ids)
+                cur.execute(
+                    f"UPDATE events SET reserved_until_ts = ? WHERE id IN ({placeholders})",
+                    [reserve_ts] + ids,
+                )
+
+            cur.execute("COMMIT")
+        except Exception:
+            try:
+                cur.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
         return self._enrich_candidates(selected, now_ts=now)
 
     @staticmethod
@@ -696,52 +778,78 @@ class NewsPoolDB:
         2. Freshness (created_at_ts DESC)
         3. link_count DESC
         Category diversity: 2nd+ picks differ from 1st pick's category.
+        Selected events are reserved for 10 minutes to prevent concurrent planners
+        from picking the same events.
         """
         now = now_ts if now_ts is not None else _utc_now_ts()
+        self.prune_expired_events(now_ts=now)
         cur = self._conn.cursor()
-        rows = cur.execute(
-            """
-            SELECT id, parent_event_id, category, jurisdiction, summary_en,
-                   development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts
-            FROM events
-            WHERE status IN ('new', 'active')
-              AND expires_at_ts > ?
-            ORDER BY
-              (CASE WHEN parent_event_id IS NOT NULL THEN 0 ELSE 1 END) ASC,
-              created_at_ts DESC,
-              link_count DESC
-            """,
-            (now,),
-        ).fetchall()
-        candidates = [dict(r) for r in rows]
 
-        if not candidates:
-            return []
+        try:
+            cur.execute("BEGIN IMMEDIATE")
 
-        selected: list[dict[str, Any]] = []
-        first_category: str | None = None
+            rows = cur.execute(
+                """
+                SELECT id, parent_event_id, category, jurisdiction, summary_en,
+                       development, title, primary_url, link_count, best_published_ts,
+                       status, created_at_ts, updated_at_ts, expires_at_ts
+                FROM events
+                WHERE status IN ('new', 'active')
+                  AND expires_at_ts > ?
+                  AND (reserved_until_ts IS NULL OR reserved_until_ts < ?)
+                ORDER BY
+                  (CASE WHEN parent_event_id IS NOT NULL THEN 0 ELSE 1 END) ASC,
+                  created_at_ts DESC,
+                  link_count DESC
+                """,
+                (now, now),
+            ).fetchall()
+            candidates = [dict(r) for r in rows]
 
-        for c in candidates:
-            if len(selected) >= limit:
-                break
-            cat = c.get("category") or "Other"
-            if len(selected) == 0:
-                selected.append(c)
-                first_category = cat
-            elif cat != first_category:
-                selected.append(c)
-            # If same category as first and we already have 1, skip for diversity.
+            if not candidates:
+                cur.execute("COMMIT")
+                return []
 
-        # If we couldn't fill with diverse categories, fill with same category.
-        if len(selected) < limit:
-            used_ids = {c["id"] for c in selected}
+            selected: list[dict[str, Any]] = []
+            first_category: str | None = None
+
             for c in candidates:
                 if len(selected) >= limit:
                     break
-                if c["id"] not in used_ids:
+                cat = c.get("category") or "Other"
+                if len(selected) == 0:
                     selected.append(c)
-                    used_ids.add(c["id"])
+                    first_category = cat
+                elif cat != first_category:
+                    selected.append(c)
+                # If same category as first and we already have 1, skip for diversity.
+
+            # If we couldn't fill with diverse categories, fill with same category.
+            if len(selected) < limit:
+                used_ids = {c["id"] for c in selected}
+                for c in candidates:
+                    if len(selected) >= limit:
+                        break
+                    if c["id"] not in used_ids:
+                        selected.append(c)
+                        used_ids.add(c["id"])
+
+            if selected:
+                reserve_ts = now + _RESERVATION_SECONDS
+                ids = [c["id"] for c in selected]
+                placeholders = ",".join("?" for _ in ids)
+                cur.execute(
+                    f"UPDATE events SET reserved_until_ts = ? WHERE id IN ({placeholders})",
+                    [reserve_ts] + ids,
+                )
+
+            cur.execute("COMMIT")
+        except Exception:
+            try:
+                cur.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
         return self._enrich_candidates(selected, now_ts=now)
 
@@ -804,6 +912,13 @@ class NewsPoolDB:
             WHERE id = ?
             """,
             (now, thread_id, run_id, now, event_id),
+        )
+
+    def release_reservation(self, event_id: int) -> None:
+        """Clear the reservation on an event so it can be selected again."""
+        self._conn.execute(
+            "UPDATE events SET reserved_until_ts = NULL WHERE id = ?",
+            (event_id,),
         )
 
     def merge_events_into(self, *, winner_id: int, loser_ids: list[int]) -> int:

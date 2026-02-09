@@ -35,11 +35,11 @@ De-duplication + “already covered?” check (required):
 Discovery checklist (required; keep it fast):
 1) Run the recent-context script first (required).
 2) Run Brave News search exactly ONCE (preferred):
-   `python3 {{OPENCLAW_HOME}}/scripts/brave_news_pool.py --query \"breaking news\" --count 50 --freshness day --max-queries 1`
+   `python3 {{OPENCLAW_HOME}}/scripts/news_pool_update.py --query \"breaking news\" --count 50 --freshness day --max-queries 1`
    - This returns up to 50 recent news links in one API call.
    - Scan and categorise those results into our categories.
 3) Optional second Brave call ONLY if and only if nothing qualifies:
-   `python3 {{OPENCLAW_HOME}}/scripts/brave_news_pool.py --query \"Hong Kong entertainment\" --count 50 --freshness day --max-queries 1`
+   `python3 {{OPENCLAW_HOME}}/scripts/news_pool_update.py --query \"Hong Kong entertainment\" --count 50 --freshness day --max-queries 1`
 4) For any finalist candidate, use `agent-browser` (preferred) or the built-in `browser` tool to confirm publish time + a concrete anchor before creating the job.
 
 Selection constraints:

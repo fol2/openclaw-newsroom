@@ -5,6 +5,11 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from ._util import count_cjk
+
+# Keep module-private alias so call-sites stay unchanged.
+_count_cjk = count_cjk
+
 
 _READ_MORE_RANGE_RE = re.compile(r"read_more_urls_(\d+)_to_(\d+)")
 
@@ -19,21 +24,6 @@ def _domain(url: str) -> str:
         return (urlsplit(url).hostname or "").lower()
     except Exception:
         return ""
-
-
-def _count_cjk(text: str) -> int:
-    total = 0
-    for ch in (text or ""):
-        o = ord(ch)
-        if 0x3400 <= o <= 0x4DBF:  # CJK Unified Ideographs Extension A
-            total += 1
-        elif 0x4E00 <= o <= 0x9FFF:  # CJK Unified Ideographs
-            total += 1
-        elif 0x3000 <= o <= 0x303F:  # CJK Symbols and Punctuation
-            total += 1
-        elif 0xFF00 <= o <= 0xFFEF:  # Halfwidth and Fullwidth Forms
-            total += 1
-    return total
 
 
 def _dedupe_urls(urls: list[str]) -> list[str]:

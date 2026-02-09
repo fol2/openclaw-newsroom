@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openclaw-newsroom"
+version = "0.1.0"
+description = "Automated AI newsroom -- LLM clustering, multi-source news pool, Discord publishing."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.28",
+    "jsonschema>=4.0",
+    "lxml>=4.9",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+charts = ["Pillow>=10.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+gdelt-pool-update = "scripts._cli:gdelt_pool_update"
+news-pool-status = "scripts._cli:news_pool_status"
+news-pool-update = "scripts._cli:news_pool_update"
+newsroom-daily-inputs = "scripts._cli:newsroom_daily_inputs"
+newsroom-hourly-inputs = "scripts._cli:newsroom_hourly_inputs"
+newsroom-runner = "scripts._cli:newsroom_runner"
+newsroom-write-run-job = "scripts._cli:newsroom_write_run_job"
+rss-pool-update = "scripts._cli:rss_pool_update"
+
+[tool.hatch.build.targets.wheel]
+packages = ["newsroom", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["newsroom/tests"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]

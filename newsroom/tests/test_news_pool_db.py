@@ -4,17 +4,17 @@ import time
 import unittest
 from pathlib import Path
 
-from newsroom.news_pool_db import NewsPoolDB, PoolLink, SCHEMA_VERSION
+from newsroom.news_pool_db import NewsPoolDB, PoolLink, SCHEMA_VERSION, _RESERVATION_SECONDS
 
 
 class TestNewsPoolDBV5Fresh(unittest.TestCase):
     """Test fresh v5 database creation."""
 
-    def test_fresh_db_creates_v5_schema(self) -> None:
+    def test_fresh_db_creates_v6_schema(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=db_path) as db:
-                self.assertEqual(db.get_meta_int("schema_version"), 5)
+                self.assertEqual(db.get_meta_int("schema_version"), 6)
 
     def test_fresh_db_has_events_table(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -118,13 +118,13 @@ class TestNewsPoolDBV5Migration(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    def test_migration_v4_to_v5(self) -> None:
+    def test_migration_v4_to_v6(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             self._create_v4_db(db_path)
 
             with NewsPoolDB(path=db_path) as db:
-                self.assertEqual(db.get_meta_int("schema_version"), 5)
+                self.assertEqual(db.get_meta_int("schema_version"), 6)
 
                 # Old tables renamed to _legacy.
                 conn = db._conn
@@ -273,6 +273,175 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                 future = int(time.time()) + 100 * 3600
                 events = db.get_fresh_events(now_ts=future)
                 self.assertEqual(len(events), 0)
+
+
+class TestNewsPoolDBV5ToV6Migration(unittest.TestCase):
+    """Test migration from v5 to v6 (reserved_until_ts column)."""
+
+    def _create_v5_db(self, path: Path) -> None:
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
+        conn.execute("INSERT INTO meta(k, v) VALUES('schema_version', '5');")
+        conn.execute("""
+            CREATE TABLE events (
+              id INTEGER PRIMARY KEY,
+              parent_event_id INTEGER REFERENCES events(id),
+              category TEXT, jurisdiction TEXT, summary_en TEXT NOT NULL,
+              development TEXT, title TEXT, primary_url TEXT,
+              link_count INTEGER NOT NULL DEFAULT 0, best_published_ts INTEGER,
+              status TEXT NOT NULL DEFAULT 'new'
+                CHECK (status IN ('new', 'active', 'posted')),
+              created_at_ts INTEGER NOT NULL, updated_at_ts INTEGER NOT NULL,
+              expires_at_ts INTEGER, posted_at_ts INTEGER,
+              thread_id TEXT, run_id TEXT, model TEXT
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE links (
+              id INTEGER PRIMARY KEY, url TEXT NOT NULL, norm_url TEXT NOT NULL UNIQUE,
+              domain TEXT, title TEXT, description TEXT, age TEXT, page_age TEXT,
+              first_seen_ts INTEGER NOT NULL, last_seen_ts INTEGER NOT NULL,
+              seen_count INTEGER NOT NULL DEFAULT 1, last_query TEXT NOT NULL,
+              last_offset INTEGER NOT NULL, last_fetched_at_ts INTEGER NOT NULL,
+              event_id INTEGER REFERENCES events(id), published_at_ts INTEGER
+            );
+        """)
+        conn.execute("CREATE TABLE fetch_state (key TEXT PRIMARY KEY, last_fetch_ts INTEGER NOT NULL, last_offset INTEGER NOT NULL DEFAULT 1, run_count INTEGER NOT NULL DEFAULT 0);")
+        conn.execute("CREATE TABLE article_cache (norm_url TEXT PRIMARY KEY, url TEXT NOT NULL, final_url TEXT, domain TEXT, http_status INTEGER, extracted_title TEXT, extracted_text TEXT, extractor TEXT, fetched_at_ts INTEGER NOT NULL, text_chars INTEGER NOT NULL, quality_score INTEGER NOT NULL, error TEXT);")
+        conn.execute("CREATE TABLE pool_runs (id INTEGER PRIMARY KEY, run_ts INTEGER NOT NULL, state_key TEXT NOT NULL, window_hours INTEGER NOT NULL, should_fetch INTEGER NOT NULL, query TEXT, offset_start INTEGER, pages INTEGER, count INTEGER, freshness TEXT, requests_made INTEGER NOT NULL DEFAULT 0, results INTEGER NOT NULL DEFAULT 0, inserted INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0, pruned INTEGER NOT NULL DEFAULT 0, pruned_articles INTEGER NOT NULL DEFAULT 0, notes TEXT);")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO events(category, jurisdiction, summary_en, status, created_at_ts, updated_at_ts, expires_at_ts) VALUES(?, ?, ?, 'new', ?, ?, ?)",
+            ("AI", "US", "Test v5 event", now, now, now + 48 * 3600),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_migration_v5_to_v6_adds_column(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            self._create_v5_db(db_path)
+
+            with NewsPoolDB(path=db_path) as db:
+                self.assertEqual(db.get_meta_int("schema_version"), 6)
+
+                # reserved_until_ts column should exist.
+                cur = db._conn.cursor()
+                self.assertTrue(NewsPoolDB._column_exists(cur, "events", "reserved_until_ts"))
+
+                # Existing events should still be queryable.
+                events = db.get_fresh_events(now_ts=0)
+                self.assertGreaterEqual(len(events), 1)
+
+    def test_migration_v5_to_v6_existing_events_have_null_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            self._create_v5_db(db_path)
+
+            with NewsPoolDB(path=db_path) as db:
+                # Migrated events should have reserved_until_ts = NULL (selectable).
+                candidates = db.get_daily_candidates(limit=10)
+                self.assertGreater(len(candidates), 0)
+
+
+class TestEventReservation(unittest.TestCase):
+    """Test planner-level event reservation to prevent concurrent selection."""
+
+    def test_daily_candidates_are_reserved(self) -> None:
+        """After get_daily_candidates(), the same events should not be returned by a second call."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+                db.create_event(summary_en="Event B", category="Politics", jurisdiction="UK")
+
+                first_call = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(first_call), 2)
+
+                # Second call at the same time should return nothing (both reserved).
+                second_call = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(second_call), 0)
+
+    def test_hourly_candidates_are_reserved(self) -> None:
+        """After get_hourly_candidates(), the same events should not be returned by a second call."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+                db.create_event(summary_en="Event B", category="Sports", jurisdiction="UK")
+
+                first_call = db.get_hourly_candidates(limit=3, now_ts=now)
+                self.assertEqual(len(first_call), 2)
+
+                second_call = db.get_hourly_candidates(limit=3, now_ts=now)
+                self.assertEqual(len(second_call), 0)
+
+    def test_reservation_expires_after_timeout(self) -> None:
+        """Reservations auto-expire after _RESERVATION_SECONDS."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+
+                first_call = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(first_call), 1)
+
+                # Still reserved.
+                mid_call = db.get_daily_candidates(limit=10, now_ts=now + _RESERVATION_SECONDS - 1)
+                self.assertEqual(len(mid_call), 0)
+
+                # Reservation expired.
+                after_expiry = now + _RESERVATION_SECONDS + 1
+                expired_call = db.get_daily_candidates(limit=10, now_ts=after_expiry)
+                self.assertEqual(len(expired_call), 1)
+
+    def test_release_reservation(self) -> None:
+        """release_reservation() makes the event selectable again immediately."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+
+                first_call = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(first_call), 1)
+
+                # Release reservation.
+                db.release_reservation(eid)
+
+                # Should be selectable again.
+                second_call = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(second_call), 1)
+
+    def test_mark_posted_clears_from_candidates(self) -> None:
+        """Posted events should never appear as candidates, reservation or not."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+                db.mark_event_posted(eid, thread_id="t1", run_id="r1")
+
+                candidates = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(candidates), 0)
+
+    def test_concurrent_daily_and_hourly_do_not_overlap(self) -> None:
+        """Events reserved by daily should not be picked by hourly."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+                db.create_event(summary_en="Event B", category="Sports", jurisdiction="UK")
+
+                daily = db.get_daily_candidates(limit=10, now_ts=now)
+                self.assertEqual(len(daily), 2)
+
+                hourly = db.get_hourly_candidates(limit=3, now_ts=now)
+                self.assertEqual(len(hourly), 0)
 
 
 class TestDailySelection(unittest.TestCase):
@@ -580,6 +749,132 @@ class TestMergeEventsInto(unittest.TestCase):
                 winner_id = db.create_event(summary_en="Winner", category="AI", jurisdiction="US")
                 result = db.merge_events_into(winner_id=winner_id, loser_ids=[])
                 self.assertEqual(result, 0)
+
+
+class TestPruneExpiredEvents(unittest.TestCase):
+    """Test NewsPoolDB.prune_expired_events()."""
+
+    def _setup_db(self, td: str) -> NewsPoolDB:
+        return NewsPoolDB(path=Path(td) / "news_pool.sqlite3")
+
+    def test_expired_old_events_are_pruned(self) -> None:
+        """Events that are both expired and older than max_age_hours get deleted."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Old expired event", category="AI", jurisdiction="US")
+                # Backdate created_at_ts and set expires_at_ts in the past.
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - 80 * 3600, now - 10 * 3600, eid),
+                )
+
+                pruned = db.prune_expired_events(max_age_hours=72, now_ts=now)
+                self.assertEqual(pruned, 1)
+                self.assertIsNone(db.get_event(eid))
+
+    def test_posted_events_are_not_pruned(self) -> None:
+        """Posted events are kept for audit trail, even if expired and old."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Posted event", category="AI", jurisdiction="US")
+                db.mark_event_posted(eid, thread_id="t_1", run_id="r_1")
+                # Backdate and expire.
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - 80 * 3600, now - 10 * 3600, eid),
+                )
+
+                pruned = db.prune_expired_events(max_age_hours=72, now_ts=now)
+                self.assertEqual(pruned, 0)
+                self.assertIsNotNone(db.get_event(eid))
+
+    def test_non_expired_active_events_are_not_pruned(self) -> None:
+        """Events that haven't expired yet are not pruned, even if old."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Still fresh", category="AI", jurisdiction="US")
+                # Old but not expired.
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - 80 * 3600, now + 3600, eid),
+                )
+
+                pruned = db.prune_expired_events(max_age_hours=72, now_ts=now)
+                self.assertEqual(pruned, 0)
+                self.assertIsNotNone(db.get_event(eid))
+
+    def test_recently_created_expired_events_are_not_pruned(self) -> None:
+        """Events that are expired but created recently (within max_age_hours) are not pruned."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Recent expired", category="AI", jurisdiction="US")
+                # Expired but created recently (1 hour ago).
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - 3600, now - 60, eid),
+                )
+
+                pruned = db.prune_expired_events(max_age_hours=72, now_ts=now)
+                self.assertEqual(pruned, 0)
+                self.assertIsNotNone(db.get_event(eid))
+
+    def test_orphaned_links_are_cleaned_up(self) -> None:
+        """Links referencing pruned events get their event_id set to NULL."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Will be pruned", category="AI", jurisdiction="US")
+
+                # Add and assign a link.
+                link = PoolLink(
+                    url="https://example.com/orphan",
+                    norm_url="https://example.com/orphan",
+                    domain="example.com",
+                    title="Orphan link",
+                    description="...",
+                    age=None,
+                    page_age=None,
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=now,
+                )
+                db.upsert_links([link], now_ts=now)
+                unassigned = db.get_unassigned_links()
+                self.assertEqual(len(unassigned), 1)
+                link_id = unassigned[0]["id"]
+                db.assign_link_to_event(link_id=link_id, event_id=eid)
+
+                # Verify link is assigned.
+                remaining = db.get_unassigned_links()
+                self.assertEqual(len(remaining), 0)
+
+                # Backdate and expire the event.
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - 80 * 3600, now - 10 * 3600, eid),
+                )
+
+                pruned = db.prune_expired_events(max_age_hours=72, now_ts=now)
+                self.assertEqual(pruned, 1)
+                self.assertIsNone(db.get_event(eid))
+
+                # Link should now be unassigned (event_id = NULL).
+                unassigned_after = db.get_unassigned_links(max_age_seconds=200 * 3600)
+                self.assertEqual(len(unassigned_after), 1)
+                self.assertIsNone(unassigned_after[0].get("event_id"))
+
+    def test_prune_returns_zero_when_nothing_to_prune(self) -> None:
+        """No events match the criteria — returns 0."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                db.create_event(summary_en="Fresh event", category="AI", jurisdiction="US")
+                pruned = db.prune_expired_events(max_age_hours=72, now_ts=now)
+                self.assertEqual(pruned, 0)
 
 
 if __name__ == "__main__":

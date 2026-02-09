@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import socket
@@ -28,10 +29,13 @@ from .dedupe import best_semantic_duplicate
 from .news_pool_db import NewsPoolDB
 from .result_repair import repair_result_json
 from .charts import render_line_chart_png
+from ._util import count_cjk
 from .image_fetch import download_image, fetch_og_image_url
 from .market_data import build_market_assets
 from .source_pack import build_source_pack
 from .story_index import anchor_terms, choose_key_tokens, tokenize_text
+
+_log = logging.getLogger(__name__)
 
 
 class JobSchemaError(RuntimeError):
@@ -630,26 +634,8 @@ def _normalize_report_body(body: str) -> str:
     return "\n".join(out).strip()
 
 
-def _count_cjk(text: str) -> int:
-    # Best-effort "Chinese character" count. This is a proxy for the length
-    # constraints, and is more reliable than trusting self-reported counts.
-    #
-    # We intentionally count:
-    # - CJK Unified Ideographs (incl. Ext A)
-    # - CJK Symbols and Punctuation
-    # - Fullwidth forms (Chinese punctuation + fullwidth digits)
-    total = 0
-    for ch in (text or ""):
-        o = ord(ch)
-        if 0x3400 <= o <= 0x4DBF:  # CJK Unified Ideographs Extension A
-            total += 1
-        elif 0x4E00 <= o <= 0x9FFF:  # CJK Unified Ideographs
-            total += 1
-        elif 0x3000 <= o <= 0x303F:  # CJK Symbols and Punctuation
-            total += 1
-        elif 0xFF00 <= o <= 0xFFEF:  # Halfwidth and Fullwidth Forms
-            total += 1
-    return total
+# Keep module-private alias so existing call-sites stay unchanged.
+_count_cjk = count_cjk
 
 
 def _looks_like_english_title(title: str) -> bool:
@@ -1009,11 +995,18 @@ class NewsroomRunner:
         thread_id = discord_state.get("thread_id")
         run_id = run_info.get("run_id")
 
+        if not thread_id:
+            _log.warning(
+                "thread_id is None when recording posted event: event_id=%s run_id=%s job_path=%s",
+                event_id, run_id, job_path,
+            )
+            story_log.log("posted_event_missing_thread_id", event_id=event_id, run_id=run_id)
+
         db_path = self._openclaw_home / "data" / "newsroom" / "news_pool.sqlite3"
         db = NewsPoolDB(path=db_path)
         try:
             db.mark_event_posted(event_id, thread_id=thread_id, run_id=run_id)
-            story_log.log("posted_event_recorded", event_id=event_id)
+            story_log.log("posted_event_recorded", event_id=event_id, thread_id=thread_id)
         finally:
             db.close()
 
@@ -1032,12 +1025,45 @@ class NewsroomRunner:
         _, story_log = self._loggers_for_job(job, job_path)
         self._update_job_file(job_path, job, story_log, event="job_skipped", reason=reason)
 
+        # Recover thread_id from the dedupe marker so _record_posted_event can
+        # store it even though this job never created its own Discord thread.
+        discord_state = state.get("discord", {}) or {}
+        if not discord_state.get("thread_id") and "dedupe_marker_exists:" in reason:
+            marker_name = reason.split("dedupe_marker_exists:")[-1].strip()
+            marker_path = self._log_root / "dedupe" / marker_name
+            try:
+                if marker_path.is_file():
+                    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                    recovered_tid = marker.get("thread_id")
+                    if recovered_tid:
+                        discord_state["thread_id"] = str(recovered_tid)
+                        state["discord"] = discord_state
+                        job["state"] = state
+                        story_log.log("thread_id_recovered_from_dedupe_marker", thread_id=str(recovered_tid), marker=marker_name)
+            except Exception as e:
+                story_log.log("thread_id_recovery_from_marker_failed", error=str(e), marker=marker_name)
+
         # Also mark the event as posted in the DB so the planner won't
-        # pick this event_id again.  Best-effort — mirrors _record_posted_event.
-        try:
-            self._record_posted_event(job_path=job_path, job=job, story_log=story_log)
-        except Exception:
-            pass
+        # pick this event_id again.  Retry up to 3 times to avoid silent double-posts.
+        _event_id = job.get("story", {}).get("event_id")
+        for _attempt in range(3):
+            try:
+                self._record_posted_event(job_path=job_path, job=job, story_log=story_log)
+                break
+            except Exception as e:
+                if _attempt < 2:
+                    time.sleep(1)
+                else:
+                    story_log.log(
+                        "posted_event_record_failed_after_retries",
+                        error=str(e),
+                        event_id=_event_id,
+                    )
+                    _log.warning(
+                        "CRITICAL: failed to mark event as posted after 3 retries: event_id=%s error=%s",
+                        _event_id,
+                        e,
+                    )
 
     def _clean_discord_title(self, text: str) -> str:
         t = (text or "").strip()
@@ -3808,10 +3834,25 @@ class NewsroomRunner:
                 story_log.log("dedupe_marker_write_failed", error=str(e))
 
             # Record event in posted_events ledger for cross-run LLM dedupe.
-            try:
-                self._record_posted_event(job_path=job_path, job=job, story_log=story_log)
-            except Exception as e:
-                story_log.log("posted_event_record_failed", error=str(e))
+            _event_id = job.get("story", {}).get("event_id")
+            for _attempt in range(3):
+                try:
+                    self._record_posted_event(job_path=job_path, job=job, story_log=story_log)
+                    break
+                except Exception as e:
+                    if _attempt < 2:
+                        time.sleep(1)
+                    else:
+                        story_log.log(
+                            "posted_event_record_failed_after_retries",
+                            error=str(e),
+                            event_id=_event_id,
+                        )
+                        _log.warning(
+                            "CRITICAL: failed to mark event as posted after 3 retries: event_id=%s error=%s",
+                            _event_id,
+                            e,
+                        )
 
             rt.lock.release()
             if rt.dedupe_lock:

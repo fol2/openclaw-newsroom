@@ -4,7 +4,11 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from ._util import count_cjk
 from .story_index import anchor_terms, choose_key_tokens, jaccard, tokenize_text
+
+# Keep module-private alias so call-sites stay unchanged.
+_count_cjk = count_cjk
 
 
 # --- Cross-lingual entity matching helpers ---
@@ -23,10 +27,6 @@ _XLANG_GENERIC = {
     "january", "february", "march", "april", "june", "july", "august",
     "september", "october", "november", "december",
 }
-
-
-def _count_cjk(text: str) -> int:
-    return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
 
 
 def _is_english_title(title: str) -> bool:

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from newsroom.brave_news import normalize_url
+from .brave_news import normalize_url
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 

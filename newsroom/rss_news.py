@@ -12,7 +12,7 @@ import requests
 import yaml
 from lxml import etree
 
-from newsroom.brave_news import normalize_url
+from .brave_news import normalize_url
 
 _USER_AGENT = "OpenClaw-Newsroom/1.0"
 

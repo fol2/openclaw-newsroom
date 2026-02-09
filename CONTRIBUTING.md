@@ -9,13 +9,10 @@ git clone <your-fork-url> openclaw-newsroom
 cd openclaw-newsroom
 ```
 
-2. Create a virtual environment and install dependencies:
+2. Install dependencies with uv:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install pytest
+uv sync --dev
 ```
 
 3. Copy `.env.example` to `.env` and fill in the required values (see README.md for details). For local development and testing, most features work without API keys when using `--dry-run`.
@@ -25,7 +22,7 @@ pip install pytest
 All 192 tests must pass before submitting changes:
 
 ```bash
-PYTHONPATH=. pytest newsroom/tests/ -v
+uv run pytest newsroom/tests/ -v
 ```
 
 Tests are located in `newsroom/tests/` and cover validators, result repair, prompt registry resolution, job schemas, deduplication, tokenization, and more.

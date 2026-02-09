@@ -25,17 +25,19 @@ openclaw-newsroom is a pipeline that transforms raw news links into polished, cl
 
 - **Python 3.12+**
 - **OpenClaw Gateway** -- The newsroom publishes to Discord through the OpenClaw Gateway HTTP API. The gateway is a separate service (not included in this repository) that provides authenticated Discord access via a token-based tool invocation interface. The newsroom works in dry-run mode without a running gateway.
-- **uv** (optional) -- Used for image generation scripts if `NANO_BANANA_SCRIPT` is configured.
+- **[uv](https://docs.astral.sh/uv/)** -- Package manager used for dependency management and virtual environment setup.
 
 ## Installation
 
 ```bash
 git clone https://github.com/fol2/openclaw-newsroom.git openclaw-newsroom
 cd openclaw-newsroom
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
+
+This creates a virtual environment and installs all dependencies from `pyproject.toml`.
+To include optional chart dependencies (Pillow): `uv sync --extra charts`.
+To include dev dependencies (pytest, pytest-cov): `uv sync --dev`.
 
 ## Configuration
 
@@ -81,7 +83,6 @@ python scripts/newsroom_runner.py --dry-run
 | `newsroom_daily_inputs.py` | Daily planner -- same clustering pipeline, selects 10-15 events with category balance and HK guarantee. |
 | `newsroom_write_run_job.py` | Creates a story job JSON file from event data (used by hourly/daily planners). |
 | `news_pool_update.py` | Fetches news from Brave News API and upserts links into the pool database. |
-| `brave_news_pool.py` | Standalone Brave News fetcher with API key rotation and rate-limit tracking. |
 | `gdelt_pool_update.py` | Fetches articles from GDELT DOC 2.0 API (free, no auth) and upserts into the pool. |
 | `rss_pool_update.py` | Fetches articles from curated RSS/Atom feeds and upserts into the pool. |
 | `news_pool_status.py` | Diagnostic tool -- shows pool statistics, cluster counts, and link freshness. |

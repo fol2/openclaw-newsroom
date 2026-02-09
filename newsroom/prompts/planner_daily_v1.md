@@ -39,12 +39,12 @@ Reject candidates that are duplicates or near-duplicates of what was already pos
 Discovery (required; keep it efficient):
 1) Run the recent-context script first (required).
 2) Run Brave News search exactly ONCE (preferred):
-   `python3 {{OPENCLAW_HOME}}/scripts/brave_news_pool.py --query \"breaking news sports entertainment AI Hong Kong\" --count 50 --freshness day --max-queries 1`
+   `python3 {{OPENCLAW_HOME}}/scripts/news_pool_update.py --query \"breaking news sports entertainment AI Hong Kong\" --count 50 --freshness day --max-queries 1`
    - This returns up to 50 candidates in ~1 API call (max 1 req/sec; script handles pacing).
    - Scan and categorise those results into our categories.
    - For each selected story, try to pick supporting_urls from this SAME pooled result set so the worker can avoid extra search.
 3) Optional second Brave call ONLY if and only if you cannot reach 5 strong candidates after strict de-dupe:
-   `python3 {{OPENCLAW_HOME}}/scripts/brave_news_pool.py --query \"Hong Kong entertainment\" --count 50 --freshness day --max-queries 1`
+   `python3 {{OPENCLAW_HOME}}/scripts/news_pool_update.py --query \"Hong Kong entertainment\" --count 50 --freshness day --max-queries 1`
 
 Story selection constraints:
 - Pick 5 distinct underlying events.
