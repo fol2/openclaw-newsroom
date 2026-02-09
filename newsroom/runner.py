@@ -715,6 +715,25 @@ def _normalize_url(url: str) -> str:
     return urllib.parse.urlunsplit(fragmentless)
 
 
+def _utc_iso_to_ts(v: Any) -> float | None:
+    """Parse `utc_iso()` style strings (YYYY-MM-DDTHH:MM:SSZ) to epoch seconds."""
+    if not isinstance(v, str) or not v.strip():
+        return None
+    s = v.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    try:
+        return float(dt.timestamp())
+    except Exception:
+        return None
+
+
 @dataclass
 class JobRuntime:
     job_path: Path
@@ -3488,16 +3507,44 @@ class NewsroomRunner:
             else:
                 raise JobSchemaError(f"Unsupported destination.platform: {destination_platform}")
 
+            monitor = job.get("monitor", {}) or {}
+            poll_seconds = int(monitor.get("poll_seconds", 5))
+
+            # If we already have an active rescue session, monitor it first. This matters
+            # when resuming after a crash: both worker+rescue session keys may exist, but
+            # only the rescue is still running.
+            rescue_state = (job.get("state", {}) or {}).get("rescue", {}) or {}
+            if rescue_state.get("child_session_key") and not rescue_state.get("ended_at"):
+                recover = job.get("recover", {}) or {}
+                rescue_timeout_seconds = int(recover.get("rescue_timeout_seconds", 600))
+                started_ts = _utc_iso_to_ts(rescue_state.get("started_at"))
+                deadline = (
+                    (started_ts + max(1, rescue_timeout_seconds))
+                    if started_ts is not None
+                    else (time.time() + max(1, rescue_timeout_seconds))
+                )
+                story_log.log("monitor_existing_rescue", child_session_key=rescue_state.get("child_session_key"))
+                return JobRuntime(
+                    job_path=job_path,
+                    job=job,
+                    lock=lock,
+                    dedupe_lock=dedupe_lock,
+                    phase="rescue",
+                    deadline_ts=deadline,
+                    poll_seconds=poll_seconds,
+                    next_poll_ts=time.time(),
+                )
+
             # If we already have an active worker session, just monitor it.
             worker_state = (job.get("state", {}) or {}).get("worker", {}) or {}
             if worker_state.get("child_session_key"):
-                poll_seconds = int((job.get("monitor", {}) or {}).get("poll_seconds", 5))
-                timeout_seconds = int((job.get("monitor", {}) or {}).get("timeout_seconds", run_defaults.get("default_timeout_seconds", 900)))
-                started_at = worker_state.get("started_at")
-                if started_at and isinstance(started_at, str):
-                    deadline = time.time() + max(1, timeout_seconds)
-                else:
-                    deadline = time.time() + max(1, timeout_seconds)
+                timeout_seconds = int(monitor.get("timeout_seconds", run_defaults.get("default_timeout_seconds", 900)))
+                started_ts = _utc_iso_to_ts(worker_state.get("started_at"))
+                deadline = (
+                    (started_ts + max(1, timeout_seconds))
+                    if started_ts is not None
+                    else (time.time() + max(1, timeout_seconds))
+                )
                 story_log.log("monitor_existing_worker", child_session_key=worker_state.get("child_session_key"))
                 return JobRuntime(
                     job_path=job_path,
@@ -3511,7 +3558,7 @@ class NewsroomRunner:
                 )
 
             # Spawn worker.
-            timeout_seconds = int((job.get("monitor", {}) or {}).get("timeout_seconds", run_defaults.get("default_timeout_seconds", 900)))
+            timeout_seconds = int(monitor.get("timeout_seconds", run_defaults.get("default_timeout_seconds", 900)))
             spawn_resp = self._spawn_subagent(
                 job=job,
                 job_path=job_path,
@@ -3542,7 +3589,7 @@ class NewsroomRunner:
                 dedupe_lock=dedupe_lock,
                 phase="worker",
                 deadline_ts=time.time() + timeout_seconds,
-                poll_seconds=int((job.get("monitor", {}) or {}).get("poll_seconds", 5)),
+                poll_seconds=poll_seconds,
                 next_poll_ts=time.time(),
             )
         except Exception as e:
@@ -4249,7 +4296,8 @@ def discover_jobs_under(jobs_root: Path) -> list[Path]:
             if run_time_str:
                 try:
                     run_dt = datetime.strptime(run_time_str[:16], "%Y-%m-%d %H:%M")
-                    age_hours = (datetime.now(UTC) - run_dt.replace(tzinfo=UTC)).total_seconds() / 3600
+                    run_dt = run_dt.replace(tzinfo=ZoneInfo("Europe/London"))
+                    age_hours = (datetime.now(UTC) - run_dt.astimezone(UTC)).total_seconds() / 3600
                     if age_hours > 48:
                         continue
                 except (ValueError, TypeError):

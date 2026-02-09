@@ -4,8 +4,9 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from newsroom.job_store import FileLock
+from newsroom.job_store import FileLock, LockHeldError
 
 
 def _pid_max() -> int:
@@ -37,3 +38,16 @@ class TestJobStoreLocks(unittest.TestCase):
                 lock.release()
             self.assertFalse(lock_path.exists())
 
+    def test_file_lock_stale_reclaim_race_does_not_raise_fileexists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "job.json.lock"
+            lock = FileLock(lock_path, owner="test", ttl_seconds=1)
+
+            # Simulate: lock exists -> stale -> unlink -> another runner recreates lock
+            # before we can acquire. We should raise LockHeldError (not leak FileExistsError).
+            with (
+                patch("newsroom.job_store.os.open", side_effect=[FileExistsError(), FileExistsError()]),
+                patch("newsroom.job_store._is_lock_stale", side_effect=[True, False]),
+            ):
+                with self.assertRaises(LockHeldError):
+                    lock.acquire()

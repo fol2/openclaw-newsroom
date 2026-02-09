@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 OPENCLAW_HOME = Path(__file__).resolve().parents[1]
+os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
 from newsroom.brave_news import normalize_url  # noqa: E402

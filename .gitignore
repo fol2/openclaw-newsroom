@@ -6,6 +6,7 @@ venv/
 .env
 .env.*
 !.env.example
+newsroom/rss_feeds.yaml
 secrets/
 data/
 logs/

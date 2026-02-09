@@ -11,7 +11,10 @@ from ._util import count_cjk
 _count_cjk = count_cjk
 
 
-_READ_MORE_RANGE_RE = re.compile(r"read_more_urls_(\d+)_to_(\d+)")
+# Accept both validator styles:
+# - success_requires:read_more_urls_3_to_5 (script_posts validators)
+# - success_requires:read_more_urls_count_3_to_5 (agent_posts/count-only validators)
+_READ_MORE_RANGE_RE = re.compile(r"read_more_urls(?:_count)?_(\d+)_to_(\d+)")
 
 
 def _is_http_url(url: str) -> bool:
@@ -218,8 +221,10 @@ def repair_result_json(*, result_json: dict[str, Any], job: dict[str, Any], erro
 
     if min_urls is not None and max_urls is not None:
         require_primary = any(e.endswith("read_more_includes_primary_url") for e in errors)
-        # If the range itself failed, we still want to keep primary_url as policy for news reporters.
-        require_primary = True if any(e.endswith("read_more_urls_3_to_5") for e in errors) else require_primary
+        # Policy: whenever we're repairing read-more URLs for newsroom content, always
+        # ensure the primary_url is included (best-effort).
+        if any("read_more_urls" in e for e in errors):
+            require_primary = True
         require_other_domain = any(e.endswith("read_more_has_other_domain") for e in errors)
 
         out, changed = _repair_read_more_urls(

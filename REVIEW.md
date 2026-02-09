@@ -28,11 +28,11 @@
 
 1. **runner.py is 4,220 lines.** This is the single largest risk. It contains 7 classes and ~60 methods encompassing prompt rendering, Discord publishing, image generation, sub-agent spawning, deduplication, validation orchestration, source pack preparation, market data, and more. Any change to one concern risks breaking another.
 
-2. **Duplicated utility code.** `_count_cjk()` is copy-pasted 5 times across runner.py, result_repair.py, dedupe.py, and 2 validators. `ALLOWED_FAILURE_TYPES` is duplicated across all 6 validators. `_normalize_url()` had a second implementation in the now-deleted brave_news_pool.py script (different from the canonical one in brave_news.py). `ValidationResult` dataclass is duplicated across multiple validators.
+2. **Utility consolidation (mostly done).** Shared validator helpers and CJK counting live in `newsroom/_util.py` (`count_cjk`, `ALLOWED_FAILURE_TYPES`, `ValidationResult`, type helpers). Remaining per-module helpers should stay minimal to avoid reintroducing copy-paste drift.
 
 3. **Scripts use sys.path hacking.** All 9 scripts contain `OPENCLAW_HOME = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(OPENCLAW_HOME))`. This is fragile and prevents proper package installation. Two modules (gdelt_news.py, rss_news.py) previously used absolute `from newsroom.brave_news import` instead of relative imports (now fixed).
 
-4. **No pyproject.toml.** The project cannot be pip-installed. Requirements are in a flat requirements.txt with 4 dependencies listed; actual dependencies include at least `requests`, `jsonschema`, `lxml`, `PyYAML`, and testing needs `pytest`. The Gemini client needs `requests` but has no dependency declaration. PIL/Pillow is used optionally in charts.py but is not documented.
+4. **Packaging exists.** `pyproject.toml` is present and the project is installable (Hatchling). Dependencies are declared in `pyproject.toml`, and optional chart support is via the `charts` extra (`Pillow`). For contributors, `uv sync --dev` is the canonical dev install path (lockfile-driven).
 
 5. **Configuration is scattered.** Environment variables are read in at least 6 different modules: gemini_client.py (GEMINI_API_KEY, GEMINI_AUTH_PROFILES, GEMINI_PROFILE_ORDER, etc.), gateway_client.py (OPENCLAW_GATEWAY_TOKEN, OPENCLAW_GATEWAY_URL), brave_news.py (BRAVE_SEARCH_API_KEY), runner.py (NANO_BANANA_SCRIPT, NANO_BANANA_API_KEY, OPENCLAW_HOME), and scripts (OPENCLAW_HOME). There is no central config object.
 

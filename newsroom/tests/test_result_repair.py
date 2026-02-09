@@ -40,6 +40,35 @@ class TestResultRepair(unittest.TestCase):
         self.assertIn("https://example.com/a", repaired["draft"]["read_more_urls"])
         self.assertGreaterEqual(len(repaired["draft"]["read_more_urls"]), 3)
 
+    def test_repairs_read_more_urls_count_style_errors(self) -> None:
+        job = {
+            "story": {
+                "title": "【測試】港股消息",
+                "primary_url": "https://example.com/a",
+                "supporting_urls": [
+                    "https://example.net/b",
+                    "https://example.org/c",
+                ],
+            },
+            "state": {
+                "source_pack": {
+                    "sources": [
+                        {"url": "https://example.com/a", "on_topic": True, "selected_chars": 800},
+                        {"url": "https://example.net/b", "on_topic": True, "selected_chars": 800},
+                    ]
+                }
+            },
+        }
+        result_json = {"status": "SUCCESS", "title": "x", "sources_used": ["https://example.net/b"]}
+        errors = ["success_requires:read_more_urls_count_2_to_5"]
+
+        repaired, repairs = repair_result_json(result_json=result_json, job=job, errors=errors)
+        self.assertIn("read_more_urls", repairs)
+        self.assertIn("draft", repaired)
+        self.assertIn("read_more_urls", repaired["draft"])
+        self.assertIn("https://example.com/a", repaired["draft"]["read_more_urls"])
+        self.assertGreaterEqual(len(repaired["draft"]["read_more_urls"]), 2)
+
     def test_repairs_title_from_job_when_validator_requires_traditional_chinese(self) -> None:
         job = {"story": {"title": "【AI】新模型發布"}}
         result_json = {"status": "SUCCESS", "title": "English only", "draft": {"body": "x", "read_more_urls": []}, "sources_used": []}

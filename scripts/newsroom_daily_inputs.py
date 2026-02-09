@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 OPENCLAW_HOME = Path(__file__).resolve().parents[1]
+os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
 from newsroom.event_manager import cluster_all_pending, merge_events  # noqa: E402
@@ -37,7 +39,20 @@ _DB_PATH = OPENCLAW_HOME / "data" / "newsroom" / "news_pool.sqlite3"
 
 def _run_json(cmd: list[str]) -> dict[str, Any]:
     """Run a command that prints JSON to stdout and parse it."""
-    out = subprocess.check_output(cmd, text=True)
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True)
+    except Exception as e:
+        return {"ok": False, "error": "spawn_failed", "detail": str(e), "cmd": cmd}
+    out = proc.stdout or ""
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "error": "cmd_failed",
+            "returncode": int(proc.returncode),
+            "stdout": out[:2000],
+            "stderr": (proc.stderr or "")[:2000],
+            "cmd": cmd,
+        }
     try:
         obj = json.loads(out)
     except Exception:

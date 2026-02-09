@@ -15,13 +15,14 @@ Automated AI newsroom: LLM clustering, multi-source news pool, Discord publishin
 - `newsroom/prompts/` -- LLM prompt templates (Mustache-style `{{VAR}}`)
 - `newsroom/schemas/` -- JSON schemas for job files
 - `newsroom/validators/` -- Output validators for LLM responses
-- `newsroom/tests/` -- Test suite (192 tests)
+- `newsroom/tests/` -- Test suite
 - `scripts/` -- CLI entry points (9 scripts)
 
 ## Development
 
-- Python 3.12+, deps in `requirements.txt`
-- Tests: `PYTHONPATH=. pytest newsroom/tests/ -v`
+- Python 3.12+, deps in `pyproject.toml` (locked in `uv.lock`)
+- Install (dev): `uv sync --dev`
+- Tests: `uv run pytest newsroom/tests/ -v`
 - All prompt template paths use `{{OPENCLAW_HOME}}` (resolved at runtime)
 - `_render_template()` in runner.py auto-injects `OPENCLAW_HOME`
 

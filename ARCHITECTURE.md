@@ -186,7 +186,7 @@ for concurrent read/write access.
 **Brave News API** (`brave_news.py`):
 
 - Endpoint: `https://api.search.brave.com/res/v1/news/search`
-- Multi-key rotation: keys loaded from `BRAVE_API_KEYS` env var or `.env` file.
+- Multi-key rotation: keys loaded from `BRAVE_SEARCH_API_KEYS` env var (or single-key `BRAVE_SEARCH_API_KEY`).
 - Key state persisted in `data/newsroom/brave_key_state.json` (tracks usage,
   rate limit events per key_id = sha256 prefix).
 - `select_brave_api_key()` picks the least-recently-rate-limited key.
@@ -666,7 +666,8 @@ Three sub-mechanisms:
 | `OPENCLAW_HOME` | Root directory (default: `~/.openclaw`) |
 | `OPENCLAW_GATEWAY_TOKEN` | Gateway authentication token |
 | `OPENCLAW_GATEWAY_HTTP_URL` | Gateway HTTP endpoint override |
-| `BRAVE_API_KEYS` | Comma-separated Brave API keys (format: `label:key`) |
+| `BRAVE_SEARCH_API_KEYS` | Comma/newline-separated Brave API keys (format: `label:key`) |
+| `BRAVE_SEARCH_API_KEY` | Single Brave API key (legacy) |
 | `GEMINI_API_KEY` | Fallback Gemini API key |
 | `GEMINI_AUTH_PROFILES` | Path to auth-profiles.json override |
 | `GEMINI_PROFILE_ORDER` | Comma-separated profile rotation order |

@@ -1,0 +1,58 @@
+# Example RSS/Atom feeds configuration for `rss_pool_update.py`.
+#
+# Usage:
+# 1) Copy this file to `newsroom/rss_feeds.yaml` (or to `$OPENCLAW_HOME/newsroom/rss_feeds.yaml`).
+# 2) Edit the feeds list as needed.
+#
+# If no config file exists, the system falls back to the built-in defaults in `newsroom/rss_news.py`.
+feeds:
+  # UK
+  - key: bbc-world
+    url: https://feeds.bbci.co.uk/news/world/rss.xml
+    label: BBC World
+    region: uk
+  - key: bbc-uk
+    url: https://feeds.bbci.co.uk/news/uk/rss.xml
+    label: BBC UK
+    region: uk
+  - key: bbc-tech
+    url: https://feeds.bbci.co.uk/news/technology/rss.xml
+    label: BBC Technology
+    region: uk
+  - key: guardian-world
+    url: https://www.theguardian.com/world/rss
+    label: Guardian World
+    region: uk
+  - key: sky-news
+    url: https://feeds.skynews.com/feeds/rss/home.xml
+    label: Sky News
+    region: uk
+  - key: dailymail-news
+    url: https://www.dailymail.co.uk/articles.rss
+    label: Daily Mail
+    region: uk
+  - key: telegraph-news
+    url: https://www.telegraph.co.uk/rss.xml
+    label: The Telegraph
+    region: uk
+
+  # Hong Kong
+  - key: rthk-en
+    url: https://rthk.hk/rthk/news/rss/e_expressnews_elocal.xml
+    label: RTHK English
+    region: hk
+  - key: scmp-hk
+    url: https://www.scmp.com/rss/91/feed
+    label: SCMP HK
+    region: hk
+
+  # Global
+  - key: aljazeera-news
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    label: Al Jazeera
+    region: global
+  - key: bbc-business
+    url: https://feeds.bbci.co.uk/news/business/rss.xml
+    label: BBC Business
+    region: global
+

@@ -111,19 +111,25 @@ class FileLock:
         raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
 
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        try:
-            fd = os.open(self.lock_path, flags, 0o644)
-        except FileExistsError:
-            if _is_lock_stale(self.lock_path, self.ttl_seconds):
-                try:
-                    self.lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                # Retry once.
+        fd: int | None = None
+        for _attempt in range(2):
+            try:
                 fd = os.open(self.lock_path, flags, 0o644)
-            else:
+                break
+            except FileExistsError:
+                # If stale, clear it and retry. Another runner may race and recreate
+                # the lock after unlink; in that case we treat it as held.
+                if _is_lock_stale(self.lock_path, self.ttl_seconds):
+                    try:
+                        self.lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
                 info = _read_lock_info(self.lock_path)
                 raise LockHeldError(f"lock held: {self.lock_path} info={info}") from None
+        if fd is None:
+            info = _read_lock_info(self.lock_path)
+            raise LockHeldError(f"lock held: {self.lock_path} info={info}") from None
 
         try:
             os.write(fd, raw)

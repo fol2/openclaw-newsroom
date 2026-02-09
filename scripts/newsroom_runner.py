@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import json
+import os
 import sys
 from pathlib import Path
 
 # Ensure the repo root (OpenClaw home) is on sys.path even when executed from the agent workspace.
 OPENCLAW_HOME = Path(__file__).resolve().parents[1]
+os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
 from newsroom.gateway_client import GatewayClient, load_gateway_config  # noqa: E402
