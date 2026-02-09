@@ -50,7 +50,7 @@ Cron trigger
 **Environment requirements:**
 
 - `OPENCLAW_HOME` environment variable (or defaults to `~/.openclaw`).
-- Brave API key configured in `data/newsroom/brave_key_state.json`.
+- Brave API keys configured via `BRAVE_SEARCH_API_KEYS` / `BRAVE_SEARCH_API_KEY` or `secrets/brave_search_api_keys*.txt`.
 - Gemini auth profiles in `agents/main/agent/auth-profiles.json` (used by GeminiClient for clustering).
 
 **Prompt file:** `newsroom/prompts/planner_daily_v1.md`
@@ -473,7 +473,7 @@ Required:
 
 - `OPENCLAW_HOME` (or defaults to `~/.openclaw`) -- used to resolve all relative paths.
 - Gemini auth profiles at `agents/main/agent/auth-profiles.json` -- needed for LLM clustering in the inputs pipeline.
-- Brave API keys in `data/newsroom/brave_key_state.json` -- needed for news discovery.
+- Brave API keys via `BRAVE_SEARCH_API_KEYS` / `BRAVE_SEARCH_API_KEY` or `secrets/brave_search_api_keys*.txt` -- needed for news discovery.
 - Gateway configuration -- needed by the runner for sub-agent spawning and Discord messaging.
 
 ### Job stuck in DISPATCHED

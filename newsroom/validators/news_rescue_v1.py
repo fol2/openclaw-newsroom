@@ -96,6 +96,13 @@ def validate(result_json: dict[str, Any], job: dict[str, Any]) -> ValidationResu
         if chars is not None and not (800 <= chars <= 1200):
             errors.append("success_requires:report_char_count_800_to_1200")
 
+        # Ensure sources_used is non-empty and includes primary_url (best-effort).
+        if isinstance(sources, list) and len(sources) < 1:
+            errors.append("success_requires:sources_used_nonempty")
+        primary_url = result_json.get("primary_url")
+        if _is_non_empty_str(primary_url) and isinstance(sources, list) and primary_url not in sources:
+            errors.append("success_requires:sources_used_includes_primary_url")
+
         if result_json.get("error_type") not in (None, "null", ""):
             errors.append("success_requires:error_type_null")
         if result_json.get("error_message") not in (None, "null", ""):
@@ -109,4 +116,3 @@ def validate(result_json: dict[str, Any], job: dict[str, Any]) -> ValidationResu
             errors.append("failure_requires:error_message_nonempty")
 
     return ValidationResult(ok=len(errors) == 0, errors=errors)
-

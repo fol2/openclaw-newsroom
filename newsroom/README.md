@@ -1,18 +1,18 @@
 # Newsroom Engine (Planner + Deterministic Runner)
 
-This implements the architecture described in `plans/news-plan.md`:
+This implements the architecture described in `ARCHITECTURE.md` and `AGENTS.md`:
 
-- **Planner (LLM)**: selects stories and writes `story_job_v1` JSON files under `jobs/`, then stops.
+- **Planner (LLM)**: selects stories and writes `story_job_v1` JSON files under `workspace/jobs/`, then stops.
 - **Runner (deterministic script)**: reads job JSON, creates Discord containers (title + thread), spawns worker sub-agents, monitors them, validates strict RESULT JSON, runs rescue on failure/timeout, and sends a DM summary.
 
 ## Folder Layout
 
 - `jobs/`  
   Run folders created by the planner:
-  - Daily: `jobs/discord-multi-YYYY-MM-DD-HH-mm/`
+  - Daily: `workspace/jobs/discord-multi-YYYY-MM-DD-HH-mm/`
     - `run.json` (optional, shared runner config)
     - `story_01.json` ... `story_05.json`
-  - Hourly: `jobs/discord-<channel_id>-YYYY-MM-DD-HH-mm/`
+  - Hourly: `workspace/jobs/discord-<channel_id>-YYYY-MM-DD-HH-mm/`
     - `story.json`
 
 - `newsroom/schemas/`  
@@ -32,20 +32,20 @@ This implements the architecture described in `plans/news-plan.md`:
 Run against discovered jobs:
 
 ```bash
-python3 scripts/newsroom_runner.py
+uv run python3 scripts/newsroom_runner.py
 ```
 
 Dry run (validate + render prompts only, no posting/spawning, no job mutation):
 
 ```bash
-python3 scripts/newsroom_runner.py --dry-run
+uv run python3 scripts/newsroom_runner.py --dry-run
 ```
 
 Run a specific folder or file:
 
 ```bash
-python3 scripts/newsroom_runner.py --path jobs/discord-multi-2026-02-02-07-00
-python3 scripts/newsroom_runner.py --path jobs/discord-1467628391082496041-2026-02-02-10-30/story.json
+uv run python3 scripts/newsroom_runner.py --path workspace/jobs/discord-multi-2026-02-02-07-00
+uv run python3 scripts/newsroom_runner.py --path workspace/jobs/discord-1467628391082496041-2026-02-02-10-30/story.json
 ```
 
 ## Planner Prompts
@@ -58,4 +58,3 @@ These prompts are designed to:
 - select stories,
 - write `story_job_v1` files under `jobs/`,
 - and stop.
-

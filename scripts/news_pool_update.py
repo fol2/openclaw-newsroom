@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 
 
 OPENCLAW_HOME = Path(__file__).resolve().parents[1]
+os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
 from newsroom.brave_news import (  # noqa: E402
@@ -101,6 +103,7 @@ def main(argv: list[str]) -> int:
         fetch_summary: dict[str, Any] = {"should_fetch": should_fetch}
         upsert = {"inserted": 0, "updated": 0}
         notes: str | None = None
+        had_success = False
 
         if should_fetch:
             # Rotate query and offset deterministically across runs.
@@ -118,25 +121,32 @@ def main(argv: list[str]) -> int:
             last_ts = 0.0
             last_rate_limit: dict[str, Any] | None = None
             keys_used: list[dict[str, Any]] = []
+            errors: list[dict[str, Any]] = []
 
             offsets = [o for o in range(offset, min(10, offset + pages))]
             for off in offsets:
-                key = select_brave_api_key(
-                    openclaw_home=OPENCLAW_HOME,
-                    keys=api_keys,
-                    prefer_label=(str(args.key_label).strip() or None),
-                    now_ts=now_ts,
-                )
-                fetched, last_ts = fetch_brave_news(
-                    api_key=key.key,
-                    q=q,
-                    count=count,
-                    offset=int(off),
-                    freshness=freshness,
-                    cache_dir=cache_dir,
-                    ttl_seconds=int(args.cache_ttl_seconds),
-                    last_request_ts=last_ts,
-                )
+                try:
+                    key = select_brave_api_key(
+                        openclaw_home=OPENCLAW_HOME,
+                        keys=api_keys,
+                        prefer_label=(str(args.key_label).strip() or None),
+                        now_ts=now_ts,
+                    )
+                    fetched, last_ts = fetch_brave_news(
+                        api_key=key.key,
+                        q=q,
+                        count=count,
+                        offset=int(off),
+                        freshness=freshness,
+                        cache_dir=cache_dir,
+                        ttl_seconds=int(args.cache_ttl_seconds),
+                        last_request_ts=last_ts,
+                    )
+                    had_success = True
+                except Exception as e:
+                    errors.append({"offset": int(off), "error": str(e)})
+                    continue
+
                 keys_used.append({"key_id": key.key_id, "label": key.label})
                 if isinstance(getattr(fetched, "rate_limit", None), dict):
                     last_rate_limit = fetched.rate_limit
@@ -180,7 +190,8 @@ def main(argv: list[str]) -> int:
                     )
 
             upsert = db.upsert_links(links, now_ts=now_ts)
-            db.update_fetch_state(key=state_key, last_fetch_ts=now_ts, last_offset=int(offset), run_count=next_run)
+            if had_success:
+                db.update_fetch_state(key=state_key, last_fetch_ts=now_ts, last_offset=int(offset), run_count=next_run)
 
             fetch_summary = {
                 "should_fetch": True,
@@ -195,6 +206,9 @@ def main(argv: list[str]) -> int:
             notes_payload: dict[str, Any] = {"keys_used": keys_used}
             if last_rate_limit:
                 notes_payload["rate_limit"] = last_rate_limit
+            if errors:
+                fetch_summary["errors"] = errors
+                notes_payload["errors"] = errors
             notes = json.dumps(notes_payload, ensure_ascii=True, separators=(",", ":"))
         else:
             fetch_summary = {
@@ -226,7 +240,7 @@ def main(argv: list[str]) -> int:
         )
 
     out = {
-        "ok": True,
+        "ok": bool((not should_fetch) or had_success),
         "db": str(db_path),
         "window_hours": hours,
         "pruned": int(pruned),

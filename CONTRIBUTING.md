@@ -19,7 +19,7 @@ uv sync --dev
 
 ## Running Tests
 
-All 192 tests must pass before submitting changes:
+All tests must pass before submitting changes:
 
 ```bash
 uv run pytest newsroom/tests/ -v
@@ -99,7 +99,7 @@ To create a new validator:
 - Follow existing code patterns and module structure.
 - Keep modules focused on a single responsibility.
 - The project intentionally avoids heavy dependencies like pandas and numpy. Do not introduce them.
-- All text processing should handle CJK characters correctly (the codebase includes `_count_cjk()` helpers for this).
+- All text processing should handle CJK characters correctly (use `count_cjk()` from `newsroom/_util.py`).
 - Use `from __future__ import annotations` in new modules.
 - Type hints are used throughout; maintain them in new code.
 - Test new functionality with unit tests in `newsroom/tests/`.
@@ -109,5 +109,5 @@ To create a new validator:
 - Keep PRs small and focused on a single change.
 - Describe what changed and why in the PR description.
 - Include test coverage for new functionality.
-- Ensure all 192 existing tests still pass.
+- Ensure all tests still pass.
 - If adding a new prompt or validator, include sample input/output in the PR description to aid review.

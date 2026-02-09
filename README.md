@@ -50,7 +50,8 @@ cp .env.example .env
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | Yes | Google Gemini API key for LLM calls (clustering, story writing). |
-| `BRAVE_SEARCH_API_KEY` | Yes | Brave Search API key for news fetching. Supports multiple keys with rotation. |
+| `BRAVE_SEARCH_API_KEYS` | Recommended | Multiple Brave Search API keys (comma/newline separated). Supports `label:key` entries for rotation. |
+| `BRAVE_SEARCH_API_KEY` | Yes (if `BRAVE_SEARCH_API_KEYS` unset) | Single Brave Search API key (legacy). |
 | `OPENCLAW_GATEWAY_TOKEN` | Yes | Bearer token for the OpenClaw Gateway HTTP API (Discord publishing). |
 | `OPENCLAW_HOME` | No | Override the OpenClaw home directory. Defaults to `~/.openclaw`. |
 | `OPENCLAW_GATEWAY_HTTP_URL` | No | Gateway HTTP endpoint. Defaults to `http://127.0.0.1:3000`. |
@@ -59,19 +60,27 @@ cp .env.example .env
 | `GEMINI_API_KEY_ONLY_UNTIL` | No | ISO 8601 timestamp after which the system switches from API key to OAuth profiles. |
 | `NANO_BANANA_SCRIPT` | No | Path to an image generation script invoked via `uv run`. |
 
+### RSS Feeds (Optional)
+
+To override the built-in RSS/Atom feed list, copy the example config to `newsroom/rss_feeds.yaml`:
+
+```bash
+cp newsroom/examples/rss_feeds.example.yaml newsroom/rss_feeds.yaml
+```
+
 ## Quick Start
 
 Run the newsroom in dry-run mode (no Discord publishing, no API keys needed for the runner itself):
 
 ```bash
 # 1. Populate the news pool with Brave News results
-python scripts/news_pool_update.py --db data/newsroom/news_pool.sqlite3
+uv run python scripts/news_pool_update.py --db data/newsroom/news_pool.sqlite3
 
 # 2. Run the hourly planner (cluster + select events)
-python scripts/newsroom_hourly_inputs.py --db data/newsroom/news_pool.sqlite3
+uv run python scripts/newsroom_hourly_inputs.py --db data/newsroom/news_pool.sqlite3
 
 # 3. Run the story writer + publisher in dry-run mode
-python scripts/newsroom_runner.py --dry-run
+uv run python scripts/newsroom_runner.py --dry-run
 ```
 
 ## Scripts Reference
@@ -92,7 +101,7 @@ All scripts live in the `scripts/` directory and are invoked as standalone Pytho
 ## Testing
 
 ```bash
-pytest newsroom/tests/ -v
+uv run pytest newsroom/tests/ -v
 ```
 
 ## Key Modules
