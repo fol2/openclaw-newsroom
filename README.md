@@ -14,6 +14,13 @@ openclaw-newsroom is a pipeline that transforms raw news links into polished, cl
 
 4. **Discord publishing** -- Finished stories are published to Discord channels via the OpenClaw Gateway, including embedded images, charts, and source attribution. The system supports both hourly breaking-news runs and daily digest runs with category balancing.
 
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) -- Detailed technical architecture, data flow diagrams, and component deep-dives
+- [AGENTS.md](AGENTS.md) -- Cron agent system, planner/runner architecture, job file formats
+- [PROMPTS.md](PROMPTS.md) -- Prompt template system, category routing, validators
+- [CONTRIBUTING.md](CONTRIBUTING.md) -- How to add news sources, prompts, and validators
+
 ## Prerequisites
 
 - **Python 3.12+**
@@ -23,7 +30,7 @@ openclaw-newsroom is a pipeline that transforms raw news links into polished, cl
 ## Installation
 
 ```bash
-git clone <repo-url> openclaw-newsroom
+git clone https://github.com/fol2/openclaw-newsroom.git openclaw-newsroom
 cd openclaw-newsroom
 python3 -m venv .venv
 source .venv/bin/activate
