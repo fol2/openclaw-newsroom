@@ -45,9 +45,56 @@ class TestJobStoreLocks(unittest.TestCase):
 
             # Simulate: lock exists -> stale -> unlink -> another runner recreates lock
             # before we can acquire. We should raise LockHeldError (not leak FileExistsError).
+            lock_path.write_text("{}", encoding="utf-8")
+
+            real_os_open = os.open
+            call_count = 0
+
+            def _fake_open(path, flags, mode):  # type: ignore[no-untyped-def]
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise FileExistsError()
+                if call_count == 2:
+                    # Another runner recreated the lock after we unlinked it.
+                    lock_path.write_text("{}", encoding="utf-8")
+                    raise FileExistsError()
+                return real_os_open(path, flags, mode)
+
             with (
-                patch("newsroom.job_store.os.open", side_effect=[FileExistsError(), FileExistsError()]),
+                patch("newsroom.job_store.os.open", side_effect=_fake_open),
                 patch("newsroom.job_store._is_lock_stale", side_effect=[True, False]),
             ):
                 with self.assertRaises(LockHeldError):
                     lock.acquire()
+
+    def test_file_lock_fileexists_race_lock_deleted_allows_acquire(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "job.json.lock"
+            lock_path.write_text("{}", encoding="utf-8")
+
+            lock = FileLock(lock_path, owner="test", ttl_seconds=3600)
+
+            real_os_open = os.open
+            call_count = 0
+
+            def _fake_open(path, flags, mode):  # type: ignore[no-untyped-def]
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    # Another runner released/removed the lock between the O_EXCL check and our inspection.
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    raise FileExistsError()
+                return real_os_open(path, flags, mode)
+
+            with patch("newsroom.job_store.os.open", side_effect=_fake_open):
+                lock.acquire()
+                try:
+                    obj = json.loads(lock_path.read_text(encoding="utf-8"))
+                    self.assertEqual(int(obj.get("pid")), os.getpid())
+                finally:
+                    lock.release()
+            self.assertFalse(lock_path.exists())
