@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.local/schemas/run_job_v1.schema.json",
+  "title": "OpenClaw Newsroom Run Job (v1)",
+  "type": "object",
+  "required": ["schema_version", "run", "runner"],
+  "properties": {
+    "schema_version": { "const": "run_job_v1" },
+    "run": {
+      "type": "object",
+      "required": ["run_id", "trigger", "run_time_uk"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trigger": {
+          "type": "string",
+          "enum": ["cron_hourly", "cron_daily", "manual"]
+        },
+        "run_time_uk": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "destination": {
+      "type": "object",
+      "properties": {
+        "platform": { "type": "string", "enum": ["discord", "webhook"] },
+        "default_title_channel_id": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "runner": {
+      "type": "object",
+      "required": ["concurrency", "stagger_seconds"],
+      "properties": {
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "stagger_seconds": { "type": "integer", "minimum": 0, "maximum": 600 },
+        "default_timeout_seconds": { "type": "integer", "minimum": 1 },
+        "dm_targets": { "type": "array", "items": { "type": "string" } },
+        "stop_run_on_failure": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
+

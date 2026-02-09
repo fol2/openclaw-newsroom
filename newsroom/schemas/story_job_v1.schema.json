@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.local/schemas/story_job_v1.schema.json",
+  "title": "OpenClaw Newsroom Story Job (v1)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run",
+    "story",
+    "destination",
+    "spawn",
+    "monitor",
+    "post",
+    "recover",
+    "validation",
+    "state",
+    "result"
+  ],
+  "properties": {
+    "schema_version": { "const": "story_job_v1" },
+    "run": {
+      "type": "object",
+      "required": ["run_id", "trigger", "run_time_uk"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trigger": {
+          "type": "string",
+          "enum": ["cron_hourly", "cron_daily", "manual"]
+        },
+        "run_time_uk": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "story": {
+      "type": "object",
+      "required": [
+        "story_id",
+        "content_type",
+        "category",
+        "title",
+        "primary_url",
+        "supporting_urls",
+        "concrete_anchor",
+        "flags"
+      ],
+      "properties": {
+        "story_id": { "type": "string", "minLength": 1 },
+        "content_type": { "type": "string", "minLength": 1 },
+        "category": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "primary_url": { "type": "string", "format": "uri" },
+        "supporting_urls": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" },
+          "minItems": 0
+        },
+        "concrete_anchor": { "type": "string", "minLength": 1 },
+        "flags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "instructions": { "type": "string" },
+        "dedupe_key": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "destination": {
+      "type": "object",
+      "required": ["platform"],
+      "properties": {
+        "platform": { "type": "string", "enum": ["discord", "webhook"] },
+        "title_channel_id": { "type": "string" },
+        "thread_name_template": { "type": "string" },
+        "webhook_url": { "type": "string", "format": "uri" }
+      },
+      "additionalProperties": true
+    },
+    "spawn": {
+      "type": "object",
+      "required": ["prompt_id", "agent_id", "publisher_mode", "input_mapping"],
+      "properties": {
+        "prompt_id": { "type": "string", "minLength": 1 },
+        "agent_id": { "type": "string", "minLength": 1 },
+        "publisher_mode": { "type": "string", "enum": ["agent_posts", "script_posts"] },
+        "input_mapping": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "monitor": {
+      "type": "object",
+      "required": ["poll_seconds", "timeout_seconds", "result_json_required"],
+      "properties": {
+        "poll_seconds": { "type": "integer", "minimum": 1 },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "result_json_required": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "post": {
+      "type": "object",
+      "properties": {
+        "on_success_dm_targets": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "on_failure_dm_targets": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "recover": {
+      "type": "object",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "rescue_prompt_id": { "type": "string" },
+        "max_rescue_attempts": { "type": "integer", "minimum": 0 },
+        "rescue_timeout_seconds": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "validation": {
+      "type": "object",
+      "required": ["validator_id", "stop_run_on_failure"],
+      "properties": {
+        "validator_id": { "type": "string", "minLength": 1 },
+        "stop_run_on_failure": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "state": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["PLANNED", "PREPARED", "DISPATCHED", "SUCCESS", "FAILURE", "RESCUED", "SKIPPED"]
+        },
+        "locked_by": { "type": ["string", "null"] },
+        "locked_at": { "type": ["string", "null"] },
+        "discord": {
+          "type": "object",
+          "properties": {
+            "title_message_id": { "type": ["string", "null"] },
+            "thread_id": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        "worker": {
+          "type": "object",
+          "properties": {
+            "attempt": { "type": "integer", "minimum": 0 },
+            "child_session_key": { "type": ["string", "null"] },
+            "run_id": { "type": ["string", "null"] },
+            "started_at": { "type": ["string", "null"] },
+            "ended_at": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        "rescue": {
+          "type": "object",
+          "properties": {
+            "attempt": { "type": "integer", "minimum": 0 },
+            "child_session_key": { "type": ["string", "null"] },
+            "started_at": { "type": ["string", "null"] },
+            "ended_at": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "final_status": { "type": ["string", "null"] },
+        "worker_result_json": { "type": ["object", "null"] },
+        "rescue_result_json": { "type": ["object", "null"] },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": { "type": "string" },
+              "message": { "type": "string" },
+              "at": { "type": "string" }
+            },
+            "required": ["type", "message"]
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

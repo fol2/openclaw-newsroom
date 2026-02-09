@@ -1,0 +1,90 @@
+{
+  "schema_version": "story_job_v1",
+  "run": {
+    "run_id": "discord-multi-2026-02-02-21-00",
+    "trigger": "manual",
+    "run_time_uk": "2026-02-02 21:00"
+  },
+  "story": {
+    "story_id": "story_01",
+    "content_type": "news_deep_dive",
+    "category": "Tech",
+    "title": "Example Story Title",
+    "primary_url": "https://example.com/primary",
+    "supporting_urls": [
+      "https://example.com/supporting-1",
+      "https://example.com/supporting-2"
+    ],
+    "concrete_anchor": "Concrete anchor goes here.",
+    "flags": [],
+    "instructions": "Focus on the concrete anchor and what changed."
+  },
+  "destination": {
+    "platform": "discord",
+    "title_channel_id": "1467628391082496041",
+    "thread_name_template": "{title}"
+  },
+  "spawn": {
+    "prompt_id": "news_reporter_v2_2_inline",
+    "agent_id": "main",
+    "publisher_mode": "agent_posts",
+    "input_mapping": {
+      "story_id": "$.story.story_id",
+      "category": "$.story.category",
+      "title": "$.story.title",
+      "primary_url": "$.story.primary_url",
+      "supporting_urls": "$.story.supporting_urls",
+      "concrete_anchor": "$.story.concrete_anchor",
+      "flags": "$.story.flags",
+      "thread_id": "$.state.discord.thread_id",
+      "run_time_uk": "$.run.run_time_uk"
+    }
+  },
+  "monitor": {
+    "poll_seconds": 5,
+    "timeout_seconds": 900,
+    "result_json_required": true
+  },
+  "post": {
+    "on_success_dm_targets": [],
+    "on_failure_dm_targets": []
+  },
+  "recover": {
+    "enabled": true,
+    "rescue_prompt_id": "news_rescue_v1",
+    "max_rescue_attempts": 1,
+    "rescue_timeout_seconds": 600
+  },
+  "validation": {
+    "validator_id": "news_reporter_v2_1_strict",
+    "stop_run_on_failure": false
+  },
+  "state": {
+    "status": "PLANNED",
+    "locked_by": null,
+    "locked_at": null,
+    "discord": {
+      "title_message_id": null,
+      "thread_id": null
+    },
+    "worker": {
+      "attempt": 0,
+      "child_session_key": null,
+      "run_id": null,
+      "started_at": null,
+      "ended_at": null
+    },
+    "rescue": {
+      "attempt": 0,
+      "child_session_key": null,
+      "started_at": null,
+      "ended_at": null
+    }
+  },
+  "result": {
+    "final_status": null,
+    "worker_result_json": null,
+    "rescue_result_json": null,
+    "errors": []
+  }
+}

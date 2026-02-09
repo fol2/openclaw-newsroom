@@ -1,0 +1,117 @@
+{
+  "schema_version": "prompt_registry_v1",
+  "prompts": {
+    "news_reporter_script_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_default_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_default_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_politics_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_politics_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_uk_parliament_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_uk_parliament_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_uk_news_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_uk_news_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_hk_news_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_hk_news_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_finance_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_finance_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_sports_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_sports_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_entertainment_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_entertainment_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_hk_entertainment_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_hk_entertainment_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_reporter_script_ai_v1": {
+      "template_path": "newsroom/prompts/news_reporter_script_ai_v1.md",
+      "validator_id": "news_reporter_script_v1"
+    },
+    "news_rescue_script_v1": {
+      "template_path": "newsroom/prompts/news_rescue_script_v1.md",
+      "validator_id": "news_rescue_script_v1"
+    },
+    "news_reporter_v2_2_inline": {
+      "template_path": "newsroom/prompts/news_reporter_v2_2_inline.md",
+      "validator_id": "news_reporter_v2_1_strict"
+    },
+    "news_reporter_v2_1": {
+      "template_path": "newsroom/prompts/news_reporter_v2_1.md",
+      "validator_id": "news_reporter_v2_1_strict"
+    },
+    "news_rescue_v1": {
+      "template_path": "newsroom/prompts/news_rescue_v1.md",
+      "validator_id": "news_rescue_v1"
+    },
+    "blog_post_long_v1": {
+      "template_path": "newsroom/prompts/blog_post_long_v1.md",
+      "validator_id": "blog_post_long_v1"
+    },
+    "twitter_post_v1": {
+      "template_path": "newsroom/prompts/twitter_post_v1.md",
+      "validator_id": "social_post_v1"
+    },
+    "facebook_post_v1": {
+      "template_path": "newsroom/prompts/facebook_post_v1.md",
+      "validator_id": "social_post_v1"
+    }
+  },
+  "validators": {
+    "news_reporter_v2_1_strict": {
+      "type": "python",
+      "path": "newsroom/validators/news_reporter_v2_1_strict.py"
+    },
+    "news_reporter_script_v1": {
+      "type": "python",
+      "path": "newsroom/validators/news_reporter_script_v1.py"
+    },
+    "news_rescue_v1": {
+      "type": "python",
+      "path": "newsroom/validators/news_rescue_v1.py"
+    },
+    "news_rescue_script_v1": {
+      "type": "python",
+      "path": "newsroom/validators/news_rescue_script_v1.py"
+    },
+    "blog_post_long_v1": {
+      "type": "python",
+      "path": "newsroom/validators/blog_post_long_v1.py"
+    },
+    "social_post_v1": {
+      "type": "python",
+      "path": "newsroom/validators/social_post_v1.py"
+    }
+  },
+  "content_types": {
+    "news_deep_dive": {
+      "default_prompt_id": "news_reporter_v2_2_inline"
+    },
+    "blog_post_long": {
+      "default_prompt_id": "blog_post_long_v1"
+    },
+    "twitter_post": {
+      "default_prompt_id": "twitter_post_v1"
+    },
+    "facebook_post": {
+      "default_prompt_id": "facebook_post_v1"
+    }
+  }
+}

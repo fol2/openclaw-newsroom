@@ -1,0 +1,20 @@
+{
+  "schema_version": "run_job_v1",
+  "run": {
+    "run_id": "discord-multi-2026-02-02-21-00",
+    "trigger": "manual",
+    "run_time_uk": "2026-02-02 21:00"
+  },
+  "destination": {
+    "platform": "discord",
+    "default_title_channel_id": "1467628391082496041"
+  },
+  "runner": {
+    "concurrency": 2,
+    "stagger_seconds": 10,
+    "default_timeout_seconds": 900,
+    "dm_targets": [],
+    "stop_run_on_failure": false
+  }
+}
+
