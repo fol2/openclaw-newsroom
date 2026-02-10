@@ -24,7 +24,7 @@ import requests
 
 from .gateway_client import GatewayClient
 from .job_store import FileLock, LockHeldError, atomic_write_json, jail_job_file, load_json_file, utc_iso
-from .brave_news import fetch_brave_news, load_brave_api_keys, normalize_url, record_brave_rate_limit, select_brave_api_key
+from .brave_news import BraveApiKey, fetch_brave_news, load_brave_api_keys, normalize_url, record_brave_rate_limit, select_brave_api_key
 from .dedupe import best_semantic_duplicate
 from .news_pool_db import NewsPoolDB
 from .result_repair import repair_result_json
@@ -49,6 +49,11 @@ class PromptRegistryError(RuntimeError):
 class ResultParseError(RuntimeError):
     pass
 
+
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{([^{}]+)\}\}")
+_TEMPLATE_PLACEHOLDER_NAME_RE = re.compile(r"^[A-Z0-9_]+$")
+
+_STORY_JOB_LIKE_NAME_RE = re.compile(r"^story(?:_[A-Za-z0-9_-]+)?\.json$")
 
 _INFOGRAPHIC_COLOR_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9_-]{1,20})\s+(Blue|Red|Green|Orange|Yellow|Pink|Purple|Black|White|Gray|Grey)\b"
@@ -311,15 +316,43 @@ class PromptRegistry:
 def _render_template(template_text: str, vars_map: dict[str, str]) -> str:
     if "OPENCLAW_HOME" not in vars_map:
         vars_map["OPENCLAW_HOME"] = os.environ.get("OPENCLAW_HOME", str(Path.home() / ".openclaw"))
-    out = template_text
-    for k, v in vars_map.items():
-        out = out.replace(f"{{{{{k}}}}}", v)
 
-    # Detect unreplaced placeholders early (prevents silent prompt bugs).
-    leftovers = sorted(set(re.findall(r"\\{\\{([A-Z0-9_]+)\\}\\}", out)))
-    if leftovers:
-        raise PromptRegistryError(f"Unreplaced template placeholders: {leftovers}")
-    return out
+    # Validate placeholders against the template *text* (not the rendered output).
+    # This avoids false positives when injected content (e.g. INPUT_JSON) contains "{{...}}".
+    raw_placeholders = [m.group(1) for m in _TEMPLATE_PLACEHOLDER_RE.finditer(template_text)]
+    if raw_placeholders:
+        invalid: set[str] = set()
+        used: set[str] = set()
+        for raw in raw_placeholders:
+            # Strict format: no whitespace, uppercase names only.
+            if raw != raw.strip():
+                invalid.add(raw)
+                continue
+            if not _TEMPLATE_PLACEHOLDER_NAME_RE.match(raw):
+                invalid.add(raw)
+                continue
+            used.add(raw)
+
+        if invalid:
+            bad = sorted(invalid)
+            raise PromptRegistryError(f"Invalid template placeholders (must be A-Z0-9_ and no whitespace): {bad}")
+
+        missing = sorted(used.difference(vars_map.keys()))
+        if missing:
+            raise PromptRegistryError(f"Unreplaced template placeholders: {missing}")
+
+    # Single-pass rendering: replacements occur only on the original template text,
+    # so injected values are never re-processed for further placeholder substitutions.
+    def repl(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if name != name.strip():
+            return m.group(0)
+        name = name.strip()
+        if not _TEMPLATE_PLACEHOLDER_NAME_RE.match(name):
+            return m.group(0)
+        return vars_map.get(name, m.group(0))
+
+    return _TEMPLATE_PLACEHOLDER_RE.sub(repl, template_text)
 
 
 def _jsonpath_get(obj: Any, expr: str) -> Any:
@@ -773,6 +806,49 @@ class NewsroomRunner:
         self._validator_cache: dict[str, Callable[[dict[str, Any], dict[str, Any]], Any]] = {}
         self._dedupe_primary_url_index: dict[str, Path] = {}
         self._dedupe_primary_url_index_loaded = False
+        # Runner-local pacing for Brave requests. This complements fetch_brave_news()'s own pacing
+        # by keeping a per-key clock across multiple story repairs within the same process.
+        self._brave_last_request_ts_by_key_id: dict[str, float] = {}
+
+    def _fetch_brave_news_paced(
+        self,
+        *,
+        key: BraveApiKey,
+        q: str,
+        count: int = 20,
+        offset: int = 1,
+        freshness: str | None = "day",
+        cache_dir: Path | None = None,
+        ttl_seconds: int = 900,
+    ) -> tuple[Any, float]:
+        """Fetch Brave News results with runner-local pacing (per API key).
+
+        The Brave client supports a `last_request_ts` input for 1rps pacing. The runner can
+        attempt multiple repairs across jobs in quick succession; without a shared clock we'd
+        accidentally pass 0.0 for every call and burst the API.
+        """
+        key_id = key.key_id
+        last_ts = float(self._brave_last_request_ts_by_key_id.get(key_id, 0.0))
+        # If the fetch fails after the request was attempted, we still want to pace subsequent
+        # attempts. Best-effort: treat it as "a request happened now".
+        attempted_ts = time.time()
+        try:
+            fetched, new_ts = fetch_brave_news(
+                api_key=key.key,
+                q=q,
+                count=count,
+                offset=offset,
+                freshness=freshness,
+                cache_dir=cache_dir,
+                ttl_seconds=ttl_seconds,
+                last_request_ts=last_ts,
+            )
+        except Exception:
+            self._brave_last_request_ts_by_key_id[key_id] = max(last_ts, attempted_ts)
+            raise
+
+        self._brave_last_request_ts_by_key_id[key_id] = float(new_ts)
+        return fetched, float(new_ts)
 
     def _load_dedupe_primary_url_index(self) -> None:
         if self._dedupe_primary_url_index_loaded:
@@ -2467,15 +2543,14 @@ class NewsroomRunner:
                     q = " ".join(q_terms)
                     api_keys = load_brave_api_keys(openclaw_home=self._openclaw_home)
                     key = select_brave_api_key(openclaw_home=self._openclaw_home, keys=api_keys)
-                    fetched, _ = fetch_brave_news(
-                        api_key=key.key,
+                    fetched, _last_ts = self._fetch_brave_news_paced(
+                        key=key,
                         q=q,
                         count=20,
                         offset=1,
                         freshness="day",
                         cache_dir=self._openclaw_home / "data" / "newsroom" / "brave_news_cache",
                         ttl_seconds=900,
-                        last_request_ts=0.0,
                     )
                     if isinstance(getattr(fetched, "rate_limit", None), dict):
                         record_brave_rate_limit(openclaw_home=self._openclaw_home, key=key, rate_limit=fetched.rate_limit)
@@ -4233,7 +4308,11 @@ class NewsroomRunner:
                 t = t[len("discord:") :]
             if self._dry_run:
                 continue
-            self._gateway.invoke(tool="message", action="send", args={"channel": "discord", "target": t, "message": summary})
+            try:
+                self._gateway.invoke(tool="message", action="send", args={"channel": "discord", "target": t, "message": summary})
+            except Exception as e:
+                # DM summaries are best-effort; failures must not abort an otherwise successful run.
+                _log.warning("DM summary send failed (target=%s): %s", t, e)
 
 
 def discover_story_job_files(path: Path) -> list[Path]:
@@ -4258,7 +4337,13 @@ def discover_story_job_files(path: Path) -> list[Path]:
     for p in candidates:
         try:
             obj = load_json_file(p)
-        except Exception:
+        except Exception as e:
+            _log.warning("Unreadable JSON while discovering story jobs: %s (%s)", p, e)
+            if _STORY_JOB_LIKE_NAME_RE.match(p.name or ""):
+                try:
+                    jail_job_file(p, reason=f"discover_story_job_files_unreadable_json: {type(e).__name__}: {e}")
+                except Exception as inner:
+                    _log.warning("Failed to jail unreadable story job file: %s (%s)", p, inner)
             continue
         if obj.get("schema_version") == "story_job_v1":
             out.append(p)
@@ -4304,6 +4389,12 @@ def discover_jobs_under(jobs_root: Path) -> list[Path]:
                     pass
 
             story_jobs.append(p)
-        except Exception:
+        except Exception as e:
+            _log.warning("Unreadable JSON while discovering story jobs: %s (%s)", p, e)
+            if _STORY_JOB_LIKE_NAME_RE.match(p.name or ""):
+                try:
+                    jail_job_file(p, reason=f"discover_jobs_under_unreadable_json: {type(e).__name__}: {e}")
+                except Exception as inner:
+                    _log.warning("Failed to jail unreadable story job file: %s (%s)", p, inner)
             continue
     return sorted(story_jobs)
