@@ -66,9 +66,9 @@
     },
     "destination": {
       "type": "object",
-      "required": ["platform"],
+      "required": ["platform", "title_channel_id"],
       "properties": {
-        "platform": { "type": "string", "enum": ["discord", "webhook"] },
+        "platform": { "type": "string", "enum": ["discord"] },
         "title_channel_id": { "type": "string" },
         "thread_name_template": { "type": "string" },
         "webhook_url": { "type": "string", "format": "uri" }
