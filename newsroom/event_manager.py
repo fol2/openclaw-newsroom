@@ -116,20 +116,81 @@ def _tokenize_link(link: dict[str, Any], *, drop_high_df: set[str] | None = None
     return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
 
 
-_ROUNDUP_RE = re.compile(
-    r"\b("
-    r"live updates?|liveblog|as it happened|rolling coverage|minute by minute|"
-    r"roundup|recap|highlights|top stories|"
-    r"morning briefing|evening briefing|daily briefing|"
-    r"what we know|everything you need to know|"
-    r"week in review|week ahead|"
-    r"explainer|q&a"
-    r")\b",
-    re.IGNORECASE,
-)
+_SKIP_CLUSTER_REGEX_RULES: list[tuple[str, list[str]]] = [
+    (
+        "live_updates",
+        [
+            r"\blive updates?\b",
+            r"\blatest updates?\b",
+            r"\bliveblog\b",
+            r"\bas it happened\b",
+            r"\brolling coverage\b",
+            r"\bminute by minute\b",
+            r"\bbreaking news\b",
+            r"即時",
+            r"持續更新",
+            r"最新",
+        ],
+    ),
+    (
+        "multi_topic",
+        [
+            r"\btop stories\b",
+            r"\bthings to watch\b",
+            r"\bweek in review\b",
+            r"\bweek ahead\b",
+            r"\bmorning briefing\b",
+            r"\bevening briefing\b",
+            r"\bdaily briefing\b",
+            r"\btransfer gossip\b",
+            r"懶人包",
+            r"盤點",
+        ],
+    ),
+    (
+        "roundup",
+        [
+            r"\broundup\b",
+            r"\brecap\b",
+            r"\bhighlights\b",
+            r"\bwhat we know\b",
+            r"\beverything you need to know\b",
+            r"\bexplainer\b",
+            r"\bexplained\b",
+            r"\bq&a\b",
+        ],
+    ),
+    (
+        "opinion",
+        [
+            r"\bopinion\b",
+            r"\bcommentary\b",
+            r"\beditorial\b",
+            r"評論",
+        ],
+    ),
+    (
+        "analysis",
+        [
+            r"\banalysis\b",
+            r"\banalyst\b",
+            r"\bin depth\b",
+            r"分析",
+        ],
+    ),
+]
+
+_SKIP_CLUSTER_REGEXES: list[tuple[str, re.Pattern[str]]] = [
+    (reason, re.compile("|".join(patterns), re.IGNORECASE))
+    for reason, patterns in _SKIP_CLUSTER_REGEX_RULES
+]
+
+
 
 _NOISY_DOMAINS = {
     # Aggregators / social shorteners tend to produce noisy titles and mixed-topic pages.
+    "dailymail.co.uk",
+    "mailonline.co.uk",
     "news.google.com",
     "t.co",
     "x.com",
@@ -137,10 +198,21 @@ _NOISY_DOMAINS = {
 }
 
 
-def _is_noisy_or_roundup_link(link: dict[str, Any]) -> bool:
+def _skip_cluster_reason(link: dict[str, Any]) -> str | None:
+    """Return a skip-clustering reason if this link looks multi-topic/roundup-ish."""
     title = str(link.get("title") or "")
     desc = str(link.get("description") or "")
-    if _ROUNDUP_RE.search(title) or _ROUNDUP_RE.search(desc):
+    text = f"{title}\n{desc}".strip()
+    if text:
+        for reason, rx in _SKIP_CLUSTER_REGEXES:
+            if rx.search(text):
+                return reason
+
+    return None
+
+
+def _is_noisy_or_roundup_link(link: dict[str, Any]) -> bool:
+    if _skip_cluster_reason(link) is not None:
         return True
 
     domain = link.get("domain")
@@ -734,6 +806,19 @@ def cluster_link(
     if not isinstance(link_id, int):
         logger.warning("link missing id")
         return None
+
+    # Gate: deterministically skip clustering for roundup/multi-topic links so they
+    # do not poison event clusters.
+    skip_reason = _skip_cluster_reason(link)
+    if skip_reason:
+        mark_fn = getattr(db, "mark_link_skip_cluster", None)
+        if callable(mark_fn):
+            try:
+                mark_fn(link_id=link_id, reason=skip_reason)
+            except Exception:
+                logger.warning("Failed to persist skip_cluster for link_id=%d", link_id, exc_info=True)
+        logger.info("Skipping clustering for link %d: %s", link_id, skip_reason)
+        return {"action": "skip", "skip_reason": skip_reason}
 
     events = all_events if all_events is not None else (fresh_events or [])
 
