@@ -224,14 +224,6 @@ def restore_news_pool_jsonl(
     if tmp_db.exists():
         tmp_db.unlink()
 
-    # Best-effort cleanup of sidecar WAL/SHM files when overwriting.
-    if target_db.exists() and overwrite:
-        for sidecar in (Path(str(target_db) + "-wal"), Path(str(target_db) + "-shm")):
-            try:
-                sidecar.unlink()
-            except FileNotFoundError:
-                pass
-
     try:
         with NewsPoolDB(path=tmp_db) as db:
             conn = db._conn
@@ -303,7 +295,9 @@ def restore_news_pool_jsonl(
         # Replace into place.
         os.replace(str(tmp_db), str(target_db))
 
-        # Best-effort remove sidecar files for the replaced DB path.
+        # Best-effort remove WAL/SHM sidecars for the replaced DB path.
+        # Important: only do this after a successful os.replace() so a failed restore
+        # does not mutate the existing target DB's sidecar files.
         for sidecar in (Path(str(target_db) + "-wal"), Path(str(target_db) + "-shm")):
             try:
                 sidecar.unlink()
@@ -324,9 +318,16 @@ def restore_news_pool_jsonl(
             "manifest": manifest,
         }
     finally:
+        # Best-effort cleanup of any temp DB artefacts.
+        for sidecar in (Path(str(tmp_db) + "-wal"), Path(str(tmp_db) + "-shm")):
+            try:
+                sidecar.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
         try:
             if tmp_db.exists():
                 tmp_db.unlink()
         except Exception:
             pass
-

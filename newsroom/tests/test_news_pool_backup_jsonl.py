@@ -114,3 +114,28 @@ def test_restore_refuses_existing_target_db(tmp_path: Path) -> None:
     # Overwrite should succeed.
     restore_news_pool_jsonl(dump_dir=dump_dir, target_db=target_db, overwrite=True)
 
+
+def test_restore_overwrite_does_not_delete_target_sidecars_on_failure(tmp_path: Path) -> None:
+    target_db = tmp_path / "target.sqlite3"
+    with NewsPoolDB(path=target_db) as db:
+        db.create_event(summary_en="Summary", category="Global News", jurisdiction="GB")
+
+    target_bytes_before = target_db.read_bytes()
+
+    wal_path = Path(str(target_db) + "-wal")
+    shm_path = Path(str(target_db) + "-shm")
+    wal_path.write_bytes(b"WAL-SENTINEL")
+    shm_path.write_bytes(b"SHM-SENTINEL")
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    (dump_dir / "links.jsonl").write_text("", encoding="utf-8")
+    # Invalid events row: missing integer 'id' -> restore should fail before os.replace().
+    (dump_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        restore_news_pool_jsonl(dump_dir=dump_dir, target_db=target_db, overwrite=True)
+
+    assert target_db.read_bytes() == target_bytes_before
+    assert wal_path.read_bytes() == b"WAL-SENTINEL"
+    assert shm_path.read_bytes() == b"SHM-SENTINEL"
