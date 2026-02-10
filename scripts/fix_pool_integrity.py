@@ -87,7 +87,7 @@ def _normalise_category(raw: str | None) -> str | None:
     "Global News" rather than leaving a non-canonical value behind.
     """
     if raw is None:
-        return None
+        return "Global News"
     s = str(raw).strip()
     if not s:
         return "Global News"
@@ -461,4 +461,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
