@@ -238,6 +238,8 @@ class TestParseClusteringResponse(unittest.TestCase):
             ("Technology", "AI"),
             ("Tech", "AI"),
             ("Technology/Tech", "AI"),
+            ("UK Parliament / Politics", "UK Parliament / Politics"),
+            ("UK Parliament/Politics", "UK Parliament / Politics"),
             ("global news", "Global News"),
             ("", "Global News"),
             (None, "Global News"),

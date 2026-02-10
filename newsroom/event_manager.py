@@ -51,7 +51,7 @@ _CATEGORY_ALIASES = {
     "world news": "Global News",
     "technology": "AI",
     "tech": "AI",
-    "technology/tech": "AI",
+    "technology / tech": "AI",
 }
 
 
@@ -63,7 +63,9 @@ def _normalise_category(raw: str | None) -> str:
     if not s:
         return "Global News"
     low = s.lower()
-    low = re.sub(r"\s*/\s*", "/", low)
+    # Normalise slash spacing so labels like "UK Parliament/Politics" match our
+    # canonical "UK Parliament / Politics" category strings.
+    low = re.sub(r"\s*/\s*", " / ", low)
     direct = _CANONICAL_CATEGORY_BY_LOWER.get(low)
     if direct:
         return direct
