@@ -472,7 +472,31 @@ class NewsPoolDB:
         cur = self._conn.cursor()
         row = cur.execute("SELECT COUNT(1) AS n FROM links WHERE last_seen_ts < ?", (int(cutoff_ts),)).fetchone()
         n = int(row["n"]) if row else 0
-        cur.execute("DELETE FROM links WHERE last_seen_ts < ?", (int(cutoff_ts),))
+
+        if n > 0:
+            # Recalculate link_count for events that will lose links.
+            # Collect affected event IDs before deleting.
+            affected_rows = cur.execute(
+                "SELECT DISTINCT event_id FROM links WHERE last_seen_ts < ? AND event_id IS NOT NULL",
+                (int(cutoff_ts),),
+            ).fetchall()
+            affected_event_ids = [r["event_id"] for r in affected_rows]
+
+            cur.execute("DELETE FROM links WHERE last_seen_ts < ?", (int(cutoff_ts),))
+
+            # Recalculate link_count from remaining links for each affected event.
+            for eid in affected_event_ids:
+                cnt_row = cur.execute(
+                    "SELECT COUNT(1) AS c FROM links WHERE event_id = ?", (eid,)
+                ).fetchone()
+                actual = int(cnt_row["c"]) if cnt_row else 0
+                cur.execute(
+                    "UPDATE events SET link_count = ? WHERE id = ?",
+                    (actual, eid),
+                )
+        else:
+            cur.execute("DELETE FROM links WHERE last_seen_ts < ?", (int(cutoff_ts),))
+
         return n
 
     def iter_links_since(self, *, cutoff_ts: int) -> Iterable[dict[str, Any]]:
@@ -510,28 +534,45 @@ class NewsPoolDB:
         return [dict(r) for r in rows]
 
     def assign_link_to_event(self, *, link_id: int, event_id: int) -> None:
-        """Set event_id FK on a link and update the event's counters."""
+        """Set event_id FK on a link and update the event's counters.
+
+        If the link was previously assigned to a different event, that event's
+        link_count is decremented to prevent drift.
+        """
         now = _utc_now_ts()
         cur = self._conn.cursor()
+
+        # Check if link was previously assigned to a different event.
+        prev_row = cur.execute("SELECT event_id, published_at_ts FROM links WHERE id = ?", (link_id,)).fetchone()
+        prev_event_id = prev_row["event_id"] if prev_row else None
+        link_pub_ts = prev_row["published_at_ts"] if prev_row else None
+
         cur.execute("UPDATE links SET event_id = ? WHERE id = ?", (event_id, link_id))
 
-        # Get link's published_at_ts for bumping event.
-        link_row = cur.execute("SELECT published_at_ts FROM links WHERE id = ?", (link_id,)).fetchone()
-        link_pub_ts = link_row["published_at_ts"] if link_row else None
+        # Decrement old event's link_count if link was reassigned.
+        if prev_event_id is not None and prev_event_id != event_id:
+            cur.execute(
+                "UPDATE events SET link_count = MAX(link_count - 1, 0), updated_at_ts = ? WHERE id = ?",
+                (now, prev_event_id),
+            )
 
         expires = now + _DEFAULT_TTL_SECONDS
-        cur.execute(
-            """
-            UPDATE events SET
-              link_count = link_count + 1,
-              best_published_ts = MAX(COALESCE(best_published_ts, 0), COALESCE(?, 0)),
-              updated_at_ts = ?,
-              expires_at_ts = MAX(COALESCE(expires_at_ts, 0), ?),
-              status = CASE WHEN status = 'new' THEN 'active' ELSE status END
-            WHERE id = ?
-            """,
-            (link_pub_ts, now, expires, event_id),
-        )
+        if prev_event_id == event_id:
+            # Link already assigned to this event — no count change needed.
+            pass
+        else:
+            cur.execute(
+                """
+                UPDATE events SET
+                  link_count = link_count + 1,
+                  best_published_ts = MAX(COALESCE(best_published_ts, 0), COALESCE(?, 0)),
+                  updated_at_ts = ?,
+                  expires_at_ts = MAX(COALESCE(expires_at_ts, 0), ?),
+                  status = CASE WHEN status = 'new' THEN 'active' ELSE status END
+                WHERE id = ?
+                """,
+                (link_pub_ts, now, expires, event_id),
+            )
 
     # ------------------------------------------------------------------
     # Events (v5 event-centric)
