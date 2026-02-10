@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,31 +22,32 @@ sys.path.insert(0, str(OPENCLAW_HOME))
 from newsroom.event_manager import cluster_all_pending, merge_events  # noqa: E402
 from newsroom.gemini_client import GeminiClient  # noqa: E402
 from newsroom.news_pool_db import NewsPoolDB  # noqa: E402
+from newsroom.subprocess_json import run_json_command  # noqa: E402
 
 _DB_PATH = OPENCLAW_HOME / "data" / "newsroom" / "news_pool.sqlite3"
 
 
+def _default_subprocess_timeout_seconds() -> float:
+    """Timeout for child processes spawned by the inputs scripts.
+
+    These scripts are called from cron-driven LLM planners. A hung subprocess
+    should not block the planner turn until the cron timeout.
+    """
+    raw = (os.environ.get("NEWSROOM_INPUTS_SUBPROCESS_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return 120.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 120.0
+
+
+_SUBPROCESS_TIMEOUT_SECONDS = _default_subprocess_timeout_seconds()
+
+
 def _run_json(cmd: list[str]) -> dict[str, Any]:
-    """Run a command that prints JSON to stdout and parse it."""
-    try:
-        proc = subprocess.run(cmd, text=True, capture_output=True)
-    except Exception as e:
-        return {"ok": False, "error": "spawn_failed", "detail": str(e), "cmd": cmd}
-    out = proc.stdout or ""
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "error": "cmd_failed",
-            "returncode": int(proc.returncode),
-            "stdout": out[:2000],
-            "stderr": (proc.stderr or "")[:2000],
-            "cmd": cmd,
-        }
-    try:
-        obj = json.loads(out)
-    except Exception:
-        return {"ok": False, "error": "invalid_json", "stdout": out[:2000]}
-    return obj if isinstance(obj, dict) else {"ok": False, "error": "json_not_object"}
+    """Run a JSON-emitting subprocess with a hard timeout."""
+    return run_json_command(cmd, timeout_seconds=_SUBPROCESS_TIMEOUT_SECONDS, max_output_chars=2000)
 
 
 def main(argv: list[str]) -> int:
