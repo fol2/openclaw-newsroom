@@ -479,28 +479,28 @@ Choose ONE action:
 
 A) ASSIGN to existing event (same incident, different source, no new material)
    → {{"action":"assign","event_id":<id>,
-      "confidence":0.0,
+      "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
-      "match_basis":"<optional brief basis>"}}
+      "match_basis":["<entity|number|location|time|other>"]}}
 
 B) NEW DEVELOPMENT of existing event (significant escalation, result, reversal)
    → {{"action":"development","parent_event_id":<id>,
-      "confidence":0.0,
+      "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
-      "match_basis":"<optional brief basis>"}}
+      "match_basis":["<entity|number|location|time|other>"]}}
 
 C) NEW EVENT (completely new story)
    → {{"action":"new_event",
-      "confidence":0.0,
+      "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
-      "match_basis":null}}
+      "match_basis":[]}}
 
 Categories: {categories_str}
 Jurisdictions: "US", "UK", "HK", "CN", "EU", "JP", "KR", "GLOBAL", or other 2-letter code.
@@ -512,9 +512,10 @@ Rules:
 - Match across languages (Chinese headline about same event = same event)
 - Only use ASSIGN if a matching event exists in the list above
 - Do NOT assign to events with status=posted unless it's truly the same event
-- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags, match_basis (optional)
+- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty)
+- link_flags may include: "roundup", "opinion", "live_updates", "multi_topic"
 - If you are NOT at least 70% sure for ASSIGN or DEVELOPMENT, choose NEW EVENT instead
-- If the link is a roundup/briefing or clearly multi-topic, set link_flags to include "roundup" and/or "multi_topic" and choose NEW EVENT
+- If the link is a roundup/briefing, opinion, live updates, or clearly multi-topic, set link_flags accordingly and choose NEW EVENT
 
 Return STRICT JSON only, no explanation."""
 
@@ -528,89 +529,102 @@ def parse_clustering_response(
 ) -> dict[str, Any] | None:
     """Validate and normalize LLM clustering response.
 
-    Returns a validated action dict or None if invalid.
+    Returns a dict containing:
+    - validated: the model's validated action (no policy overrides)
+    - enforced: the action after deterministic policy enforcement
+
+    Returns None if the response is structurally invalid.
     """
     def _parse_confidence(v: Any) -> float | None:
-        if v is None:
-            return None
-        if isinstance(v, bool):
+        if v is None or isinstance(v, bool):
             return None
         if isinstance(v, (int, float)):
             f = float(v)
-        elif isinstance(v, str):
-            t = v.strip()
-            if not t:
-                return None
+        elif isinstance(v, str) and v.strip():
             try:
-                f = float(t)
-            except Exception:
+                f = float(v.strip())
+            except ValueError:
                 return None
         else:
             return None
-        if f < 0.0 or f > 1.0:
-            return None
-        return f
+        if 0.0 <= f <= 1.0:
+            return f
+        return None
 
-    def _parse_match_basis(v: Any) -> str | None:
-        if not isinstance(v, str):
-            return None
-        t = v.strip()
-        if not t:
-            return None
-        # Keep logs bounded; this is for human debugging only.
-        return t[:240]
-
-    def _parse_link_flags(v: Any) -> list[str]:
-        items: list[Any]
+    def _parse_str_list(v: Any) -> list[str]:
         if v is None:
-            items = []
-        elif isinstance(v, (list, tuple)):
-            items = list(v)
-        elif isinstance(v, str):
-            t = v.strip()
-            if not t:
-                items = []
-            else:
-                # Accept either a single flag or a comma-separated string.
-                parts = [p.strip() for p in t.split(",")] if "," in t else [t]
-                items = [p for p in parts if p]
+            return []
+        items: list[str]
+        if isinstance(v, list):
+            items = [str(x) for x in v if isinstance(x, (str, int, float)) and str(x).strip()]
+        elif isinstance(v, str) and v.strip():
+            items = [v.strip()]
         else:
-            items = []
+            return []
 
         out: list[str] = []
         seen: set[str] = set()
-        for it in items:
-            if not isinstance(it, str):
+        for s in items:
+            t = str(s).strip()
+            if not t:
                 continue
-            flag = it.strip().lower()
-            if not flag or flag not in _LINK_FLAGS_ALLOWED:
+            low = t.lower()
+            if low in seen:
                 continue
-            if flag in seen:
+            seen.add(low)
+            out.append(low)
+        return out
+
+    def _parse_link_flags(v: Any) -> list[str]:
+        flags = _parse_str_list(v)
+        # Keep only allowed flags and preserve the returned order.
+        out: list[str] = []
+        seen: set[str] = set()
+        for f in flags:
+            if f not in _LINK_FLAGS_ALLOWED:
                 continue
-            seen.add(flag)
-            out.append(flag)
+            if f in seen:
+                continue
+            seen.add(f)
+            out.append(f)
         return out
 
     action = str(response.get("action") or "").strip().lower()
     confidence = _parse_confidence(response.get("confidence"))
-    match_basis = _parse_match_basis(response.get("match_basis"))
+    confidence_missing = confidence is None
+    if confidence is None:
+        logger.warning("clustering: missing/invalid confidence, treating as 0.0")
+        confidence = 0.0
+
+    match_basis = _parse_str_list(response.get("match_basis"))
     link_flags = _parse_link_flags(response.get("link_flags"))
 
-    summary_en = str(response.get("summary_en") or "").strip() or None
     category = str(response.get("category") or "").strip() or None
     jurisdiction = str(response.get("jurisdiction") or "").strip() or None
+
+    summary_en = str(response.get("summary_en") or "").strip()
+    if not summary_en:
+        # Deterministic fallback so we can still create an event when policy overrides trigger.
+        title = str(link.get("title") or "").strip()
+        if title:
+            summary_en = title
+        else:
+            desc = str(link.get("description") or "").strip()
+            summary_en = desc[:200] if desc else ""
+
+    valid_ids = {ev["id"] for ev in fresh_events if isinstance(ev.get("id"), int)}
+
+    validated: dict[str, Any]
 
     if action == "assign":
         event_id = response.get("event_id")
         if not isinstance(event_id, int):
             logger.warning("assign: event_id not int: %s", response)
             return None
-        # Verify event_id exists in fresh_events.
-        valid_ids = {ev["id"] for ev in fresh_events}
         if event_id not in valid_ids:
-            logger.warning("assign: event_id %d not in fresh events", event_id)
+            logger.warning("assign: event_id %d not in candidate set", event_id)
             return None
-        return {
+        validated = {
             "action": "assign",
             "event_id": event_id,
             "confidence": confidence,
@@ -621,46 +635,83 @@ def parse_clustering_response(
             "jurisdiction": jurisdiction,
         }
 
-    if action == "development":
+    elif action == "development":
         parent_id = response.get("parent_event_id")
         if not isinstance(parent_id, int):
             logger.warning("development: parent_event_id not int: %s", response)
             return None
-        valid_ids = {ev["id"] for ev in fresh_events}
         if parent_id not in valid_ids:
-            logger.warning("development: parent_event_id %d not in fresh events", parent_id)
+            logger.warning("development: parent_event_id %d not in candidate set", parent_id)
             return None
         if not summary_en:
             logger.warning("development: empty summary_en")
             return None
-        return {
+        validated = {
             "action": "development",
             "parent_event_id": parent_id,
-            "confidence": confidence,
-            "match_basis": match_basis,
-            "link_flags": link_flags,
             "summary_en": summary_en,
             "development": str(response.get("development") or "").strip() or None,
             "category": category,
             "jurisdiction": jurisdiction,
-        }
-
-    if action in ("new_event", "new"):
-        if not summary_en:
-            logger.warning("new_event: empty summary_en")
-            return None
-        return {
-            "action": "new_event",
             "confidence": confidence,
             "match_basis": match_basis,
             "link_flags": link_flags,
+        }
+
+    elif action in ("new_event", "new"):
+        if not summary_en:
+            logger.warning("new_event: empty summary_en")
+            return None
+        validated = {
+            "action": "new_event",
             "summary_en": summary_en,
             "category": category,
             "jurisdiction": jurisdiction,
+            "confidence": confidence,
+            "match_basis": match_basis,
+            "link_flags": link_flags,
         }
 
-    logger.warning("Unknown clustering action: %s", action)
-    return None
+    else:
+        logger.warning("Unknown clustering action: %s", action)
+        return None
+
+    enforced = dict(validated)
+    override_reasons: list[str] = []
+
+    if validated["action"] in ("assign", "development"):
+        if confidence_missing:
+            override_reasons.append("missing_confidence")
+
+        if float(confidence) < _ASSIGNMENT_MIN_CONFIDENCE:
+            override_reasons.append(f"low_confidence:{float(confidence):.2f}")
+
+        for f in sorted(set(link_flags) & _LINK_FLAGS_FORCE_NEW_EVENT):
+            override_reasons.append(f"link_flag:{f}")
+
+    if override_reasons:
+        logger.info(
+            "Clustering policy override: %s -> new_event (confidence=%.2f flags=%s reasons=%s)",
+            validated["action"],
+            float(confidence),
+            ",".join(link_flags) if link_flags else "-",
+            ",".join(override_reasons),
+        )
+        enforced = {
+            "action": "new_event",
+            "summary_en": str(validated.get("summary_en") or "").strip(),
+            "category": validated.get("category"),
+            "jurisdiction": validated.get("jurisdiction"),
+            "confidence": confidence,
+            "match_basis": match_basis,
+            "link_flags": link_flags,
+            "enforcement": {
+                "original_action": str(validated.get("action") or ""),
+                "reasons": override_reasons,
+            },
+        }
+
+    return {"validated": validated, "enforced": enforced}
 
 
 def cluster_link(
@@ -774,10 +825,10 @@ def cluster_link(
         logger.warning("Empty Gemini response for link %s", link.get("norm_url", "?"))
         return None
 
-    # Validate against candidate events (not full list).
+    # Validate against candidate events (not full list), then enforce policy.
     candidate_events = [ev for ev, _score in candidates]
-    validated = parse_clustering_response(response, link, candidate_events)
-    if not validated:
+    parsed = parse_clustering_response(response, link, candidate_events)
+    if not parsed:
         _log_decision(
             llm_response=response,
             validated_action=None,
@@ -786,58 +837,24 @@ def cluster_link(
             llm_finished_at_ts=llm_finished_at_ts,
         )
         return None
-    validated_action_obj = dict(validated)
+    validated_action = parsed.get("validated")
+    enforced_action = parsed.get("enforced")
+    if not isinstance(validated_action, dict) or not isinstance(enforced_action, dict):
+        _log_decision(
+            llm_response=response,
+            validated_action=None,
+            enforced_action=None,
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+        )
+        logger.warning("Invalid parsed clustering response shape: %s", type(parsed))
+        return None
+
+    validated_action_obj = dict(validated_action)
+    enforced: dict[str, Any] = dict(enforced_action)
 
     link_title = str(link.get("title") or "").strip() or None
     link_url = str(link.get("url") or "").strip() or None
-
-    def _fallback_summary_en_for_override() -> str:
-        title = str(link.get("title") or "").strip()
-        desc = str(link.get("description") or "").strip()
-        base = title or desc
-        if not base:
-            return "News link"
-        # Keep to a short single-sentence summary to avoid bloating DB logs.
-        return base.replace("\n", " ").strip()[:240]
-
-    enforced: dict[str, Any] = dict(validated)
-    override_reasons: list[str] = []
-    if enforced.get("action") in ("assign", "development"):
-        flags = set(enforced.get("link_flags") or [])
-        for f in sorted(flags & _LINK_FLAGS_FORCE_NEW_EVENT):
-            override_reasons.append(f"link_flag:{f}")
-
-        conf = enforced.get("confidence")
-        if conf is None:
-            override_reasons.append("missing_confidence")
-        else:
-            try:
-                if float(conf) < _ASSIGNMENT_MIN_CONFIDENCE:
-                    override_reasons.append(f"low_confidence:{float(conf):.2f}")
-            except Exception:
-                override_reasons.append("invalid_confidence")
-
-        if override_reasons:
-            # Deterministic abstain behaviour: do not ASSIGN/DEVELOP on low confidence or noisy link types.
-            enforced = {
-                "action": "new_event",
-                "confidence": enforced.get("confidence"),
-                "match_basis": enforced.get("match_basis"),
-                "link_flags": list(enforced.get("link_flags") or []),
-                "summary_en": enforced.get("summary_en") or _fallback_summary_en_for_override(),
-                "category": enforced.get("category"),
-                "jurisdiction": enforced.get("jurisdiction"),
-                "enforcement": {
-                    "original_action": str(validated_action_obj.get("action") or ""),
-                    "reasons": override_reasons,
-                },
-            }
-            logger.info(
-                "Enforced new_event for link %d (validated=%s): %s",
-                link_id,
-                validated_action_obj.get("action"),
-                ", ".join(override_reasons),
-            )
 
     action = str(enforced.get("action") or "").strip().lower()
 

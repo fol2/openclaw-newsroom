@@ -83,16 +83,27 @@ class TestBuildClusteringPrompt(unittest.TestCase):
 
 class TestParseClusteringResponse(unittest.TestCase):
     def test_parse_assign(self) -> None:
-        response = {"action": "assign", "event_id": 42}
+        response = {
+            "action": "assign",
+            "event_id": 42,
+            "confidence": 0.9,
+            "summary_en": "Test event",
+            "category": "Global News",
+            "jurisdiction": "GLOBAL",
+            "link_flags": [],
+            "match_basis": [],
+        }
         events = [{"id": 42}, {"id": 43}]
         result = parse_clustering_response(response, {}, events)
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertEqual(result["action"], "assign")
-        self.assertEqual(result["event_id"], 42)
+        self.assertEqual(result["validated"]["action"], "assign")
+        self.assertEqual(result["validated"]["event_id"], 42)
+        self.assertEqual(result["enforced"]["action"], "assign")
+        self.assertEqual(result["enforced"]["event_id"], 42)
 
     def test_parse_assign_invalid_event_id(self) -> None:
-        response = {"action": "assign", "event_id": 999}
+        response = {"action": "assign", "event_id": 999, "confidence": 0.9, "summary_en": "Test"}
         events = [{"id": 42}]
         result = parse_clustering_response(response, {}, events)
         self.assertIsNone(result)
@@ -101,36 +112,88 @@ class TestParseClusteringResponse(unittest.TestCase):
         response = {
             "action": "development",
             "parent_event_id": 42,
+            "confidence": 0.9,
             "summary_en": "FCA investigates Mandelson",
             "development": "FCA investigation",
             "category": "UK Parliament / Politics",
             "jurisdiction": "UK",
+            "link_flags": [],
+            "match_basis": ["entity", "organisation"],
         }
         events = [{"id": 42}]
         result = parse_clustering_response(response, {}, events)
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertEqual(result["action"], "development")
-        self.assertEqual(result["parent_event_id"], 42)
-        self.assertEqual(result["summary_en"], "FCA investigates Mandelson")
+        self.assertEqual(result["validated"]["action"], "development")
+        self.assertEqual(result["validated"]["parent_event_id"], 42)
+        self.assertEqual(result["validated"]["summary_en"], "FCA investigates Mandelson")
+        self.assertEqual(result["enforced"]["action"], "development")
 
     def test_parse_new_event(self) -> None:
         response = {
             "action": "new_event",
+            "confidence": 0.95,
             "summary_en": "Tesla Q4 earnings beat expectations",
             "category": "US Stocks",
             "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
         }
         result = parse_clustering_response(response, {}, [])
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertEqual(result["action"], "new_event")
-        self.assertEqual(result["summary_en"], "Tesla Q4 earnings beat expectations")
+        self.assertEqual(result["validated"]["action"], "new_event")
+        self.assertEqual(result["validated"]["summary_en"], "Tesla Q4 earnings beat expectations")
+        self.assertEqual(result["enforced"]["action"], "new_event")
 
     def test_parse_new_event_missing_summary(self) -> None:
         response = {"action": "new_event", "category": "AI"}
         result = parse_clustering_response(response, {}, [])
         self.assertIsNone(result)
+
+    def test_parse_enforces_low_confidence_abstain(self) -> None:
+        response = {
+            "action": "assign",
+            "event_id": 42,
+            "confidence": 0.2,
+            "summary_en": "Some story",
+            "category": "Global News",
+            "jurisdiction": "GLOBAL",
+            "link_flags": [],
+            "match_basis": [],
+        }
+        events = [{"id": 42}]
+        result = parse_clustering_response(response, {"title": "Some story"}, events)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["validated"]["action"], "assign")
+        self.assertEqual(result["enforced"]["action"], "new_event")
+        reasons = (result["enforced"].get("enforcement") or {}).get("reasons") if isinstance(result["enforced"].get("enforcement"), dict) else None
+        self.assertIsInstance(reasons, list)
+        assert isinstance(reasons, list)
+        self.assertTrue(any(str(r).startswith("low_confidence:") for r in reasons))
+
+    def test_parse_enforces_abstain_flags(self) -> None:
+        response = {
+            "action": "assign",
+            "event_id": 42,
+            "confidence": 0.95,
+            "summary_en": "Some story",
+            "category": "Global News",
+            "jurisdiction": "GLOBAL",
+            "link_flags": ["roundup"],
+            "match_basis": ["other"],
+        }
+        events = [{"id": 42}]
+        result = parse_clustering_response(response, {"title": "Some story"}, events)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["validated"]["action"], "assign")
+        self.assertEqual(result["enforced"]["action"], "new_event")
+        reasons = (result["enforced"].get("enforcement") or {}).get("reasons") if isinstance(result["enforced"].get("enforcement"), dict) else None
+        self.assertIsInstance(reasons, list)
+        assert isinstance(reasons, list)
+        self.assertIn("link_flag:roundup", reasons)
 
     def test_parse_unknown_action(self) -> None:
         response = {"action": "unknown"}
