@@ -102,10 +102,13 @@ class NewsPoolDB:
         if schema is None:
             # Fresh database — create all tables directly.
             self._create_all_tables_v5(cur)
+            self._create_clustering_decisions_tables(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
         if schema == SCHEMA_VERSION:
+            # Auxiliary tables should exist regardless of schema_version.
+            self._create_clustering_decisions_tables(cur)
             return
 
         if schema <= 4:
@@ -114,6 +117,7 @@ class NewsPoolDB:
 
         if schema == 5:
             self._migrate_to_v6(cur)
+            self._create_clustering_decisions_tables(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -209,6 +213,49 @@ class NewsPoolDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_runs_run_ts ON pool_runs(run_ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_runs_state_key_run_ts ON pool_runs(state_key, run_ts);")
 
+    def _create_clustering_decisions_tables(self, cur: sqlite3.Cursor) -> None:
+        """Create clustering decision audit tables (auxiliary, schema-version agnostic)."""
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS clustering_decisions (
+              id INTEGER PRIMARY KEY,
+              link_id INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
+              prompt_sha256 TEXT NOT NULL,
+              model_name TEXT,
+              llm_started_at_ts INTEGER,
+              llm_finished_at_ts INTEGER,
+              llm_response_json TEXT,
+              validated_action TEXT,
+              validated_action_json TEXT,
+              enforced_action TEXT,
+              enforced_action_json TEXT,
+              error_type TEXT,
+              error_message TEXT,
+              created_at_ts INTEGER NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clustering_decisions_link_created ON clustering_decisions(link_id, created_at_ts);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clustering_decisions_created ON clustering_decisions(created_at_ts);"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS clustering_decision_candidates (
+              decision_id INTEGER NOT NULL REFERENCES clustering_decisions(id) ON DELETE CASCADE,
+              rank INTEGER NOT NULL,
+              event_id INTEGER NOT NULL,
+              score REAL NOT NULL,
+              PRIMARY KEY(decision_id, rank)
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clustering_decision_candidates_event_id ON clustering_decision_candidates(event_id);"
+        )
+
     def _create_events_table_v5(self, cur: sqlite3.Cursor) -> None:
         """Create the new event-centric events table (v5+v6 columns)."""
         cur.execute(
@@ -241,6 +288,83 @@ class NewsPoolDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_status ON events(status, created_at_ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at_ts) WHERE expires_at_ts IS NOT NULL;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_category ON events(category, status);")
+
+    def insert_clustering_decision(
+        self,
+        *,
+        link_id: int,
+        candidates: list[tuple[int, float]] | None,
+        prompt_sha256: str,
+        model_name: str | None = None,
+        llm_response: Any | None = None,
+        validated_action: dict[str, Any] | None = None,
+        enforced_action: dict[str, Any] | None = None,
+        llm_started_at_ts: int | None = None,
+        llm_finished_at_ts: int | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        created_at_ts: int | None = None,
+    ) -> int:
+        """Insert a clustering decision audit row and its candidate set.
+
+        This is intended for debugging and post-mortems; it must not affect
+        the clustering outcome if it fails.
+        """
+        if not isinstance(link_id, int):
+            raise TypeError("link_id must be int")
+        if not isinstance(prompt_sha256, str) or not prompt_sha256.strip():
+            raise ValueError("prompt_sha256 must be a non-empty str")
+
+        def _json_text(obj: Any | None) -> str | None:
+            if obj is None:
+                return None
+            try:
+                return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return json.dumps({"_repr": repr(obj)}, ensure_ascii=False)
+
+        now = int(created_at_ts) if created_at_ts is not None else _utc_now_ts()
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO clustering_decisions(
+              link_id, prompt_sha256, model_name,
+              llm_started_at_ts, llm_finished_at_ts,
+              llm_response_json,
+              validated_action, validated_action_json,
+              enforced_action, enforced_action_json,
+              error_type, error_message,
+              created_at_ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(link_id),
+                prompt_sha256.strip(),
+                (model_name.strip() if isinstance(model_name, str) and model_name.strip() else None),
+                (int(llm_started_at_ts) if llm_started_at_ts is not None else None),
+                (int(llm_finished_at_ts) if llm_finished_at_ts is not None else None),
+                _json_text(llm_response),
+                (str(validated_action.get("action")) if isinstance(validated_action, dict) and validated_action.get("action") else None),
+                _json_text(validated_action),
+                (str(enforced_action.get("action")) if isinstance(enforced_action, dict) and enforced_action.get("action") else None),
+                _json_text(enforced_action),
+                (str(error_type) if isinstance(error_type, str) and error_type.strip() else None),
+                (str(error_message) if isinstance(error_message, str) and error_message.strip() else None),
+                int(now),
+            ),
+        )
+        decision_id = int(cur.lastrowid)
+
+        for rank, (event_id, score) in enumerate(candidates or [], start=1):
+            cur.execute(
+                """
+                INSERT INTO clustering_decision_candidates(decision_id, rank, event_id, score)
+                VALUES (?, ?, ?, ?)
+                """,
+                (decision_id, int(rank), int(event_id), float(score)),
+            )
+        return decision_id
 
     def _migrate_to_v5(self, cur: sqlite3.Cursor, *, from_version: int) -> None:
         """Migrate from schema v1-v4 to v5."""

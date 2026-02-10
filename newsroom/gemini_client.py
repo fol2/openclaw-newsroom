@@ -156,6 +156,9 @@ class GeminiClient:
     def __init__(self, *, auth_profiles_path: Path | None = None, api_key: str | None = None) -> None:
         self._auth_path = auth_profiles_path or _AUTH_PROFILES_PATH
         self._rotation_index = 0
+        # Last successful model details (best-effort, for audit/logging).
+        self.last_model_name: str | None = None
+        self.last_profile_id: str | None = None
         self._profiles: list[dict[str, Any]] = []
         self._profile_ids: list[str] = []
         self._exhausted_until: dict[str, float] = {}  # pid → monotonic time when cooldown expires
@@ -659,10 +662,16 @@ class GeminiClient:
         evenly.  Skips profiles still in 429 cooldown.  Falls back to API key
         if all OAuth profiles fail.
         """
+        # Clear last-success metadata for this call.
+        self.last_model_name = None
+        self.last_profile_id = None
+
         # API-key-only mode: skip OAuth entirely.
         if self._api_key_only and self._api_key:
             result = self._call_genai(prompt=prompt)
             if result:
+                self.last_model_name = _GENAI_FLASH_MODEL
+                self.last_profile_id = "api_key"
                 return result
             logger.warning("API-key-only mode: API key call failed for prompt (len=%d)", len(prompt))
             return None
@@ -699,6 +708,8 @@ class GeminiClient:
                         "Gemini success: profile=%s model=%s chars=%d",
                         pid, model, len(result),
                     )
+                    self.last_model_name = model
+                    self.last_profile_id = pid
                     # Advance rotation so next call starts from the next profile.
                     self._rotation_index = (idx + 1) % n
                     return result
@@ -725,6 +736,8 @@ class GeminiClient:
             result = self._call_genai(prompt=prompt)
             if result:
                 logger.debug("Gemini API key success: model=%s chars=%d", _GENAI_FLASH_MODEL, len(result))
+                self.last_model_name = _GENAI_FLASH_MODEL
+                self.last_profile_id = "api_key"
                 return result
 
         logger.warning("All Gemini attempts failed for prompt (len=%d)", len(prompt))
