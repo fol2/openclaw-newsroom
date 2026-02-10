@@ -146,6 +146,36 @@ class TestParseClusteringResponse(unittest.TestCase):
         self.assertEqual(result["validated"]["summary_en"], "Tesla Q4 earnings beat expectations")
         self.assertEqual(result["enforced"]["action"], "new_event")
 
+    def test_parse_normalises_category_aliases(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.9,
+            "summary_en": "Tech story",
+            "category": "Technology",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": [],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["validated"]["category"], "AI")
+
+    def test_parse_defaults_unknown_category(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.9,
+            "summary_en": "Some story",
+            "category": "Completely Unknown",
+            "jurisdiction": "GLOBAL",
+            "link_flags": [],
+            "match_basis": [],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["validated"]["category"], "Global News")
+
     def test_parse_new_event_missing_summary(self) -> None:
         response = {"action": "new_event", "category": "AI"}
         result = parse_clustering_response(response, {}, [])

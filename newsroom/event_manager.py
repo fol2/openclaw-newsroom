@@ -45,6 +45,31 @@ _ASSIGNMENT_MIN_CONFIDENCE = 0.70
 _LINK_FLAGS_ALLOWED = {"roundup", "opinion", "live_updates", "multi_topic"}
 _LINK_FLAGS_FORCE_NEW_EVENT = {"roundup", "multi_topic"}
 
+_CANONICAL_CATEGORY_BY_LOWER = {c.lower(): c for c in CATEGORY_LIST}
+_CATEGORY_ALIASES = {
+    "us news": "Global News",
+    "world news": "Global News",
+    "technology": "AI",
+    "tech": "AI",
+}
+
+
+def _normalise_category(raw: str | None) -> str:
+    """Map a category label onto the canonical category set."""
+    if raw is None:
+        return "Global News"
+    s = str(raw).strip()
+    if not s:
+        return "Global News"
+    low = s.lower()
+    direct = _CANONICAL_CATEGORY_BY_LOWER.get(low)
+    if direct:
+        return direct
+    alias = _CATEGORY_ALIASES.get(low)
+    if alias:
+        return alias
+    return "Global News"
+
 
 # ---------------------------------------------------------------------------
 # Retrieve-then-decide helpers
@@ -671,7 +696,8 @@ def parse_clustering_response(
     match_basis = _parse_str_list(response.get("match_basis"))
     link_flags = _parse_link_flags(response.get("link_flags"))
 
-    category = str(response.get("category") or "").strip() or None
+    raw_category = str(response.get("category") or "").strip() or None
+    category = _normalise_category(raw_category)
     jurisdiction = str(response.get("jurisdiction") or "").strip() or None
 
     summary_en = str(response.get("summary_en") or "").strip()
