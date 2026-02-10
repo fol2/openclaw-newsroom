@@ -855,7 +855,7 @@ class TestGetAllFreshEvents(unittest.TestCase):
                 events = db.get_all_fresh_events()
                 self.assertTrue(any(e["id"] == eid for e in events))
 
-    def test_includes_expired(self) -> None:
+    def test_excludes_expired_unposted(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
@@ -869,9 +869,26 @@ class TestGetAllFreshEvents(unittest.TestCase):
                 fresh = db.get_fresh_events()
                 self.assertFalse(any(e["id"] == eid for e in fresh))
 
-                # get_all_fresh_events should include it.
+                # get_all_fresh_events should also exclude expired, unposted events.
                 all_events = db.get_all_fresh_events()
-                self.assertTrue(any(e["id"] == eid for e in all_events))
+                self.assertFalse(any(e["id"] == eid for e in all_events))
+
+    def test_excludes_old_posted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Old posted event", category="AI", jurisdiction="US")
+                db.mark_event_posted(eid, thread_id="t1", run_id="r1")
+
+                # Make it older than the default posted_recent_hours window (48h).
+                db._conn.execute(
+                    "UPDATE events SET posted_at_ts = ? WHERE id = ?",
+                    (now - (49 * 3600), eid),
+                )
+
+                events = db.get_all_fresh_events(now_ts=now)
+                self.assertFalse(any(e["id"] == eid for e in events))
 
 
 if __name__ == "__main__":

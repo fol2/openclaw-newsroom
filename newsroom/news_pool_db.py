@@ -757,26 +757,74 @@ class NewsPoolDB:
         row = cur.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_all_fresh_events(self, *, max_age_hours: int = 168) -> list[dict[str, Any]]:
-        """All events within max_age_hours, regardless of status/expiry.
+    def get_all_fresh_events(
+        self,
+        *,
+        max_age_hours: int = 168,
+        now_ts: int | None = None,
+        posted_recent_hours: int = 48,
+        max_root_events: int = 600,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded retrieval universe for clustering/merging.
 
-        Used by retrieval-based clustering to include posted events.
+        Notes:
+        - Root events only (parent_event_id IS NULL).
+        - Unposted events are included only if they are unexpired (expires_at_ts > now).
+        - Posted events are included only within a short recent window for dedupe.
+        - Ordering prefers updated_at_ts / best_published_ts over created_at_ts.
+
+        Args:
+            max_age_hours: Hard safety window for unposted events (based on updated/best_published).
+            posted_recent_hours: Window for including posted events (dedupe).
+            max_root_events: Maximum number of unposted root events to return.
         """
-        now = _utc_now_ts()
-        cutoff = now - max_age_hours * 3600
+        now = now_ts if now_ts is not None else _utc_now_ts()
+        unposted_cutoff = now - max_age_hours * 3600
+        posted_cutoff = now - posted_recent_hours * 3600
         cur = self._conn.cursor()
-        rows = cur.execute(
+
+        # Active/unposted root events: unexpired + recently updated/published.
+        unposted_rows = cur.execute(
             """
             SELECT id, parent_event_id, category, jurisdiction, summary_en,
                    development, title, primary_url, link_count, best_published_ts,
                    status, created_at_ts, updated_at_ts, expires_at_ts,
                    posted_at_ts, thread_id, run_id
             FROM events
-            WHERE created_at_ts >= ?
-            ORDER BY created_at_ts DESC
+            WHERE parent_event_id IS NULL
+              AND status IN ('new', 'active')
+              AND expires_at_ts > ?
+              AND (
+                    COALESCE(updated_at_ts, 0) >= ?
+                 OR COALESCE(best_published_ts, 0) >= ?
+                 OR COALESCE(created_at_ts, 0) >= ?
+              )
+            ORDER BY COALESCE(updated_at_ts, 0) DESC,
+                     COALESCE(best_published_ts, 0) DESC,
+                     id DESC
+            LIMIT ?
             """,
-            (cutoff,),
+            (now, unposted_cutoff, unposted_cutoff, unposted_cutoff, max_root_events),
         ).fetchall()
+
+        # Recent posted root events: include only for short-window dedupe/assignment.
+        posted_rows = cur.execute(
+            """
+            SELECT id, parent_event_id, category, jurisdiction, summary_en,
+                   development, title, primary_url, link_count, best_published_ts,
+                   status, created_at_ts, updated_at_ts, expires_at_ts,
+                   posted_at_ts, thread_id, run_id
+            FROM events
+            WHERE parent_event_id IS NULL
+              AND status = 'posted'
+              AND COALESCE(posted_at_ts, 0) >= ?
+            ORDER BY COALESCE(posted_at_ts, 0) DESC,
+                     id DESC
+            """,
+            (posted_cutoff,),
+        ).fetchall()
+
+        rows = list(unposted_rows) + list(posted_rows)
         return [dict(r) for r in rows]
 
     def get_root_event_id(self, event_id: int) -> int:
