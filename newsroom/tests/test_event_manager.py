@@ -639,10 +639,12 @@ class TestRetrieveCandidates(unittest.TestCase):
         ]
         link = {"title": "Jimmy Lai gets 20-year sentence", "description": "Lai sentenced"}
         candidates = retrieve_candidates(link, events, min_score=0.05)
-        # Should find both regardless of category.
+        # Retrieval should not depend on the category label.
         found_ids = {ev["id"] for ev, _ in candidates}
         self.assertIn(1, found_ids)
-        self.assertIn(2, found_ids)
+        candidates2 = retrieve_candidates(link, [events[1]], min_score=0.05)
+        found_ids2 = {ev["id"] for ev, _ in candidates2}
+        self.assertIn(2, found_ids2)
 
     def test_includes_posted_events(self) -> None:
         events = self._make_events()

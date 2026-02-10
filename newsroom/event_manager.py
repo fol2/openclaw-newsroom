@@ -51,25 +51,162 @@ class EventTokens:
     key_tokens: frozenset[str]
     anchor_tokens: frozenset[str]
 
+_TOKEN_CACHE_DF_SIG_KEY = "__nr_drop_high_df_sig__"
 
-def _tokenize_event(event: dict[str, Any]) -> EventTokens:
+
+def _drop_high_df_signature(drop_high_df: set[str]) -> str:
+    if not drop_high_df:
+        return "df0"
+    h = hashlib.sha1()
+    for t in sorted(drop_high_df):
+        h.update(t.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()[:12]
+
+
+def _compute_drop_high_df(events: list[dict[str, Any]]) -> set[str]:
+    """Compute a deterministic set of high-document-frequency tokens to drop.
+
+    We drop very common tokens across the retrieval universe to avoid glue terms
+    like "government" causing unrelated matches.
+    """
+    if not events:
+        return set()
+
+    df: dict[str, int] = {}
+    for ev in events:
+        summary = str(ev.get("summary_en") or "").strip()
+        title = str(ev.get("title") or "").strip()
+        toks = _si_tokenize_text(summary or title, title if summary else None)
+        # Use "signal" key tokens before DF filtering so DF reflects what would
+        # actually influence retrieval scoring.
+        kt = choose_key_tokens(toks, drop_high_df=set())
+        for t in kt:
+            df[t] = df.get(t, 0) + 1
+
+    # If a token appears in >= ~5% of events (min 8), treat it as non-signal.
+    n = len(events)
+    df_cap = max(8, int(n * 0.05))
+    return {t for t, c in df.items() if c >= df_cap}
+
+
+def _tokenize_event(event: dict[str, Any], *, drop_high_df: set[str] | None = None) -> EventTokens:
     """Tokenize event summary_en + title for retrieval matching."""
+    drop_high_df = drop_high_df or set()
     summary = str(event.get("summary_en") or "").strip()
     title = str(event.get("title") or "").strip()
     tokens = _si_tokenize_text(summary or title, title if summary else None)
     anchors = _si_anchor_terms(summary or title, title if summary else None)
-    key = choose_key_tokens(tokens, drop_high_df=set())
+    key = choose_key_tokens(tokens, drop_high_df=drop_high_df)
     return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
 
 
-def _tokenize_link(link: dict[str, Any]) -> EventTokens:
+def _tokenize_link(link: dict[str, Any], *, drop_high_df: set[str] | None = None) -> EventTokens:
     """Tokenize a link's title + description for retrieval matching."""
+    drop_high_df = drop_high_df or set()
     title = str(link.get("title") or "").strip()
     desc = str(link.get("description") or "").strip()
     tokens = _si_tokenize_text(title, desc)
     anchors = _si_anchor_terms(title, desc)
-    key = choose_key_tokens(tokens, drop_high_df=set())
+    key = choose_key_tokens(tokens, drop_high_df=drop_high_df)
     return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
+
+
+_ROUNDUP_RE = re.compile(
+    r"\b("
+    r"live updates?|liveblog|as it happened|rolling coverage|minute by minute|"
+    r"roundup|recap|highlights|top stories|"
+    r"morning briefing|evening briefing|daily briefing|"
+    r"what we know|everything you need to know|"
+    r"week in review|week ahead|"
+    r"explainer|q&a"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_NOISY_DOMAINS = {
+    # Aggregators / social shorteners tend to produce noisy titles and mixed-topic pages.
+    "news.google.com",
+    "t.co",
+    "x.com",
+    "twitter.com",
+}
+
+
+def _is_noisy_or_roundup_link(link: dict[str, Any]) -> bool:
+    title = str(link.get("title") or "")
+    desc = str(link.get("description") or "")
+    if _ROUNDUP_RE.search(title) or _ROUNDUP_RE.search(desc):
+        return True
+
+    domain = link.get("domain")
+    if isinstance(domain, str) and domain.strip():
+        d = domain.strip().lower()
+        if d.startswith("www."):
+            d = d[4:]
+        if d in _NOISY_DOMAINS:
+            return True
+    return False
+
+
+def _link_published_ts(link: dict[str, Any]) -> int | None:
+    for k in ("published_at_ts", "published_ts"):
+        v = link.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    v = link.get("first_seen_ts")
+    if isinstance(v, int) and v > 0:
+        return v
+    return None
+
+
+def _event_best_ts(ev: dict[str, Any]) -> int | None:
+    for k in ("best_published_ts", "updated_at_ts", "created_at_ts"):
+        v = ev.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+def _recency_bonus(link_ts: int | None, event_ts: int | None) -> float:
+    if not link_ts or not event_ts:
+        return 0.0
+    delta = abs(int(link_ts) - int(event_ts))
+    window = 72 * 3600
+    if delta >= window:
+        return 0.0
+    # 0h -> +0.06, 72h -> +0.00
+    return 0.06 * (1.0 - (float(delta) / float(window)))
+
+
+def _adjusted_min_score(
+    base_min_score: float,
+    *,
+    link_key_token_count: int,
+    link_anchor_token_count: int,
+    noisy_or_roundup: bool,
+) -> float:
+    bump = 0.0
+
+    # Specificity: links with very few tokens/anchors are more ambiguous.
+    if link_key_token_count <= 2:
+        bump += 0.08
+    elif link_key_token_count <= 4:
+        bump += 0.04
+
+    if link_anchor_token_count == 0:
+        bump += 0.08
+    elif link_anchor_token_count == 1:
+        bump += 0.04
+
+    if link_key_token_count <= 2 and link_anchor_token_count <= 1:
+        bump += 0.04
+
+    if noisy_or_roundup:
+        bump += 0.03
+
+    # Never reduce the caller's threshold. Cap to 1.0 so min_score remains meaningful.
+    return min(1.0, float(base_min_score) + bump)
 
 
 def retrieve_candidates(
@@ -77,8 +214,10 @@ def retrieve_candidates(
     events: list[dict[str, Any]],
     *,
     top_k: int = 5,
-    min_score: float = 0.10,
+    min_score: float = 0.18,
     token_cache: dict[int, EventTokens] | None = None,
+    drop_high_df: set[str] | None = None,
+    drop_high_df_sig: str | None = None,
 ) -> list[tuple[dict[str, Any], float]]:
     """Deterministic token/anchor similarity retrieval for candidate events.
 
@@ -88,28 +227,52 @@ def retrieve_candidates(
     if not events:
         return []
 
-    link_tok = _tokenize_link(link)
-    if not link_tok.key_tokens and not link_tok.anchor_tokens:
-        return []
+    drop_high_df = drop_high_df or set()
 
     if token_cache is None:
         token_cache = {}
 
+    if drop_high_df_sig is None:
+        drop_high_df_sig = _drop_high_df_signature(drop_high_df)
+    prev_sig = token_cache.get(_TOKEN_CACHE_DF_SIG_KEY)  # type: ignore[assignment]
+    if prev_sig != drop_high_df_sig:
+        token_cache.clear()
+        token_cache[_TOKEN_CACHE_DF_SIG_KEY] = drop_high_df_sig  # type: ignore[index]
+
+    link_tok = _tokenize_link(link, drop_high_df=drop_high_df)
+    if not link_tok.key_tokens and not link_tok.anchor_tokens:
+        return []
+
+    noisy_or_roundup = _is_noisy_or_roundup_link(link)
+    min_score_adj = _adjusted_min_score(
+        min_score,
+        link_key_token_count=len(link_tok.key_tokens),
+        link_anchor_token_count=len(link_tok.anchor_tokens),
+        noisy_or_roundup=noisy_or_roundup,
+    )
+    link_ts = _link_published_ts(link)
+
     scored: list[tuple[dict[str, Any], float]] = []
     for ev in events:
         eid = ev.get("id", 0)
-        if eid not in token_cache:
-            token_cache[eid] = _tokenize_event(ev)
-        et = token_cache[eid]
+        et: EventTokens | None = None
+        if isinstance(eid, int) and eid > 0:
+            if eid not in token_cache:
+                token_cache[eid] = _tokenize_event(ev, drop_high_df=drop_high_df)
+            et = token_cache.get(eid)
+        if et is None:
+            et = _tokenize_event(ev, drop_high_df=drop_high_df)
 
-        key_sim = jaccard(set(link_tok.key_tokens), set(et.key_tokens))
-        anchor_sim = jaccard(set(link_tok.anchor_tokens), set(et.anchor_tokens))
+        key_sim = jaccard(link_tok.key_tokens, et.key_tokens)
+        anchor_sim = jaccard(link_tok.anchor_tokens, et.anchor_tokens)
 
         score = 0.55 * key_sim + 0.45 * anchor_sim
 
         # Bonus for numeric/entity anchor overlap.
+        anchor_overlap = frozenset()
         if link_tok.anchor_tokens and et.anchor_tokens:
             overlap = link_tok.anchor_tokens & et.anchor_tokens
+            anchor_overlap = overlap
             numeric_overlap = sum(1 for t in overlap if any(c.isdigit() for c in t))
             entity_overlap = sum(
                 1 for t in overlap
@@ -120,11 +283,31 @@ def retrieve_candidates(
             if entity_overlap:
                 score += 0.05 * entity_overlap
 
-        if score >= min_score:
+        # Recency weighting: small bonus for events close in time to the link.
+        score += _recency_bonus(link_ts, _event_best_ts(ev))
+
+        # Noisy/roundup links are prone to false matches; require stronger anchors or a high score.
+        if noisy_or_roundup and len(anchor_overlap) < 2 and score < 0.35:
+            continue
+
+        if score >= min_score_adj:
             scored.append((ev, score))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:top_k]
+    scored.sort(
+        key=lambda x: (
+            -x[1],
+            -(int(x[0].get("best_published_ts") or 0)),
+            -(int(x[0].get("link_count") or 0)),
+            int(x[0].get("id") or 0),
+        )
+    )
+    if not scored:
+        return []
+
+    best = scored[0][1]
+    dynamic_min = max(min_score_adj, best - 0.08)
+    pruned = [it for it in scored if it[1] >= dynamic_min]
+    return pruned[:top_k]
 
 
 def build_focused_clustering_prompt(
@@ -371,6 +554,8 @@ def cluster_link(
     gemini: Any,
     db: Any,
     token_cache: dict[int, EventTokens] | None = None,
+    drop_high_df: set[str] | None = None,
+    drop_high_df_sig: str | None = None,
 ) -> dict[str, Any] | None:
     """Classify a single link using retrieve-then-decide.
 
@@ -386,7 +571,12 @@ def cluster_link(
 
     # Stage 1: Retrieve candidates (deterministic).
     candidates = retrieve_candidates(
-        link, events, top_k=5, min_score=0.10, token_cache=token_cache,
+        link,
+        events,
+        top_k=5,
+        token_cache=token_cache,
+        drop_high_df=drop_high_df,
+        drop_high_df_sig=drop_high_df_sig,
     )
 
     # Stage 2: Focused LLM prompt.
@@ -935,6 +1125,8 @@ def cluster_all_pending(
         all_events = db.get_all_fresh_events(max_age_hours=168)
     except (TypeError, AttributeError):
         all_events = db.get_fresh_events()
+    drop_high_df = _compute_drop_high_df(all_events)
+    drop_high_df_sig = _drop_high_df_signature(drop_high_df)
 
     for i, link in enumerate(links):
         # Early exit: if Gemini is consistently failing, stop wasting quota.
@@ -952,10 +1144,14 @@ def cluster_all_pending(
                 all_events = db.get_all_fresh_events(max_age_hours=168)
             except (TypeError, AttributeError):
                 all_events = db.get_fresh_events()
+            drop_high_df = _compute_drop_high_df(all_events)
+            drop_high_df_sig = _drop_high_df_signature(drop_high_df)
 
         result = cluster_link(
             link=link, all_events=all_events, gemini=gemini, db=db,
             token_cache=token_cache,
+            drop_high_df=drop_high_df,
+            drop_high_df_sig=drop_high_df_sig,
         )
         stats["processed"] += 1
 
