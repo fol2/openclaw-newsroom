@@ -103,12 +103,14 @@ class NewsPoolDB:
             # Fresh database — create all tables directly.
             self._create_all_tables_v5(cur)
             self._create_clustering_decisions_tables(cur)
+            self._ensure_links_skip_cluster_columns(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
         if schema == SCHEMA_VERSION:
             # Auxiliary tables should exist regardless of schema_version.
             self._create_clustering_decisions_tables(cur)
+            self._ensure_links_skip_cluster_columns(cur)
             return
 
         if schema <= 4:
@@ -118,6 +120,7 @@ class NewsPoolDB:
         if schema == 5:
             self._migrate_to_v6(cur)
             self._create_clustering_decisions_tables(cur)
+            self._ensure_links_skip_cluster_columns(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -144,7 +147,9 @@ class NewsPoolDB:
               last_offset INTEGER NOT NULL,
               last_fetched_at_ts INTEGER NOT NULL,
               event_id INTEGER REFERENCES events(id),
-              published_at_ts INTEGER
+              published_at_ts INTEGER,
+              skip_cluster_reason TEXT,
+              skip_clustered_at_ts INTEGER
             );
             """
         )
@@ -254,6 +259,22 @@ class NewsPoolDB:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_clustering_decision_candidates_event_id ON clustering_decision_candidates(event_id);"
+        )
+
+    def _ensure_links_skip_cluster_columns(self, cur: sqlite3.Cursor) -> None:
+        """Ensure links has persistent skip-clustering fields.
+
+        These columns allow the clustering pipeline to deterministically skip
+        multi-topic/roundup links without reprocessing them forever.
+        """
+        if not self._column_exists(cur, "links", "skip_cluster_reason"):
+            cur.execute("ALTER TABLE links ADD COLUMN skip_cluster_reason TEXT;")
+        if not self._column_exists(cur, "links", "skip_clustered_at_ts"):
+            cur.execute("ALTER TABLE links ADD COLUMN skip_clustered_at_ts INTEGER;")
+
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_links_skip_clustered_at_ts ON links(skip_clustered_at_ts) "
+            "WHERE skip_clustered_at_ts IS NOT NULL;"
         )
 
     def _create_events_table_v5(self, cur: sqlite3.Cursor) -> None:
@@ -650,12 +671,30 @@ class NewsPoolDB:
                    first_seen_ts, last_seen_ts, published_at_ts
             FROM links
             WHERE event_id IS NULL
+              AND skip_clustered_at_ts IS NULL
               AND last_seen_ts >= ?
             ORDER BY COALESCE(published_at_ts, first_seen_ts) ASC
             """,
             (cutoff,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def mark_link_skip_cluster(self, *, link_id: int, reason: str, now_ts: int | None = None) -> None:
+        """Mark a link as skipped for clustering (persistent).
+
+        This prevents the same multi-topic/roundup link from being reprocessed on
+        every clustering run.
+        """
+        now = _utc_now_ts() if now_ts is None else int(now_ts)
+        r = str(reason or "").strip()
+        if not r:
+            r = "skip_cluster"
+        if len(r) > 200:
+            r = r[:200]
+        self._conn.execute(
+            "UPDATE links SET skip_cluster_reason = ?, skip_clustered_at_ts = ? WHERE id = ?",
+            (r, now, int(link_id)),
+        )
 
     def assign_link_to_event(self, *, link_id: int, event_id: int) -> None:
         """Set event_id FK on a link and update the event's counters.

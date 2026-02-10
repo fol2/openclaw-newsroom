@@ -57,6 +57,44 @@ class TestNewsPoolDBV5Fresh(unittest.TestCase):
                 self.assertIsNotNone(links[0]["published_at_ts"])
 
 
+class TestLinkSkipCluster(unittest.TestCase):
+    def test_get_unassigned_links_excludes_skip_clustered_links(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                link = PoolLink(
+                    url="https://example.com/skip-1",
+                    norm_url="https://example.com/skip-1",
+                    domain="example.com",
+                    title="Live updates: something happened",
+                    description="Rolling coverage",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+
+                unassigned = db.get_unassigned_links()
+                self.assertEqual(len(unassigned), 1)
+                link_id = int(unassigned[0]["id"])
+
+                db.mark_link_skip_cluster(link_id=link_id, reason="live_updates")
+
+                remaining = db.get_unassigned_links()
+                self.assertEqual(len(remaining), 0)
+
+                row = db._conn.execute(
+                    "SELECT skip_cluster_reason, skip_clustered_at_ts FROM links WHERE id = ?",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["skip_cluster_reason"], "live_updates")
+                self.assertIsNotNone(row["skip_clustered_at_ts"])
+
+
 class TestNewsPoolDBForeignKeys(unittest.TestCase):
     """Test SQLite foreign key enforcement is enabled."""
 

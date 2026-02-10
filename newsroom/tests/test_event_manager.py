@@ -240,6 +240,46 @@ class TestClusterLink(unittest.TestCase):
                 assert ev is not None
                 self.assertEqual(ev["link_count"], 1)
 
+    def test_cluster_link_gate_skips_roundup_links(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://example.com/roundup-1", norm_url="https://example.com/roundup-1",
+                    domain="example.com", title="Morning briefing: PM crisis", description="Latest updates...",
+                    age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                link_id = int(links[0]["id"])
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {"action": "new_event", "summary_en": "Should not be called"}
+
+                result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "skip")
+                self.assertIn("skip_reason", result)
+
+                # Gate should prevent any LLM call.
+                gemini.generate_json.assert_not_called()
+
+                row = db._conn.execute(
+                    "SELECT event_id, skip_cluster_reason, skip_clustered_at_ts FROM links WHERE id = ?",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertIsNone(row["event_id"])
+                self.assertIsInstance(row["skip_cluster_reason"], str)
+                self.assertIsNotNone(row["skip_clustered_at_ts"])
+
+                # Skipped links should not be returned as unassigned links any more.
+                self.assertEqual(db.get_unassigned_links(), [])
+
     def test_cluster_link_logs_decision_assign(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
@@ -367,7 +407,8 @@ class TestClusterLink(unittest.TestCase):
             with NewsPoolDB(path=Path(db_path)) as db:
                 link = PoolLink(
                     url="https://bbc.co.uk/roundup-1", norm_url="https://bbc.co.uk/roundup-1",
-                    domain="bbc.co.uk", title="Morning briefing: PM crisis", description="...",
+                    # Avoid triggering the deterministic gate; we want to exercise LLM-provided link_flags enforcement.
+                    domain="bbc.co.uk", title="PM crisis continues", description="...",
                     age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
                     fetched_at_ts=int(time.time()),
                 )
@@ -470,6 +511,46 @@ class TestClusterLink(unittest.TestCase):
 
                 remaining = db.get_unassigned_links()
                 self.assertEqual(len(remaining), 1)
+
+    def test_cluster_link_skip_cluster_gate_does_not_call_gemini_and_records_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://example.com/live-1",
+                    norm_url="https://example.com/live-1",
+                    domain="example.com",
+                    title="Live updates: PM crisis",
+                    description="Rolling coverage of multiple developments",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                link_id = int(links[0]["id"])
+
+                gemini = MagicMock()
+
+                result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "skip")
+                self.assertEqual(result["skip_reason"], "live_updates")
+
+                gemini.generate_json.assert_not_called()
+
+                row = db._conn.execute(
+                    "SELECT skip_cluster_reason, skip_clustered_at_ts FROM links WHERE id = ?",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["skip_cluster_reason"], "live_updates")
+                self.assertIsNotNone(row["skip_clustered_at_ts"])
 
     def test_cluster_link_logs_decision_empty_response(self) -> None:
         with tempfile.TemporaryDirectory() as td:
