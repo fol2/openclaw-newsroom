@@ -95,8 +95,34 @@ uv run python scripts/newsroom_runner.py --dry-run
 | `gdelt_pool_update.py` | Fetches articles from GDELT DOC 2.0 API (free, no auth) and upserts into the pool. |
 | `rss_pool_update.py` | Fetches articles from curated RSS/Atom feeds and upserts into the pool. |
 | `news_pool_status.py` | Diagnostic tool -- shows pool statistics, cluster counts, and link freshness. |
+| `news_pool_dump_jsonl.py` | Dumps a consistent snapshot of `links` + `events` to JSONL for sandbox rebuilds. |
+| `news_pool_restore_jsonl.py` | Restores a JSONL dump into a fresh SQLite DB (refuses to overwrite without `--overwrite`). |
 
 All scripts live in the `scripts/` directory and are invoked as standalone Python scripts.
+
+## DB Sandbox Rebuild (JSONL Dump/Restore)
+
+When experimenting with clustering changes, avoid touching the production SQLite DB.
+You can export a snapshot of recent pool data to JSONL, restore it into a separate
+DB file, and run the planner/clustering scripts against the sandbox.
+
+```bash
+# Dump into a timestamped folder (UTC)
+uv run python scripts/news_pool_dump_jsonl.py \
+  --db data/newsroom/news_pool.sqlite3 \
+  --out-dir data/newsroom/db_dumps/$(date -u +%Y%m%dT%H%M%SZ)
+
+# Restore into a sandbox DB (will refuse to overwrite unless --overwrite is set)
+uv run python scripts/news_pool_restore_jsonl.py \
+  --dump-dir data/newsroom/db_dumps/<TIMESTAMP> \
+  --db data/newsroom/news_pool.sandbox.sqlite3
+
+# Run the hourly inputs pipeline against the sandbox DB
+uv run python scripts/newsroom_hourly_inputs.py --db data/newsroom/news_pool.sandbox.sqlite3
+```
+
+By default the dump includes links seen in the last 48 hours and events created in
+the last 168 hours, plus any events referenced by those links (and their parents).
 
 ## Testing
 
