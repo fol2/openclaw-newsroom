@@ -64,6 +64,8 @@ class NewsPoolDB:
         # Use WAL for concurrent readers (planner) while collector is writing.
         self._conn = sqlite3.connect(str(path), timeout=30, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # Ensure SQLite enforces declared foreign key constraints.
+        self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
 
