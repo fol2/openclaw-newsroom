@@ -1,5 +1,16 @@
 # Newsroom Agent and Cron System
 
+## 0. Development Workflow Note
+
+When asked to create PRs (especially when using multiple sub-agents), prefer **real GitHub PRs** by default:
+
+- Each sub-agent should work on its own branch (and worktree if helpful).
+- Push the branch to the remote.
+- Open a GitHub PR (e.g. via `gh pr create`) and share the PR link/number in the handoff.
+- Merge via GitHub after review.
+
+If GitHub access is unavailable (no remote, no auth, or network restrictions), fall back to local branches and clearly state that the workflow is local-only.
+
 ## 1. Overview
 
 The newsroom uses a two-tier agent architecture: LLM planners (run via cron) select stories, then a deterministic runner executes the story-writing pipeline. This separation ensures LLM creativity for story selection while maintaining reliability for execution.
