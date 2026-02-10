@@ -22,7 +22,7 @@
     "destination": {
       "type": "object",
       "properties": {
-        "platform": { "type": "string", "enum": ["discord", "webhook"] },
+        "platform": { "type": "string", "enum": ["discord"] },
         "default_title_channel_id": { "type": "string" }
       },
       "additionalProperties": true
@@ -42,4 +42,3 @@
   },
   "additionalProperties": true
 }
-

@@ -22,6 +22,7 @@ from newsroom.prompt_policy import prompt_id_for_category  # noqa: E402
 
 _TRIGGER_ALIASES = {"manual_run": "manual"}
 _VALID_TRIGGERS = {"cron_hourly", "cron_daily", "manual"}
+_MIN_TIMEOUT_SECONDS = 60
 
 
 def _is_snowflake(v: str) -> bool:
@@ -241,6 +242,8 @@ def main(argv: list[str]) -> int:
         print(f"WARNING: unknown trigger {trigger!r}, defaulting to 'manual'", file=sys.stderr)
         trigger = "manual"
 
+    timeout_seconds = int(max(_MIN_TIMEOUT_SECONDS, args.timeout_seconds))
+
     run_job: dict[str, Any] = {
         "schema_version": "run_job_v1",
         "run": {"run_id": folder, "trigger": trigger, "run_time_uk": run_time_uk},
@@ -248,7 +251,7 @@ def main(argv: list[str]) -> int:
         "runner": {
             "concurrency": int(max(1, args.concurrency)),
             "stagger_seconds": int(max(0, args.stagger_seconds)),
-            "default_timeout_seconds": int(max(60, args.timeout_seconds)),
+            "default_timeout_seconds": timeout_seconds,
             "dm_targets": [str(t).strip() for t in (args.dm_target or []) if isinstance(t, str) and str(t).strip()],
             "stop_run_on_failure": bool(args.stop_run_on_failure),
         },
@@ -331,7 +334,7 @@ def main(argv: list[str]) -> int:
                     "run_time_uk": "$.run.run_time_uk",
                 },
             },
-            "monitor": {"poll_seconds": 5, "timeout_seconds": 900, "result_json_required": True},
+            "monitor": {"poll_seconds": 5, "timeout_seconds": timeout_seconds, "result_json_required": True},
             "post": {"on_success_dm_targets": [], "on_failure_dm_targets": []},
             "recover": {"enabled": True, "rescue_prompt_id": "news_rescue_script_v1", "max_rescue_attempts": 1, "rescue_timeout_seconds": 600},
             "validation": {"validator_id": "news_reporter_script_v1", "stop_run_on_failure": False},

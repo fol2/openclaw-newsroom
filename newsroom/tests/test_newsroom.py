@@ -17,11 +17,35 @@ class TestSchemas(unittest.TestCase):
         example = json.loads((root / "newsroom" / "examples" / "story_job_example.json").read_text(encoding="utf-8"))
         jsonschema.validate(instance=example, schema=schema)
 
+    def test_story_job_disallows_webhook_platform(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        schema = json.loads((root / "newsroom" / "schemas" / "story_job_v1.schema.json").read_text(encoding="utf-8"))
+        example = json.loads((root / "newsroom" / "examples" / "story_job_example.json").read_text(encoding="utf-8"))
+        example["destination"]["platform"] = "webhook"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(instance=example, schema=schema)
+
+    def test_story_job_requires_title_channel_id_for_discord(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        schema = json.loads((root / "newsroom" / "schemas" / "story_job_v1.schema.json").read_text(encoding="utf-8"))
+        example = json.loads((root / "newsroom" / "examples" / "story_job_example.json").read_text(encoding="utf-8"))
+        example["destination"].pop("title_channel_id", None)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(instance=example, schema=schema)
+
     def test_run_job_example_validates(self) -> None:
         root = Path(__file__).resolve().parents[2]
         schema = json.loads((root / "newsroom" / "schemas" / "run_job_v1.schema.json").read_text(encoding="utf-8"))
         example = json.loads((root / "newsroom" / "examples" / "run_job_example.json").read_text(encoding="utf-8"))
         jsonschema.validate(instance=example, schema=schema)
+
+    def test_run_job_disallows_webhook_platform(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        schema = json.loads((root / "newsroom" / "schemas" / "run_job_v1.schema.json").read_text(encoding="utf-8"))
+        example = json.loads((root / "newsroom" / "examples" / "run_job_example.json").read_text(encoding="utf-8"))
+        example["destination"]["platform"] = "webhook"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(instance=example, schema=schema)
 
 
 class TestPromptRegistry(unittest.TestCase):

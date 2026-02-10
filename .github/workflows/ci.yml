@@ -23,8 +23,7 @@ jobs:
         run: uv lock --check
 
       - name: Sync (Dev)
-        run: uv sync --dev
+        run: uv sync --dev --locked
 
       - name: Tests
-        run: uv run pytest -q
-
+        run: uv run python -m pytest -q

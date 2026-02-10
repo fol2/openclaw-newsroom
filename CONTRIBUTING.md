@@ -22,7 +22,7 @@ uv sync --dev
 All tests must pass before submitting changes:
 
 ```bash
-uv run pytest newsroom/tests/ -v
+uv run python -m pytest newsroom/tests/ -v
 ```
 
 Tests are located in `newsroom/tests/` and cover validators, result repair, prompt registry resolution, job schemas, deduplication, tokenization, and more.

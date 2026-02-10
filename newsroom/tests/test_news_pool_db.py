@@ -57,6 +57,45 @@ class TestNewsPoolDBV5Fresh(unittest.TestCase):
                 self.assertIsNotNone(links[0]["published_at_ts"])
 
 
+class TestNewsPoolDBForeignKeys(unittest.TestCase):
+    """Test SQLite foreign key enforcement is enabled."""
+
+    def test_foreign_keys_pragma_is_on(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                row = db._conn.execute("PRAGMA foreign_keys;").fetchone()
+                assert row is not None
+                self.assertEqual(int(row[0]), 1)
+
+    def test_foreign_key_constraints_are_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db._conn.execute(
+                        """
+                        INSERT INTO links(
+                          url, norm_url,
+                          first_seen_ts, last_seen_ts,
+                          last_query, last_offset, last_fetched_at_ts,
+                          event_id
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "https://example.com/bad",
+                            "https://example.com/bad",
+                            now,
+                            now,
+                            "test",
+                            1,
+                            now,
+                            9999,
+                        ),
+                    )
+
+
 class TestNewsPoolDBV5Migration(unittest.TestCase):
     """Test migration from v4 to v5."""
 
@@ -125,6 +164,9 @@ class TestNewsPoolDBV5Migration(unittest.TestCase):
 
             with NewsPoolDB(path=db_path) as db:
                 self.assertEqual(db.get_meta_int("schema_version"), 6)
+                row = db._conn.execute("PRAGMA foreign_keys;").fetchone()
+                assert row is not None
+                self.assertEqual(int(row[0]), 1)
 
                 # Old tables renamed to _legacy.
                 conn = db._conn
@@ -324,6 +366,9 @@ class TestNewsPoolDBV5ToV6Migration(unittest.TestCase):
 
             with NewsPoolDB(path=db_path) as db:
                 self.assertEqual(db.get_meta_int("schema_version"), 6)
+                row = db._conn.execute("PRAGMA foreign_keys;").fetchone()
+                assert row is not None
+                self.assertEqual(int(row[0]), 1)
 
                 # reserved_until_ts column should exist.
                 cur = db._conn.cursor()

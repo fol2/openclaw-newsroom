@@ -1,5 +1,6 @@
 """Tests for newsroom.event_manager — LLM clustering logic."""
 import json
+import re as _re
 import tempfile
 import time
 import unittest
@@ -8,13 +9,19 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from newsroom.event_manager import (
+    EventTokens,
+    _find_cross_category_duplicates,
+    _tokenize_event,
+    _tokenize_link,
     build_clustering_prompt,
+    build_focused_clustering_prompt,
     build_merge_prompt,
     cluster_all_pending,
     cluster_link,
     merge_events,
     parse_clustering_response,
     parse_merge_response,
+    retrieve_candidates,
 )
 from newsroom.news_pool_db import NewsPoolDB, PoolLink
 
@@ -136,7 +143,6 @@ class TestClusterLink(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
-                # Create a link.
                 link = PoolLink(
                     url="https://bbc.co.uk/1", norm_url="https://bbc.co.uk/1",
                     domain="bbc.co.uk", title="PM crisis", description="...",
@@ -147,15 +153,13 @@ class TestClusterLink(unittest.TestCase):
                 links = db.get_unassigned_links()
                 self.assertEqual(len(links), 1)
 
-                # Create an event.
                 eid = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
 
-                # Mock Gemini to return assign.
                 gemini = MagicMock()
                 gemini.generate_json.return_value = {"action": "assign", "event_id": eid}
 
                 fresh = db.get_fresh_events()
-                result = cluster_link(link=links[0], fresh_events=fresh, gemini=gemini, db=db)
+                result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
                 self.assertIsNotNone(result)
                 assert result is not None
                 self.assertEqual(result["action"], "assign")
@@ -185,13 +189,12 @@ class TestClusterLink(unittest.TestCase):
                     "jurisdiction": "GLOBAL",
                 }
 
-                result = cluster_link(link=links[0], fresh_events=[], gemini=gemini, db=db)
+                result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
                 self.assertIsNotNone(result)
                 assert result is not None
                 self.assertEqual(result["action"], "new_event")
                 self.assertIn("event_id", result)
 
-                # Event should exist.
                 ev = db.get_event(result["event_id"])
                 self.assertIsNotNone(ev)
                 assert ev is not None
@@ -213,12 +216,65 @@ class TestClusterLink(unittest.TestCase):
                 gemini = MagicMock()
                 gemini.generate_json.return_value = None
 
-                result = cluster_link(link=links[0], fresh_events=[], gemini=gemini, db=db)
+                result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
                 self.assertIsNone(result)
 
-                # Link should still be unassigned.
                 remaining = db.get_unassigned_links()
                 self.assertEqual(len(remaining), 1)
+
+    def test_cluster_link_backward_compat_fresh_events(self) -> None:
+        """fresh_events param still works as backward compat alias."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/4", norm_url="https://bbc.co.uk/4",
+                    domain="bbc.co.uk", title="Test", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "new_event", "summary_en": "Test event",
+                    "category": "AI", "jurisdiction": "US",
+                }
+
+                # Use fresh_events (old param name).
+                result = cluster_link(link=links[0], fresh_events=[], gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+
+    def test_cluster_link_assign_to_posted_event(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/5", norm_url="https://bbc.co.uk/5",
+                    domain="bbc.co.uk", title="Jimmy Lai sentenced to 20 years",
+                    description="Former media tycoon Jimmy Lai sentenced",
+                    age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years in prison",
+                    category="Hong Kong News", jurisdiction="HK",
+                )
+                db.mark_event_posted(eid, thread_id="t1", run_id="r1")
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {"action": "assign", "event_id": eid}
+
+                events = db.get_all_fresh_events()
+                result = cluster_link(link=links[0], all_events=events, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "assign")
+                self.assertTrue(result.get("assigned_to_posted"))
 
 
 class TestClusterAllPending(unittest.TestCase):
@@ -226,14 +282,13 @@ class TestClusterAllPending(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
-                # Insert 3 links.
                 for i in range(3):
                     link = PoolLink(
                         url=f"https://example.com/{i}",
                         norm_url=f"https://example.com/{i}",
                         domain="example.com",
-                        title=f"Article {i}",
-                        description=f"Description {i}",
+                        title=f"Jimmy Lai sentenced article {i}",
+                        description=f"Jimmy Lai sentenced to 20 years {i}",
                         age=None,
                         page_age="2026-02-07T10:00:00",
                         query="test",
@@ -242,23 +297,17 @@ class TestClusterAllPending(unittest.TestCase):
                     )
                     db.upsert_links([link])
 
-                # Mock Gemini: first creates new event, others assigned to it.
-                call_count = [0]
-
                 def mock_generate_json(prompt: str) -> dict[str, Any] | None:
-                    call_count[0] += 1
-                    if call_count[0] == 1:
-                        return {
-                            "action": "new_event",
-                            "summary_en": "Test event cluster",
-                            "category": "AI",
-                            "jurisdiction": "US",
-                        }
-                    # For subsequent calls, find the event id.
-                    fresh = db.get_fresh_events()
-                    if fresh:
-                        return {"action": "assign", "event_id": fresh[0]["id"]}
-                    return {"action": "new_event", "summary_en": "Another", "category": "AI", "jurisdiction": "US"}
+                    # Prompt-aware: if candidates shown in prompt, assign to first.
+                    ids_in_prompt = [int(m) for m in _re.findall(r'\[id=(\d+)\]', prompt)]
+                    if ids_in_prompt:
+                        return {"action": "assign", "event_id": ids_in_prompt[0]}
+                    return {
+                        "action": "new_event",
+                        "summary_en": "Jimmy Lai sentenced to 20 years",
+                        "category": "Hong Kong News",
+                        "jurisdiction": "HK",
+                    }
 
                 gemini = MagicMock()
                 gemini.generate_json.side_effect = mock_generate_json
@@ -268,7 +317,6 @@ class TestClusterAllPending(unittest.TestCase):
                 self.assertEqual(stats["errors"], 0)
                 self.assertGreaterEqual(stats["new_events"], 1)
 
-                # All links should be assigned.
                 remaining = db.get_unassigned_links()
                 self.assertEqual(len(remaining), 0)
 
@@ -330,7 +378,6 @@ class TestParseMergeResponse(unittest.TestCase):
         result = parse_merge_response(response, valid_ids)
         self.assertIsNotNone(result)
         assert result is not None
-        # First group gets 42, 55. Second group: 55 already seen, only 78 left → <2 → filtered.
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0], [42, 55])
 
@@ -340,7 +387,6 @@ class TestMergeEventsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
-                # Create two events in same category that are duplicates.
                 eid1 = db.create_event(
                     summary_en="UK PM faces crisis over Mandelson links",
                     category="UK Parliament / Politics", jurisdiction="UK",
@@ -349,12 +395,10 @@ class TestMergeEventsIntegration(unittest.TestCase):
                     summary_en="Peter Mandelson investigated by FCA",
                     category="UK Parliament / Politics", jurisdiction="UK",
                 )
-                # Create an unrelated event in a different category.
                 eid3 = db.create_event(
                     summary_en="Tesla Q4 earnings beat", category="US Stocks", jurisdiction="US",
                 )
 
-                # Add links to eid1 (more links = winner).
                 for i in range(3):
                     link = PoolLink(
                         url=f"https://bbc.co.uk/m{i}", norm_url=f"https://bbc.co.uk/m{i}",
@@ -366,7 +410,6 @@ class TestMergeEventsIntegration(unittest.TestCase):
                     links = db.get_unassigned_links()
                     db.assign_link_to_event(link_id=links[0]["id"], event_id=eid1)
 
-                # Add 1 link to eid2.
                 link = PoolLink(
                     url="https://telegraph.co.uk/m", norm_url="https://telegraph.co.uk/m",
                     domain="telegraph.co.uk", title="FCA probe", description="...",
@@ -377,7 +420,6 @@ class TestMergeEventsIntegration(unittest.TestCase):
                 links = db.get_unassigned_links()
                 db.assign_link_to_event(link_id=links[0]["id"], event_id=eid2)
 
-                # Mock Gemini to group eid1 + eid2.
                 gemini = MagicMock()
                 gemini.generate.return_value = json.dumps({
                     "groups": [[eid1, eid2]],
@@ -388,19 +430,16 @@ class TestMergeEventsIntegration(unittest.TestCase):
 
                 self.assertEqual(stats["groups_merged"], 1)
                 self.assertEqual(stats["events_removed"], 1)
-                self.assertEqual(stats["links_moved"], 1)  # 1 link moved from eid2 to eid1.
+                self.assertEqual(stats["links_moved"], 1)
                 self.assertEqual(stats["errors"], 0)
 
-                # Winner (eid1) should have 4 links now.
                 winner = db.get_event(eid1)
                 assert winner is not None
                 self.assertEqual(winner["link_count"], 4)
 
-                # Loser (eid2) should be deleted.
                 loser = db.get_event(eid2)
                 self.assertIsNone(loser)
 
-                # Unrelated event should be untouched.
                 other = db.get_event(eid3)
                 self.assertIsNotNone(other)
 
@@ -408,7 +447,6 @@ class TestMergeEventsIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
-                # Only 1 event in category — no merge needed.
                 db.create_event(summary_en="Solo event", category="AI", jurisdiction="US")
 
                 gemini = MagicMock()
@@ -428,13 +466,13 @@ class TestClusterEarlyExit(unittest.TestCase):
             {"id": i, "url": f"https://example.com/{i}", "title": f"Story {i}", "description": "desc"}
             for i in range(num_links)
         ]
+        db.get_all_fresh_events.return_value = []
         db.get_fresh_events.return_value = []
         return db
 
     def test_early_exit_after_consecutive_failures(self) -> None:
         db = self._make_mock_db(10)
 
-        # Gemini always returns None (failure).
         gemini = MagicMock()
         gemini.generate_json.return_value = None
 
@@ -442,7 +480,6 @@ class TestClusterEarlyExit(unittest.TestCase):
             db=db, gemini=gemini, delay_seconds=0, max_consecutive_failures=3,
         )
 
-        # Should process exactly 3, skip remaining 7.
         self.assertEqual(stats["processed"], 3)
         self.assertEqual(stats["errors"], 3)
         self.assertEqual(stats["skipped"], 7)
@@ -450,7 +487,6 @@ class TestClusterEarlyExit(unittest.TestCase):
     def test_no_early_exit_on_intermittent_failures(self) -> None:
         db = self._make_mock_db(6)
 
-        # Alternate: fail, fail, succeed, fail, fail, succeed.
         call_count = 0
         def side_effect(*args, **kwargs):
             nonlocal call_count
@@ -466,9 +502,292 @@ class TestClusterEarlyExit(unittest.TestCase):
             db=db, gemini=gemini, delay_seconds=0, max_consecutive_failures=3,
         )
 
-        # All 6 processed, no skips (consecutive never hit 3).
         self.assertEqual(stats["processed"], 6)
         self.assertEqual(stats["skipped"], 0)
+
+
+# ---------------------------------------------------------------------------
+# New tests for retrieve-then-decide
+# ---------------------------------------------------------------------------
+
+class TestTokenization(unittest.TestCase):
+    def test_tokenize_event(self) -> None:
+        ev = {"summary_en": "Jimmy Lai sentenced to 20 years in prison", "title": "Lai trial"}
+        tok = _tokenize_event(ev)
+        self.assertIsInstance(tok, EventTokens)
+        self.assertTrue(len(tok.key_tokens) > 0)
+
+    def test_tokenize_link(self) -> None:
+        link = {"title": "Jimmy Lai sentenced to 20 years", "description": "Former media tycoon"}
+        tok = _tokenize_link(link)
+        self.assertIsInstance(tok, EventTokens)
+        self.assertTrue(len(tok.key_tokens) > 0)
+
+    def test_tokenize_empty(self) -> None:
+        tok = _tokenize_event({"summary_en": "", "title": ""})
+        self.assertEqual(len(tok.key_tokens), 0)
+
+
+class TestRetrieveCandidates(unittest.TestCase):
+    def _make_events(self) -> list[dict[str, Any]]:
+        return [
+            {"id": 1, "summary_en": "Jimmy Lai sentenced to 20 years in prison", "title": "Lai trial",
+             "category": "Hong Kong News", "status": "active"},
+            {"id": 2, "summary_en": "Leicester City handed six-point deduction", "title": "Leicester",
+             "category": "Sports", "status": "active"},
+            {"id": 3, "summary_en": "Tesla Q4 earnings beat expectations", "title": "Tesla Q4",
+             "category": "US Stocks", "status": "posted"},
+        ]
+
+    def test_finds_matching_event(self) -> None:
+        events = self._make_events()
+        link = {"title": "Jimmy Lai sentenced to 20 years by Hong Kong court", "description": "Media tycoon"}
+        candidates = retrieve_candidates(link, events, min_score=0.05)
+        self.assertTrue(len(candidates) > 0)
+        self.assertEqual(candidates[0][0]["id"], 1)
+
+    def test_cross_category_matching(self) -> None:
+        events = [
+            {"id": 1, "summary_en": "Jimmy Lai sentenced to 20 years", "title": "Lai",
+             "category": "Hong Kong News", "status": "active"},
+            {"id": 2, "summary_en": "Jimmy Lai jailed for 20 years under national security law", "title": "Lai",
+             "category": "Global News", "status": "active"},
+        ]
+        link = {"title": "Jimmy Lai gets 20-year sentence", "description": "Lai sentenced"}
+        candidates = retrieve_candidates(link, events, min_score=0.05)
+        # Should find both regardless of category.
+        found_ids = {ev["id"] for ev, _ in candidates}
+        self.assertIn(1, found_ids)
+        self.assertIn(2, found_ids)
+
+    def test_includes_posted_events(self) -> None:
+        events = self._make_events()
+        link = {"title": "Tesla Q4 earnings surprise Wall Street", "description": "Tesla revenue up"}
+        candidates = retrieve_candidates(link, events, min_score=0.05)
+        found_ids = {ev["id"] for ev, _ in candidates}
+        self.assertIn(3, found_ids)  # Posted event should be found.
+
+    def test_respects_top_k(self) -> None:
+        events = self._make_events()
+        link = {"title": "Jimmy Lai sentenced", "description": "Lai trial"}
+        candidates = retrieve_candidates(link, events, top_k=1, min_score=0.01)
+        self.assertLessEqual(len(candidates), 1)
+
+    def test_respects_min_score(self) -> None:
+        events = self._make_events()
+        link = {"title": "Jimmy Lai sentenced to 20 years", "description": "Lai"}
+        candidates = retrieve_candidates(link, events, min_score=0.99)
+        # Very high min_score should filter almost everything.
+        self.assertEqual(len(candidates), 0)
+
+    def test_novel_story_no_candidates(self) -> None:
+        events = self._make_events()
+        link = {"title": "Volcanic eruption in Iceland", "description": "Massive eruption near Reykjavik"}
+        candidates = retrieve_candidates(link, events, min_score=0.10)
+        self.assertEqual(len(candidates), 0)
+
+    def test_token_cache(self) -> None:
+        events = self._make_events()
+        cache: dict[int, EventTokens] = {}
+        link = {"title": "Jimmy Lai sentenced", "description": ""}
+        retrieve_candidates(link, events, token_cache=cache)
+        self.assertTrue(len(cache) > 0)
+        # Second call reuses cache.
+        retrieve_candidates(link, events, token_cache=cache)
+
+    def test_empty_events(self) -> None:
+        link = {"title": "Test", "description": ""}
+        candidates = retrieve_candidates(link, [])
+        self.assertEqual(len(candidates), 0)
+
+
+class TestBuildFocusedClusteringPrompt(unittest.TestCase):
+    def test_no_candidates_prompt(self) -> None:
+        link = {"title": "New volcano erupts", "description": ""}
+        prompt = build_focused_clustering_prompt(link, [])
+        self.assertIn("NEW EVENT", prompt)
+        self.assertIn("new_event", prompt)
+        self.assertNotIn("ASSIGN", prompt)
+
+    def test_with_candidates_shows_scores(self) -> None:
+        ev = {"id": 42, "summary_en": "Volcano erupted", "category": "Global News",
+              "jurisdiction": "GLOBAL", "status": "active", "link_count": 3}
+        candidates = [(ev, 0.75)]
+        prompt = build_focused_clustering_prompt({"title": "Volcano erupts again"}, candidates)
+        self.assertIn("[id=42]", prompt)
+        self.assertIn("score=0.75", prompt)
+        self.assertIn("ASSIGN", prompt)
+
+    def test_assign_first_guidance(self) -> None:
+        ev = {"id": 1, "summary_en": "Test event", "category": "AI",
+              "jurisdiction": "US", "status": "active", "link_count": 1}
+        candidates = [(ev, 0.5)]
+        prompt = build_focused_clustering_prompt({"title": "Test"}, candidates)
+        self.assertIn("ASSIGN is likely correct", prompt)
+
+    def test_development_criteria(self) -> None:
+        ev = {"id": 1, "summary_en": "Test event", "category": "AI",
+              "jurisdiction": "US", "status": "active", "link_count": 1}
+        candidates = [(ev, 0.5)]
+        prompt = build_focused_clustering_prompt({"title": "Test"}, candidates)
+        self.assertIn("DEVELOPMENT", prompt)
+        self.assertIn("new phase", prompt)
+
+
+class TestMergeIncludesPosted(unittest.TestCase):
+    def test_posted_status_transfer(self) -> None:
+        """If loser is posted and winner is not, posted status should transfer."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                eid1 = db.create_event(
+                    summary_en="Jimmy Lai sentenced (version 1)",
+                    category="Hong Kong News", jurisdiction="HK",
+                )
+                eid2 = db.create_event(
+                    summary_en="Jimmy Lai sentenced (version 2)",
+                    category="Hong Kong News", jurisdiction="HK",
+                )
+                # Mark eid2 as posted.
+                db.mark_event_posted(eid2, thread_id="t123", run_id="r123")
+
+                # Add more links to eid1 so it wins.
+                for i in range(3):
+                    link = PoolLink(
+                        url=f"https://example.com/p{i}", norm_url=f"https://example.com/p{i}",
+                        domain="example.com", title=f"Lai {i}", description="...",
+                        age=None, page_age=None, query="test", offset=1,
+                        fetched_at_ts=int(time.time()),
+                    )
+                    db.upsert_links([link])
+                    links = db.get_unassigned_links()
+                    db.assign_link_to_event(link_id=links[0]["id"], event_id=eid1)
+
+                gemini = MagicMock()
+                gemini.generate.return_value = json.dumps({
+                    "groups": [[eid1, eid2]], "no_merge": [],
+                })
+
+                stats = merge_events(db=db, gemini=gemini, delay_seconds=0)
+                self.assertGreaterEqual(stats["groups_merged"], 1)
+
+                winner = db.get_event(eid1)
+                assert winner is not None
+                self.assertEqual(winner["status"], "posted")
+
+    def test_cross_category_merge(self) -> None:
+        """Events in different categories with shared anchors should be detected."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                eid1 = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years in prison under national security law",
+                    category="Hong Kong News", jurisdiction="HK",
+                )
+                eid2 = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years for sedition under Hong Kong national security law",
+                    category="Global News", jurisdiction="HK",
+                )
+
+                gemini = MagicMock()
+                gemini.generate.return_value = json.dumps({
+                    "groups": [[eid1, eid2]], "no_merge": [],
+                })
+
+                stats = merge_events(db=db, gemini=gemini, delay_seconds=0)
+                self.assertGreaterEqual(stats["cross_category_pairs"], 1)
+
+
+class TestDedupeMarkerRootAncestor(unittest.TestCase):
+    def test_child_event_key_matches_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                parent_id = db.create_event(summary_en="Parent event", category="AI", jurisdiction="US")
+                child_id = db.create_event(
+                    summary_en="Child development", category="AI", jurisdiction="US",
+                    parent_event_id=parent_id,
+                )
+
+                root = db.get_root_event_id(child_id)
+                self.assertEqual(root, parent_id)
+
+    def test_deeply_nested_resolves_to_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                root_id = db.create_event(summary_en="Root", category="AI", jurisdiction="US")
+                mid_id = db.create_event(summary_en="Mid", category="AI", jurisdiction="US", parent_event_id=root_id)
+                leaf_id = db.create_event(summary_en="Leaf", category="AI", jurisdiction="US", parent_event_id=mid_id)
+
+                self.assertEqual(db.get_root_event_id(leaf_id), root_id)
+                self.assertEqual(db.get_root_event_id(mid_id), root_id)
+
+    def test_root_returns_itself(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                root_id = db.create_event(summary_en="Root event", category="AI", jurisdiction="US")
+                self.assertEqual(db.get_root_event_id(root_id), root_id)
+
+
+class TestFindCrossCategoryDuplicates(unittest.TestCase):
+    def test_finds_cross_category_pairs(self) -> None:
+        events = [
+            {"id": 1, "summary_en": "Jimmy Lai sentenced to 20 years in prison",
+             "title": "Lai trial", "category": "Hong Kong News"},
+            {"id": 2, "summary_en": "Jimmy Lai sentenced to 20 years under national security law",
+             "title": "Lai jailed", "category": "Global News"},
+        ]
+        pairs = _find_cross_category_duplicates(events, min_anchor_overlap=2)
+        self.assertTrue(len(pairs) > 0)
+        self.assertIn((1, 2), pairs)
+
+    def test_same_category_excluded(self) -> None:
+        events = [
+            {"id": 1, "summary_en": "Jimmy Lai sentenced", "title": "Lai", "category": "HK News"},
+            {"id": 2, "summary_en": "Jimmy Lai jailed", "title": "Lai", "category": "HK News"},
+        ]
+        pairs = _find_cross_category_duplicates(events)
+        self.assertEqual(len(pairs), 0)
+
+    def test_unrelated_events_excluded(self) -> None:
+        events = [
+            {"id": 1, "summary_en": "Jimmy Lai sentenced", "title": "Lai", "category": "HK News"},
+            {"id": 2, "summary_en": "Tesla Q4 earnings beat", "title": "Tesla", "category": "US Stocks"},
+        ]
+        pairs = _find_cross_category_duplicates(events, min_anchor_overlap=2)
+        self.assertEqual(len(pairs), 0)
+
+
+class TestGetAllFreshEvents(unittest.TestCase):
+    def test_includes_posted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                eid = db.create_event(summary_en="Posted event", category="AI", jurisdiction="US")
+                db.mark_event_posted(eid, thread_id="t1", run_id="r1")
+
+                events = db.get_all_fresh_events()
+                self.assertTrue(any(e["id"] == eid for e in events))
+
+    def test_includes_expired(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                eid = db.create_event(summary_en="Test event", category="AI", jurisdiction="US")
+                # Expire the event.
+                db._conn.execute(
+                    "UPDATE events SET expires_at_ts = 1 WHERE id = ?", (eid,)
+                )
+
+                # get_fresh_events should NOT include it.
+                fresh = db.get_fresh_events()
+                self.assertFalse(any(e["id"] == eid for e in fresh))
+
+                # get_all_fresh_events should include it.
+                all_events = db.get_all_fresh_events()
+                self.assertTrue(any(e["id"] == eid for e in all_events))
 
 
 if __name__ == "__main__":

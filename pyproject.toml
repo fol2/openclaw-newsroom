@@ -22,6 +22,10 @@ Issues = "https://github.com/fol2/openclaw-newsroom/issues"
 
 [project.optional-dependencies]
 charts = ["Pillow>=10.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
 
 [dependency-groups]
 dev = [

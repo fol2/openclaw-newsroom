@@ -56,6 +56,8 @@ class TestWriteRunJobScript(unittest.TestCase):
                 "2026-02-04 07:00 AM",
                 "--trigger",
                 "cron_daily",
+                "--timeout-seconds",
+                "1234",
                 "--pick",
                 "1",
                 "--pick",
@@ -77,6 +79,7 @@ class TestWriteRunJobScript(unittest.TestCase):
 
             run_json = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
             jsonschema.validate(instance=run_json, schema=run_schema)
+            self.assertEqual(run_json["runner"]["default_timeout_seconds"], 1234)
 
             story_files = sorted(run_dir.glob("story_*.json"))
             self.assertEqual(len(story_files), 5)
@@ -86,6 +89,69 @@ class TestWriteRunJobScript(unittest.TestCase):
                 self.assertEqual(story["run"]["run_id"], run_dir.name)
                 self.assertEqual(story["run"]["trigger"], "cron_daily")
                 self.assertEqual(story["destination"]["title_channel_id"], "1467628391082496041")
+                self.assertEqual(story["monitor"]["timeout_seconds"], 1234)
+
+
+    def test_write_run_job_timeout_seconds_has_sane_minimum(self) -> None:
+        """timeout_seconds should be clamped to a sensible minimum for story monitor settings."""
+        root = Path(__file__).resolve().parents[2]
+        story_schema = json.loads((root / "newsroom" / "schemas" / "story_job_v1.schema.json").read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            jobs_root = tmp / "jobs"
+            jobs_root.mkdir(parents=True, exist_ok=True)
+
+            inputs_path = tmp / "inputs.json"
+            candidates = [
+                {
+                    "i": 1,
+                    "event_key": "event:01abc",
+                    "anchor_key": "anchor:01def",
+                    "suggested_category": "Global News",
+                    "title": "Example Title 1",
+                    "description": "Example description 1.",
+                    "primary_url": "https://example.com/1",
+                    "supporting_urls": ["https://example.org/1a"],
+                    "age_minutes": 30,
+                    "cluster_size": 1,
+                    "domains": ["example.com", "example.org"],
+                    "cluster_terms": ["foo"],
+                }
+            ]
+            inputs_obj = {"index": {"candidates": candidates}}
+            inputs_path.write_text(json.dumps(inputs_obj, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            cmd = [
+                sys.executable,
+                str(root / "scripts" / "newsroom_write_run_job.py"),
+                "--jobs-root",
+                str(jobs_root),
+                "--inputs-json-path",
+                str(inputs_path),
+                "--channel-id",
+                "1467628391082496041",
+                "--run-time-uk",
+                "2026-02-04 07:01 AM",
+                "--trigger",
+                "cron_daily",
+                "--expected-stories",
+                "1",
+                "--timeout-seconds",
+                "10",
+                "--pick",
+                "1",
+            ]
+
+            out = subprocess.check_output(cmd, text=True)
+            summary = json.loads(out)
+            run_dir = Path(summary["run_dir"])
+            story_files = sorted(run_dir.glob("story_*.json"))
+            self.assertEqual(len(story_files), 1)
+
+            story = json.loads(story_files[0].read_text(encoding="utf-8"))
+            jsonschema.validate(instance=story, schema=story_schema)
+            self.assertEqual(story["monitor"]["timeout_seconds"], 60)
 
 
     def test_write_run_job_v5_top_level_candidates(self) -> None:

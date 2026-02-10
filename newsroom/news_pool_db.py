@@ -64,6 +64,8 @@ class NewsPoolDB:
         # Use WAL for concurrent readers (planner) while collector is writing.
         self._conn = sqlite3.connect(str(path), timeout=30, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # Ensure SQLite enforces declared foreign key constraints.
+        self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
 
@@ -590,6 +592,45 @@ class NewsPoolDB:
         row = cur.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_all_fresh_events(self, *, max_age_hours: int = 168) -> list[dict[str, Any]]:
+        """All events within max_age_hours, regardless of status/expiry.
+
+        Used by retrieval-based clustering to include posted events.
+        """
+        now = _utc_now_ts()
+        cutoff = now - max_age_hours * 3600
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT id, parent_event_id, category, jurisdiction, summary_en,
+                   development, title, primary_url, link_count, best_published_ts,
+                   status, created_at_ts, updated_at_ts, expires_at_ts,
+                   posted_at_ts, thread_id, run_id
+            FROM events
+            WHERE created_at_ts >= ?
+            ORDER BY created_at_ts DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_root_event_id(self, event_id: int) -> int:
+        """Walk parent_event_id chain to root. Returns event_id itself if already root."""
+        cur = self._conn.cursor()
+        current = event_id
+        seen: set[int] = set()
+        while True:
+            if current in seen:
+                break  # cycle guard
+            seen.add(current)
+            row = cur.execute(
+                "SELECT parent_event_id FROM events WHERE id = ?", (current,)
+            ).fetchone()
+            if not row or row["parent_event_id"] is None:
+                break
+            current = row["parent_event_id"]
+        return current
+
     def get_fresh_events(self, *, now_ts: int | None = None) -> list[dict[str, Any]]:
         """Return events where expires_at_ts > now (for clustering prompt)."""
         now = now_ts if now_ts is not None else _utc_now_ts()
@@ -887,9 +928,10 @@ class NewsPoolDB:
             # Field aliases for backward compat with newsroom_write_run_job.py.
             c["suggested_category"] = c.get("category") or "Global News"
             c["description"] = c.get("summary_en") or ""
-            c["event_key"] = f"event:{eid}"
-            c["semantic_event_key"] = f"event:{eid}"
-            c["anchor_key"] = f"event:{eid}"
+            root_eid = self.get_root_event_id(eid)
+            c["event_key"] = f"event:{root_eid}"
+            c["semantic_event_key"] = f"event:{root_eid}"
+            c["anchor_key"] = f"event:{root_eid}"
             c["cluster_size"] = c.get("link_count") or 0
             c["cluster_terms"] = []
             c["anchor_terms"] = []

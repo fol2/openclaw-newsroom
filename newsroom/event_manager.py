@@ -11,8 +11,16 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from newsroom.story_index import (
+    anchor_terms as _si_anchor_terms,
+    choose_key_tokens,
+    jaccard,
+    tokenize_text as _si_tokenize_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,179 @@ CATEGORY_LIST = [
     "Global News",
     "Hong Kong News",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Retrieve-then-decide helpers
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EventTokens:
+    key_tokens: frozenset[str]
+    anchor_tokens: frozenset[str]
+
+
+def _tokenize_event(event: dict[str, Any]) -> EventTokens:
+    """Tokenize event summary_en + title for retrieval matching."""
+    summary = str(event.get("summary_en") or "").strip()
+    title = str(event.get("title") or "").strip()
+    tokens = _si_tokenize_text(summary or title, title if summary else None)
+    anchors = _si_anchor_terms(summary or title, title if summary else None)
+    key = choose_key_tokens(tokens, drop_high_df=set())
+    return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
+
+
+def _tokenize_link(link: dict[str, Any]) -> EventTokens:
+    """Tokenize a link's title + description for retrieval matching."""
+    title = str(link.get("title") or "").strip()
+    desc = str(link.get("description") or "").strip()
+    tokens = _si_tokenize_text(title, desc)
+    anchors = _si_anchor_terms(title, desc)
+    key = choose_key_tokens(tokens, drop_high_df=set())
+    return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
+
+
+def retrieve_candidates(
+    link: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    top_k: int = 5,
+    min_score: float = 0.10,
+    token_cache: dict[int, EventTokens] | None = None,
+) -> list[tuple[dict[str, Any], float]]:
+    """Deterministic token/anchor similarity retrieval for candidate events.
+
+    Returns up to *top_k* (event, score) pairs sorted by score descending,
+    filtering those below *min_score*.  Cross-category, status-agnostic.
+    """
+    if not events:
+        return []
+
+    link_tok = _tokenize_link(link)
+    if not link_tok.key_tokens and not link_tok.anchor_tokens:
+        return []
+
+    if token_cache is None:
+        token_cache = {}
+
+    scored: list[tuple[dict[str, Any], float]] = []
+    for ev in events:
+        eid = ev.get("id", 0)
+        if eid not in token_cache:
+            token_cache[eid] = _tokenize_event(ev)
+        et = token_cache[eid]
+
+        key_sim = jaccard(set(link_tok.key_tokens), set(et.key_tokens))
+        anchor_sim = jaccard(set(link_tok.anchor_tokens), set(et.anchor_tokens))
+
+        score = 0.55 * key_sim + 0.45 * anchor_sim
+
+        # Bonus for numeric/entity anchor overlap.
+        if link_tok.anchor_tokens and et.anchor_tokens:
+            overlap = link_tok.anchor_tokens & et.anchor_tokens
+            numeric_overlap = sum(1 for t in overlap if any(c.isdigit() for c in t))
+            entity_overlap = sum(
+                1 for t in overlap
+                if any("\u4e00" <= c <= "\u9fff" for c in t) or (t.isupper() and len(t) >= 2)
+            )
+            if numeric_overlap:
+                score += 0.05 * numeric_overlap
+            if entity_overlap:
+                score += 0.05 * entity_overlap
+
+        if score >= min_score:
+            scored.append((ev, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+
+def build_focused_clustering_prompt(
+    link: dict[str, Any],
+    candidates: list[tuple[dict[str, Any], float]],
+) -> str:
+    """Build a focused clustering prompt showing only retrieved candidates.
+
+    If *candidates* is empty, offers only NEW_EVENT.
+    """
+    title = str(link.get("title") or "").strip() or "(no title)"
+    desc = str(link.get("description") or "").strip()
+
+    link_section = f'Title: "{title}"'
+    if desc:
+        link_section += f'\nDescription: "{desc[:300]}"'
+
+    categories_str = ", ".join(f'"{c}"' for c in CATEGORY_LIST)
+
+    if not candidates:
+        return f"""You are a news event classifier.
+
+This is a news link:
+{link_section}
+
+No candidate events matched this link. Create a NEW EVENT.
+
+Return STRICT JSON:
+{{"action":"new_event",
+  "summary_en":"<one-sentence English summary>",
+  "category":"<category>","jurisdiction":"<jurisdiction>"}}
+
+Categories: {categories_str}
+Jurisdictions: "US", "UK", "HK", "CN", "EU", "JP", "KR", "GLOBAL", or other 2-letter code.
+Return STRICT JSON only, no explanation."""
+
+    # Build candidate list with scores and children.
+    cand_lines: list[str] = []
+    for i, (ev, score) in enumerate(candidates, start=1):
+        eid = ev["id"]
+        cat = ev.get("category") or "?"
+        jur = ev.get("jurisdiction") or "?"
+        summary = ev.get("summary_en") or ev.get("title") or "?"
+        status = ev.get("status") or "?"
+        lc = ev.get("link_count", 0)
+        cand_lines.append(
+            f'E{i}. [id={eid}] "{summary}" | {cat} | {jur} | status={status} | {lc} links | score={score:.2f}'
+        )
+
+    cand_section = "\n".join(cand_lines)
+
+    return f"""You are a news event classifier.
+
+This is a news link:
+{link_section}
+
+These candidate events share significant vocabulary with this link:
+{cand_section}
+
+Choose ONE action:
+
+A) ASSIGN to existing event (same incident, different source, no new material)
+   → {{"action":"assign","event_id":<id>}}
+   ASSIGN is likely correct if a candidate covers the same story from a different source.
+
+B) NEW DEVELOPMENT of existing event (significant escalation, verdict, arrest, resignation)
+   → {{"action":"development","parent_event_id":<id>,
+      "summary_en":"<one-sentence English summary>",
+      "development":"<short label>",
+      "category":"<category>","jurisdiction":"<jurisdiction>"}}
+   DEVELOPMENT = new phase only. Same facts from different source = ASSIGN, not DEVELOPMENT.
+
+C) NEW EVENT (completely new story, none of the candidates match)
+   → {{"action":"new_event",
+      "summary_en":"<one-sentence English summary>",
+      "category":"<category>","jurisdiction":"<jurisdiction>"}}
+
+Categories: {categories_str}
+Jurisdictions: "US", "UK", "HK", "CN", "EU", "JP", "KR", "GLOBAL", or other 2-letter code.
+
+Rules:
+- Same event = same incident/announcement, different source or angle → A
+- Significant new development (result, escalation, arrest, resignation) → B
+- Completely unrelated story → C
+- Match across languages (Chinese headline about same event = same event)
+- Only use ASSIGN if a matching event exists in the candidates above
+
+Return STRICT JSON only, no explanation."""
 
 
 def build_clustering_prompt(
@@ -184,15 +365,26 @@ def parse_clustering_response(
 def cluster_link(
     *,
     link: dict[str, Any],
-    fresh_events: list[dict[str, Any]],
+    all_events: list[dict[str, Any]] | None = None,
+    fresh_events: list[dict[str, Any]] | None = None,
     gemini: Any,
     db: Any,
+    token_cache: dict[int, EventTokens] | None = None,
 ) -> dict[str, Any] | None:
-    """Classify a single link against fresh events using Gemini.
+    """Classify a single link using retrieve-then-decide.
 
+    Uses *all_events* (preferred) or *fresh_events* (backward compat alias).
     Returns the action result dict or None on failure.
     """
-    prompt = build_clustering_prompt(link, fresh_events)
+    events = all_events if all_events is not None else (fresh_events or [])
+
+    # Stage 1: Retrieve candidates (deterministic).
+    candidates = retrieve_candidates(
+        link, events, top_k=5, min_score=0.10, token_cache=token_cache,
+    )
+
+    # Stage 2: Focused LLM prompt.
+    prompt = build_focused_clustering_prompt(link, candidates)
 
     try:
         response = gemini.generate_json(prompt)
@@ -204,7 +396,9 @@ def cluster_link(
         logger.warning("Empty Gemini response for link %s", link.get("norm_url", "?"))
         return None
 
-    validated = parse_clustering_response(response, link, fresh_events)
+    # Validate against candidate events (not full list).
+    candidate_events = [ev for ev, _score in candidates]
+    validated = parse_clustering_response(response, link, candidate_events)
     if not validated:
         return None
 
@@ -220,8 +414,14 @@ def cluster_link(
 
     if action == "assign":
         event_id = validated["event_id"]
+        assigned_to_posted = False
+        for ev in candidate_events:
+            if ev["id"] == event_id and ev.get("status") == "posted":
+                assigned_to_posted = True
+                break
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
-        logger.info("Assigned link %d to event %d", link_id, event_id)
+        validated["assigned_to_posted"] = assigned_to_posted
+        logger.info("Assigned link %d to event %d%s", link_id, event_id, " (posted)" if assigned_to_posted else "")
         return validated
 
     if action == "development":
@@ -323,6 +523,85 @@ def parse_merge_response(
     return valid_groups if valid_groups else None
 
 
+def _find_cross_category_duplicates(
+    events: list[dict[str, Any]],
+    *,
+    min_anchor_overlap: int = 2,
+    token_cache: dict[int, EventTokens] | None = None,
+) -> list[tuple[int, int]]:
+    """Find event pairs across different categories with high anchor overlap."""
+    if token_cache is None:
+        token_cache = {}
+    pairs: list[tuple[int, int]] = []
+    for i, ev_a in enumerate(events):
+        aid = ev_a.get("id", 0)
+        if aid not in token_cache:
+            token_cache[aid] = _tokenize_event(ev_a)
+        a_tok = token_cache[aid]
+        cat_a = ev_a.get("category") or ""
+        for ev_b in events[i + 1:]:
+            cat_b = ev_b.get("category") or ""
+            if cat_a == cat_b:
+                continue
+            bid = ev_b.get("id", 0)
+            if bid not in token_cache:
+                token_cache[bid] = _tokenize_event(ev_b)
+            b_tok = token_cache[bid]
+            overlap = a_tok.anchor_tokens & b_tok.anchor_tokens
+            if len(overlap) >= min_anchor_overlap:
+                pairs.append((aid, bid))
+    return pairs
+
+
+def _execute_merge_group(
+    group_events: list[dict[str, Any]],
+    *,
+    db: Any,
+    stats: dict[str, int],
+    merged_ids: set[int],
+) -> None:
+    """Pick winner, handle posted status transfer, merge losers into winner."""
+    if len(group_events) < 2:
+        return
+
+    winner = max(
+        group_events,
+        key=lambda e: (e.get("link_count", 0), -(e.get("created_at_ts", 0))),
+    )
+    loser_ids = [e["id"] for e in group_events if e["id"] != winner["id"]]
+
+    # Handle posted status transfer.
+    winner_posted = winner.get("status") == "posted"
+    for lid in loser_ids:
+        loser = next((e for e in group_events if e["id"] == lid), None)
+        if loser and loser.get("status") == "posted" and not winner_posted:
+            try:
+                db.mark_event_posted(
+                    winner["id"],
+                    thread_id=loser.get("thread_id"),
+                    run_id=loser.get("run_id"),
+                )
+                winner_posted = True
+            except Exception:
+                pass
+
+    try:
+        links_moved = db.merge_events_into(
+            winner_id=winner["id"], loser_ids=loser_ids
+        )
+        stats["groups_merged"] += 1
+        stats["events_removed"] += len(loser_ids)
+        stats["links_moved"] += links_moved
+        merged_ids.update(loser_ids)
+        logger.info(
+            "Merged %d events into %d (winner), %d links moved",
+            len(loser_ids), winner["id"], links_moved,
+        )
+    except Exception as e:
+        logger.warning("Merge DB error for group %s: %s", [e["id"] for e in group_events], e)
+        stats["errors"] += 1
+
+
 def merge_events(
     *,
     db: Any,
@@ -333,7 +612,7 @@ def merge_events(
     max_consecutive_failures: int = 3,
 ) -> dict[str, int]:
     """Post-clustering merge pass: compare event summaries within each category,
-    merge duplicates using LLM.
+    merge duplicates using LLM.  Includes posted events and cross-category pairs.
 
     Args:
         include_expired: If True, merge across ALL events (not just fresh).
@@ -343,6 +622,7 @@ def merge_events(
     """
     stats = {
         "categories_processed": 0,
+        "cross_category_pairs": 0,
         "llm_calls": 0,
         "groups_merged": 0,
         "events_removed": 0,
@@ -351,20 +631,79 @@ def merge_events(
     }
     consecutive_failures = 0
 
-    fresh_events = db.get_fresh_events(now_ts=0 if include_expired else None)
-    # Filter to root events only (no children), status in ('new', 'active').
+    try:
+        fresh_events = db.get_all_fresh_events(max_age_hours=168)
+    except (TypeError, AttributeError):
+        fresh_events = db.get_fresh_events(now_ts=0 if include_expired else None)
+    # Filter to root events only (includes posted).
     root_events = [
         ev for ev in fresh_events
         if ev.get("parent_event_id") is None
-        and ev.get("status") in ("new", "active")
     ]
 
     if not root_events:
         return stats
 
-    # Group by category.
+    # --- Cross-category merge pass ---
+    token_cache: dict[int, EventTokens] = {}
+    cross_pairs = _find_cross_category_duplicates(root_events, token_cache=token_cache)
+    stats["cross_category_pairs"] = len(cross_pairs)
+    ev_lookup_all = {ev["id"]: ev for ev in root_events}
+    merged_ids: set[int] = set()
+
+    for aid, bid in cross_pairs:
+        if aid in merged_ids or bid in merged_ids:
+            continue
+        ev_a = ev_lookup_all.get(aid)
+        ev_b = ev_lookup_all.get(bid)
+        if not ev_a or not ev_b:
+            continue
+
+        label = f"cross-category ({ev_a.get('category', '?')} + {ev_b.get('category', '?')})"
+        prompt = build_merge_prompt([ev_a, ev_b], label)
+
+        try:
+            raw_text = gemini.generate(prompt)
+        except Exception as e:
+            logger.warning("Cross-category merge LLM failed: %s", e)
+            stats["errors"] += 1
+            consecutive_failures += 1
+            continue
+
+        stats["llm_calls"] += 1
+        if not raw_text:
+            stats["errors"] += 1
+            consecutive_failures += 1
+            continue
+
+        consecutive_failures = 0
+        sanitized = re.sub(r'\bE(\d+)\b', r'\1', raw_text)
+        try:
+            response = json.loads(
+                sanitized[sanitized.find("{"):sanitized.rfind("}") + 1]
+            )
+        except (json.JSONDecodeError, ValueError):
+            stats["errors"] += 1
+            continue
+
+        valid_ids = {aid, bid}
+        groups = parse_merge_response(response, valid_ids)
+        if not groups:
+            continue
+
+        for group in groups:
+            group_events = [ev_lookup_all[eid] for eid in group if eid in ev_lookup_all]
+            _execute_merge_group(group_events, db=db, stats=stats, merged_ids=merged_ids)
+
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    # --- Per-category merge pass ---
+    # Group by category (exclude already-merged).
     by_category: dict[str, list[dict[str, Any]]] = {}
     for ev in root_events:
+        if ev["id"] in merged_ids:
+            continue
         cat = ev.get("category") or "Other"
         by_category.setdefault(cat, []).append(ev)
 
@@ -387,7 +726,6 @@ def merge_events(
         # Sliding window: overlap adjacent batches so boundary pairs get compared.
         overlap = min(10, batch_size // 3)
         stride = max(batch_size - overlap, 1)
-        merged_ids: set[int] = set()  # Track already-merged losers across windows.
 
         chunk_start = 0
         while chunk_start < len(cat_events):
@@ -441,36 +779,10 @@ def merge_events(
                 chunk_start += stride
                 continue
 
-            # Build lookup for winner selection.
             ev_lookup = {ev["id"]: ev for ev in chunk}
-
             for group in groups:
-                # Pick winner: most links, tiebreak oldest (smallest created_at_ts).
                 group_events = [ev_lookup[eid] for eid in group if eid in ev_lookup]
-                if len(group_events) < 2:
-                    continue
-
-                winner = max(
-                    group_events,
-                    key=lambda e: (e.get("link_count", 0), -(e.get("created_at_ts", 0))),
-                )
-                loser_ids = [e["id"] for e in group_events if e["id"] != winner["id"]]
-
-                try:
-                    links_moved = db.merge_events_into(
-                        winner_id=winner["id"], loser_ids=loser_ids
-                    )
-                    stats["groups_merged"] += 1
-                    stats["events_removed"] += len(loser_ids)
-                    stats["links_moved"] += links_moved
-                    merged_ids.update(loser_ids)
-                    logger.info(
-                        "Merged %d events into %d (winner), %d links moved",
-                        len(loser_ids), winner["id"], links_moved,
-                    )
-                except Exception as e:
-                    logger.warning("Merge DB error for group %s: %s", group, e)
-                    stats["errors"] += 1
+                _execute_merge_group(group_events, db=db, stats=stats, merged_ids=merged_ids)
 
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
@@ -478,9 +790,10 @@ def merge_events(
             chunk_start += stride
 
     logger.info(
-        "Merge pass complete: %d categories, %d LLM calls, %d groups merged, "
+        "Merge pass complete: %d categories, %d cross-cat pairs, %d LLM calls, %d groups merged, "
         "%d events removed, %d links moved, %d errors",
-        stats["categories_processed"], stats["llm_calls"], stats["groups_merged"],
+        stats["categories_processed"], stats["cross_category_pairs"],
+        stats["llm_calls"], stats["groups_merged"],
         stats["events_removed"], stats["links_moved"], stats["errors"],
     )
     return stats
@@ -496,18 +809,30 @@ def cluster_all_pending(
 ) -> dict[str, int]:
     """Process all unassigned links sequentially, oldest first.
 
-    Returns stats: {"processed": N, "assigned": N, "new_events": N, "developments": N, "errors": N, "skipped": N}
+    Uses retrieve-then-decide: loads all events once, refreshes every 10 links,
+    and maintains a shared token cache across iterations.
+
+    Returns stats dict.
     """
     links = db.get_unassigned_links()
     if not links:
-        return {"processed": 0, "assigned": 0, "new_events": 0, "developments": 0, "errors": 0, "skipped": 0}
+        return {"processed": 0, "assigned": 0, "new_events": 0, "developments": 0,
+                "assigned_to_posted": 0, "errors": 0, "skipped": 0}
 
     links = links[:max_links]
 
-    stats = {"processed": 0, "assigned": 0, "new_events": 0, "developments": 0, "errors": 0, "skipped": 0}
+    stats = {"processed": 0, "assigned": 0, "new_events": 0, "developments": 0,
+             "assigned_to_posted": 0, "errors": 0, "skipped": 0}
     consecutive_failures = 0
+    token_cache: dict[int, EventTokens] = {}
 
-    for link in links:
+    # Load all events once (cross-category, includes posted).
+    try:
+        all_events = db.get_all_fresh_events(max_age_hours=168)
+    except (TypeError, AttributeError):
+        all_events = db.get_fresh_events()
+
+    for i, link in enumerate(links):
         # Early exit: if Gemini is consistently failing, stop wasting quota.
         if consecutive_failures >= max_consecutive_failures:
             stats["skipped"] = len(links) - stats["processed"]
@@ -517,10 +842,17 @@ def cluster_all_pending(
             )
             break
 
-        # Refresh fresh events each iteration (new events from prior links are now visible).
-        fresh_events = db.get_fresh_events()
+        # Refresh events every 10 links to pick up newly created events.
+        if i > 0 and i % 10 == 0:
+            try:
+                all_events = db.get_all_fresh_events(max_age_hours=168)
+            except (TypeError, AttributeError):
+                all_events = db.get_fresh_events()
 
-        result = cluster_link(link=link, fresh_events=fresh_events, gemini=gemini, db=db)
+        result = cluster_link(
+            link=link, all_events=all_events, gemini=gemini, db=db,
+            token_cache=token_cache,
+        )
         stats["processed"] += 1
 
         if result is None:
@@ -530,8 +862,19 @@ def cluster_all_pending(
             consecutive_failures = 0
             if result["action"] == "assign":
                 stats["assigned"] += 1
+                if result.get("assigned_to_posted"):
+                    stats["assigned_to_posted"] += 1
             elif result["action"] == "new_event":
                 stats["new_events"] += 1
+                # Add newly created event to the list for subsequent links.
+                new_eid = result.get("event_id")
+                if new_eid:
+                    try:
+                        new_ev = db.get_event(new_eid)
+                        if new_ev:
+                            all_events.append(new_ev)
+                    except Exception:
+                        pass
             elif result["action"] == "development":
                 stats["developments"] += 1
 
@@ -540,8 +883,8 @@ def cluster_all_pending(
             time.sleep(delay_seconds)
 
     logger.info(
-        "Clustering complete: %d processed, %d assigned, %d new, %d dev, %d errors, %d skipped",
-        stats["processed"], stats["assigned"], stats["new_events"],
-        stats["developments"], stats["errors"], stats["skipped"],
+        "Clustering complete: %d processed, %d assigned (%d to posted), %d new, %d dev, %d errors, %d skipped",
+        stats["processed"], stats["assigned"], stats["assigned_to_posted"],
+        stats["new_events"], stats["developments"], stats["errors"], stats["skipped"],
     )
     return stats

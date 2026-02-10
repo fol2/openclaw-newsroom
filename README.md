@@ -101,7 +101,7 @@ All scripts live in the `scripts/` directory and are invoked as standalone Pytho
 ## Testing
 
 ```bash
-uv run pytest newsroom/tests/ -v
+uv run python -m pytest newsroom/tests/ -v
 ```
 
 ## Key Modules

@@ -82,6 +82,7 @@ def main(argv: list[str]) -> int:
         fetch_summary: dict[str, Any] = {"should_fetch": should_fetch}
         upsert = {"inserted": 0, "updated": 0}
         notes: str | None = None
+        had_success = False
 
         if should_fetch:
             next_run = run_count + 1
@@ -103,6 +104,7 @@ def main(argv: list[str]) -> int:
                 ttl_seconds=int(args.cache_ttl_seconds),
                 last_request_ts=last_ts,
             )
+            had_success = bool(fetched.ok)
             requests_made += int(fetched.requests_made)
             total_results += len(fetched.results)
 
@@ -132,10 +134,12 @@ def main(argv: list[str]) -> int:
                 )
 
             upsert = db.upsert_links(links, now_ts=now_ts)
-            db.update_fetch_state(key=state_key, last_fetch_ts=now_ts, last_offset=0, run_count=next_run)
+            if had_success:
+                db.update_fetch_state(key=state_key, last_fetch_ts=now_ts, last_offset=0, run_count=next_run)
 
             fetch_summary = {
                 "should_fetch": True,
+                "ok": bool(fetched.ok),
                 "query": q,
                 "gdelt_query_prefix": f"gdelt:{q}",
                 "requests_made": int(requests_made),
@@ -143,9 +147,15 @@ def main(argv: list[str]) -> int:
                 "cached": bool(fetched.cached),
                 "run_count": int(next_run),
             }
-            if fetched.error:
+            if not fetched.ok:
+                fetch_summary["error"] = fetched.error or "unknown"
+            elif fetched.error:
                 fetch_summary["error"] = fetched.error
-            notes = json.dumps({"source": "gdelt", "query": q, "ok": fetched.ok}, ensure_ascii=True, separators=(",", ":"))
+
+            notes_payload: dict[str, Any] = {"source": "gdelt", "query": q, "ok": bool(fetched.ok)}
+            if fetched.error:
+                notes_payload["error"] = fetched.error
+            notes = json.dumps(notes_payload, ensure_ascii=True, separators=(",", ":"))
         else:
             fetch_summary = {
                 "should_fetch": False,
@@ -175,7 +185,7 @@ def main(argv: list[str]) -> int:
         )
 
     out = {
-        "ok": True,
+        "ok": bool((not should_fetch) or had_success),
         "source": "gdelt",
         "db": str(db_path),
         "window_hours": hours,
