@@ -16,10 +16,12 @@ os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
 from newsroom.brave_news import (  # noqa: E402
+    BraveApiError,
     BraveApiKey,
     fetch_brave_news,
     load_brave_api_keys,
     normalize_url,
+    record_brave_cooldown,
     record_brave_rate_limit,
     select_brave_api_key,
 )
@@ -125,6 +127,7 @@ def main(argv: list[str]) -> int:
 
             offsets = [o for o in range(offset, min(10, offset + pages))]
             for off in offsets:
+                key: BraveApiKey | None = None
                 try:
                     key = select_brave_api_key(
                         openclaw_home=OPENCLAW_HOME,
@@ -143,8 +146,48 @@ def main(argv: list[str]) -> int:
                         last_request_ts=last_ts,
                     )
                     had_success = True
+                except BraveApiError as e:
+                    requests_made += int(getattr(e, "requests_made", 0) or 0)
+                    errors.append(
+                        {
+                            "offset": int(off),
+                            "error": str(e),
+                            "status_code": getattr(e, "status_code", None),
+                            "key_id": (key.key_id if isinstance(key, BraveApiKey) else None),
+                        }
+                    )
+
+                    if isinstance(getattr(e, "rate_limit", None), dict) and isinstance(key, BraveApiKey):
+                        last_rate_limit = e.rate_limit
+                        record_brave_rate_limit(openclaw_home=OPENCLAW_HOME, key=key, rate_limit=e.rate_limit, now_ts=now_ts)
+
+                    status = getattr(e, "status_code", None)
+                    if status in (429, 503) and isinstance(key, BraveApiKey):
+                        retry_after_s = getattr(e, "retry_after_s", None)
+                        cooldown_seconds: int
+                        if isinstance(retry_after_s, int) and retry_after_s > 0:
+                            cooldown_seconds = int(min(retry_after_s + 1, 600))
+                        else:
+                            # Prefer the shortest known window (usually per-second reset) if present.
+                            rl = getattr(e, "rate_limit", None)
+                            reset = rl.get("reset") if isinstance(rl, dict) else None
+                            if isinstance(reset, list) and reset and isinstance(reset[0], int) and reset[0] > 0:
+                                cooldown_seconds = int(min(reset[0] + 1, 120))
+                            else:
+                                cooldown_seconds = 60 if status == 429 else 30
+
+                        record_brave_cooldown(
+                            openclaw_home=OPENCLAW_HOME,
+                            key=key,
+                            cooldown_seconds=cooldown_seconds,
+                            now_ts=now_ts,
+                            reason=f"http_{int(status)}",
+                        )
+                    continue
                 except Exception as e:
-                    errors.append({"offset": int(off), "error": str(e)})
+                    errors.append(
+                        {"offset": int(off), "error": str(e), "key_id": (key.key_id if isinstance(key, BraveApiKey) else None)}
+                    )
                     continue
 
                 keys_used.append({"key_id": key.key_id, "label": key.label})

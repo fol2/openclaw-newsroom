@@ -18,6 +18,27 @@ BRAVE_NEWS_ENDPOINT = "https://api.search.brave.com/res/v1/news/search"
 _KEY_STATE_VERSION = 1
 
 
+class BraveApiError(RuntimeError):
+    """Brave News API error with optional rate limit context."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None,
+        error: Any | None,
+        rate_limit: dict[str, Any] | None,
+        retry_after_s: int | None,
+        requests_made: int,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code) if isinstance(status_code, int) else None
+        self.error = error
+        self.rate_limit = rate_limit
+        self.retry_after_s = int(retry_after_s) if isinstance(retry_after_s, int) else None
+        self.requests_made = int(requests_made)
+
+
 @dataclass(frozen=True)
 class BraveApiKey:
     """A Brave Search API key.
@@ -171,7 +192,17 @@ def select_brave_api_key(
         except Exception:
             return False
 
-    available = [k for k in keys if not is_exhausted(k)]
+    def is_cooled_down(k: BraveApiKey) -> bool:
+        row = ks.get(k.key_id)
+        if not isinstance(row, dict):
+            return False
+        until = row.get("cooldown_until_ts")
+        try:
+            return until is not None and int(until) > now_ts
+        except Exception:
+            return False
+
+    available = [k for k in keys if (not is_exhausted(k)) and (not is_cooled_down(k))]
 
     if prefer_label:
         for k in available:
@@ -233,6 +264,7 @@ def record_brave_rate_limit(
 
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
     q = _quota_from_rate_limit(rate_limit)
+    monthly_limit = q.get("monthly_limit")
     monthly_remaining = q.get("monthly_remaining")
     monthly_reset_s = q.get("monthly_reset_s")
     reset_at_ts = (now_ts + int(monthly_reset_s)) if isinstance(monthly_reset_s, int) and monthly_reset_s > 0 else None
@@ -251,16 +283,78 @@ def record_brave_rate_limit(
 
     row["label"] = key.label
     row["last_seen_ts"] = int(now_ts)
-    row["monthly_limit"] = q.get("monthly_limit")
-    row["monthly_remaining"] = monthly_remaining
-    row["monthly_reset_s"] = monthly_reset_s
-    row["monthly_reset_at_ts"] = reset_at_ts
+    if isinstance(monthly_limit, int):
+        row["monthly_limit"] = monthly_limit
+    if isinstance(monthly_remaining, int):
+        row["monthly_remaining"] = monthly_remaining
+    if isinstance(monthly_reset_s, int):
+        row["monthly_reset_s"] = monthly_reset_s
+    if reset_at_ts:
+        row["monthly_reset_at_ts"] = int(reset_at_ts)
 
     # When remaining hits 0, mark the key as exhausted until reset (best-effort).
-    if isinstance(monthly_remaining, int) and monthly_remaining <= 0 and reset_at_ts:
-        row["exhausted_until_ts"] = int(reset_at_ts)
-    elif isinstance(monthly_remaining, int) and monthly_remaining > 0:
-        row["exhausted_until_ts"] = None
+    if isinstance(monthly_remaining, int):
+        if monthly_remaining <= 0 and reset_at_ts:
+            row["exhausted_until_ts"] = int(reset_at_ts)
+        elif monthly_remaining > 0:
+            row["exhausted_until_ts"] = None
+
+    _save_key_state(path=state_path, state=state)
+
+
+def record_brave_cooldown(
+    *,
+    openclaw_home: Path,
+    key: BraveApiKey,
+    cooldown_seconds: int | None = None,
+    cooldown_until_ts: int | None = None,
+    now_ts: int | None = None,
+    reason: str | None = None,
+) -> None:
+    """Persist a short-term cooldown for a Brave API key (e.g. after 429/503)."""
+
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    until_ts: int | None
+    if cooldown_until_ts is not None:
+        try:
+            until_ts = int(cooldown_until_ts)
+        except Exception:
+            until_ts = None
+    elif cooldown_seconds is not None:
+        try:
+            sec = int(cooldown_seconds)
+        except Exception:
+            sec = 0
+        until_ts = int(now_ts + max(0, sec))
+    else:
+        until_ts = None
+
+    if until_ts is None:
+        return
+
+    state_path = _key_state_path(openclaw_home=openclaw_home)
+    state = _load_key_state(path=state_path)
+    keys_obj = state.get("keys")
+    if not isinstance(keys_obj, dict):
+        keys_obj = {}
+        state["keys"] = keys_obj
+
+    row = keys_obj.get(key.key_id)
+    if not isinstance(row, dict):
+        row = {}
+        keys_obj[key.key_id] = row
+
+    row["label"] = key.label
+    row["last_seen_ts"] = int(now_ts)
+
+    prev = row.get("cooldown_until_ts")
+    try:
+        prev_ts = int(prev) if prev is not None else None
+    except Exception:
+        prev_ts = None
+    row["cooldown_until_ts"] = int(max(prev_ts or 0, until_ts))
+    if isinstance(reason, str) and reason.strip():
+        row["cooldown_reason"] = reason.strip()
 
     _save_key_state(path=state_path, state=state)
 
@@ -389,6 +483,15 @@ def _rate_limit_info(resp: requests.Response) -> dict[str, Any]:
     }
 
 
+def _parse_retry_after(value: str | None) -> int | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
+
+
 def fetch_brave_news(
     *,
     api_key: str,
@@ -449,25 +552,53 @@ def fetch_brave_news(
         params["freshness"] = freshness
 
     # Retry briefly on 429/503.
-    resp = None
+    resp: requests.Response | None = None
+    rate_limit: dict[str, Any] | None = None
+    retry_after_s: int | None = None
     for attempt in range(1, 4):
-        resp = requests.get(BRAVE_NEWS_ENDPOINT, headers=headers, params=params, timeout=20)
-        if resp.status_code in (429, 503):
+        requests_made += 1
+        try:
+            resp = requests.get(BRAVE_NEWS_ENDPOINT, headers=headers, params=params, timeout=20)
+        except requests.RequestException as e:
+            if attempt < 3:
+                time.sleep(min(2.0 * attempt, 5.0))
+                continue
+            raise BraveApiError(
+                f"Brave API request failed: {e}",
+                status_code=None,
+                error=str(e),
+                rate_limit=None,
+                retry_after_s=None,
+                requests_made=requests_made,
+            ) from e
+
+        # Track the most recent attempt so callers can keep a politeness delay
+        # across sequential page fetches even when we retry.
+        last_request_ts = time.time()
+
+        rate_limit = _rate_limit_info(resp)
+        retry_after_s = _parse_retry_after(resp.headers.get("Retry-After"))
+
+        if resp.status_code in (429, 503) and attempt < 3:
             time.sleep(min(2.0 * attempt, 5.0))
             continue
         break
     if resp is None:
         raise RuntimeError("Brave API request did not execute")
-    requests_made += 1
 
     if resp.status_code != 200:
         try:
             err = resp.json().get("error")
         except Exception:
             err = {"status": resp.status_code, "detail": resp.text[:200]}
-        raise RuntimeError(f"Brave API error (status {resp.status_code}): {err}")
-
-    rate_limit = _rate_limit_info(resp)
+        raise BraveApiError(
+            f"Brave API error (status {resp.status_code}): {err}",
+            status_code=resp.status_code,
+            error=err,
+            rate_limit=rate_limit,
+            retry_after_s=retry_after_s,
+            requests_made=requests_made,
+        )
 
     raw = resp.json()
     items = raw.get("results", [])

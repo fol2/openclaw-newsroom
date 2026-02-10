@@ -189,8 +189,9 @@ for concurrent read/write access.
 - Multi-key rotation: keys loaded from `BRAVE_SEARCH_API_KEYS` env var (or single-key `BRAVE_SEARCH_API_KEY`).
 - Key state persisted in `data/newsroom/brave_key_state.json` (tracks usage,
   rate limit events per key_id = sha256 prefix).
-- `select_brave_api_key()` picks the least-recently-rate-limited key.
-- `record_brave_rate_limit()` marks a key as rate-limited with a cooldown.
+- `select_brave_api_key()` skips keys that are temporarily cooled down or exhausted.
+- `record_brave_rate_limit()` persists the last-seen quota headers and can mark a key as exhausted until reset.
+- `record_brave_cooldown()` records a short-term cooldown after transient errors (e.g. 429/503) so callers can rotate keys.
 - Each key has a label (e.g., "free", "paid") parsed from `label:key` format.
 - URL normalization strips fragments and tracking params (`utm_*`, `fbclid`, etc.).
 
