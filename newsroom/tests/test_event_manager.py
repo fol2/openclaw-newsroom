@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from newsroom.event_manager import (
+    CATEGORY_LIST,
     EventTokens,
     _find_cross_category_duplicates,
     _tokenize_event,
@@ -229,6 +230,36 @@ class TestParseClusteringResponse(unittest.TestCase):
         response = {"action": "unknown"}
         result = parse_clustering_response(response, {}, [])
         self.assertIsNone(result)
+
+    def test_normalises_category_to_canonical_list(self) -> None:
+        cases: list[tuple[Any, str]] = [
+            ("US News", "Global News"),
+            ("World News", "Global News"),
+            ("Technology", "AI"),
+            ("Tech", "AI"),
+            ("Technology/Tech", "AI"),
+            ("global news", "Global News"),
+            ("", "Global News"),
+            (None, "Global News"),
+            ("Not a real category", "Global News"),
+        ]
+
+        for raw, expected in cases:
+            response = {
+                "action": "new_event",
+                "confidence": 0.9,
+                "summary_en": "Test",
+                "category": raw,
+                "jurisdiction": "GLOBAL",
+                "link_flags": [],
+                "match_basis": [],
+            }
+            result = parse_clustering_response(response, {}, [])
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["validated"]["category"], expected)
+            self.assertEqual(result["enforced"]["category"], expected)
+            self.assertIn(expected, CATEGORY_LIST)
 
 
 class TestClusterLink(unittest.TestCase):
@@ -519,6 +550,46 @@ class TestClusterLink(unittest.TestCase):
                 self.assertIsNotNone(ev)
                 assert ev is not None
                 self.assertEqual(ev["summary_en"], "Scientists discover new species")
+
+    def test_cluster_link_normalises_category_before_db_write(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/alias-1",
+                    norm_url="https://bbc.co.uk/alias-1",
+                    domain="bbc.co.uk",
+                    title="New AI model launched",
+                    description="A new model is released.",
+                    age=None,
+                    page_age="2026-02-07T12:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "new_event",
+                    "confidence": 0.9,
+                    "summary_en": "A new AI model is launched",
+                    "category": "Tech",
+                    "jurisdiction": "GLOBAL",
+                    "link_flags": [],
+                    "match_basis": [],
+                }
+
+                result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "new_event")
+
+                ev = db.get_event(result["event_id"])
+                self.assertIsNotNone(ev)
+                assert ev is not None
+                self.assertEqual(ev["category"], "AI")
 
     def test_cluster_link_gemini_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
