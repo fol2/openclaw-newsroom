@@ -922,5 +922,164 @@ class TestPruneExpiredEvents(unittest.TestCase):
                 self.assertEqual(pruned, 0)
 
 
+class TestLinkCountDrift(unittest.TestCase):
+    """Test that link_count stays accurate across reassignments and pruning."""
+
+    def _setup_db(self, td: str) -> NewsPoolDB:
+        return NewsPoolDB(path=Path(td) / "news_pool.sqlite3")
+
+    def test_assign_link_to_event_decrements_old_event(self) -> None:
+        """Moving a link from event A to event B decrements A's link_count."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                eid_a = db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+                eid_b = db.create_event(summary_en="Event B", category="AI", jurisdiction="US")
+
+                link = PoolLink(
+                    url="https://example.com/x", norm_url="https://example.com/x",
+                    domain="example.com", title="Link X", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                link_id = db.get_unassigned_links()[0]["id"]
+
+                # Assign to A.
+                db.assign_link_to_event(link_id=link_id, event_id=eid_a)
+                ev_a = db.get_event(eid_a)
+                assert ev_a is not None
+                self.assertEqual(ev_a["link_count"], 1)
+
+                # Reassign to B.
+                db.assign_link_to_event(link_id=link_id, event_id=eid_b)
+                ev_a = db.get_event(eid_a)
+                ev_b = db.get_event(eid_b)
+                assert ev_a is not None
+                assert ev_b is not None
+                self.assertEqual(ev_a["link_count"], 0, "Old event should have link_count decremented")
+                self.assertEqual(ev_b["link_count"], 1, "New event should have link_count incremented")
+
+    def test_assign_link_to_same_event_idempotent(self) -> None:
+        """Re-assigning a link to the same event should not change link_count."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                eid = db.create_event(summary_en="Event A", category="AI", jurisdiction="US")
+
+                link = PoolLink(
+                    url="https://example.com/y", norm_url="https://example.com/y",
+                    domain="example.com", title="Link Y", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                link_id = db.get_unassigned_links()[0]["id"]
+
+                db.assign_link_to_event(link_id=link_id, event_id=eid)
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 1)
+
+                # Assign again to same event.
+                db.assign_link_to_event(link_id=link_id, event_id=eid)
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 1, "link_count should not double on idempotent assign")
+
+    def test_prune_links_updates_event_link_count(self) -> None:
+        """Pruning old links should decrement affected events' link_count."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Event", category="AI", jurisdiction="US")
+
+                # Insert two links: one old (will be pruned), one recent (will survive).
+                old_link = PoolLink(
+                    url="https://example.com/old", norm_url="https://example.com/old",
+                    domain="example.com", title="Old link", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=now - 1000,
+                )
+                new_link = PoolLink(
+                    url="https://example.com/new", norm_url="https://example.com/new",
+                    domain="example.com", title="New link", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=now,
+                )
+                db.upsert_links([old_link], now_ts=now - 1000)
+                db.upsert_links([new_link], now_ts=now)
+
+                # Assign both links to the event.
+                all_links = list(db.iter_links_since(cutoff_ts=0))
+                for lnk in all_links:
+                    db.assign_link_to_event(link_id=lnk["id"], event_id=eid)
+
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 2)
+
+                # Prune the old link (cutoff between old and new).
+                cutoff = now - 500
+                pruned = db.prune_links(cutoff_ts=cutoff)
+                self.assertEqual(pruned, 1)
+
+                # Event should now have link_count = 1.
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 1, "link_count should reflect pruned links")
+
+    def test_prune_links_all_removed_sets_count_to_zero(self) -> None:
+        """Pruning all links from an event should set link_count to 0."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Event", category="AI", jurisdiction="US")
+
+                link = PoolLink(
+                    url="https://example.com/z", norm_url="https://example.com/z",
+                    domain="example.com", title="Link Z", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=now - 1000,
+                )
+                db.upsert_links([link], now_ts=now - 1000)
+                link_id = list(db.iter_links_since(cutoff_ts=0))[0]["id"]
+                db.assign_link_to_event(link_id=link_id, event_id=eid)
+
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 1)
+
+                # Prune all links.
+                pruned = db.prune_links(cutoff_ts=now)
+                self.assertEqual(pruned, 1)
+
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 0, "link_count should be 0 after all links pruned")
+
+    def test_prune_links_no_assigned_links_no_side_effect(self) -> None:
+        """Pruning links that are not assigned to any event has no side effects."""
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Event", category="AI", jurisdiction="US")
+
+                # Insert an unassigned link.
+                link = PoolLink(
+                    url="https://example.com/unassigned", norm_url="https://example.com/unassigned",
+                    domain="example.com", title="Unassigned", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=now - 1000,
+                )
+                db.upsert_links([link], now_ts=now - 1000)
+
+                pruned = db.prune_links(cutoff_ts=now)
+                self.assertEqual(pruned, 1)
+
+                # Event link_count should remain 0.
+                ev = db.get_event(eid)
+                assert ev is not None
+                self.assertEqual(ev["link_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
