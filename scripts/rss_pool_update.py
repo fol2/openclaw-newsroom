@@ -59,6 +59,7 @@ def main(argv: list[str]) -> int:
         fetch_summary: dict[str, Any] = {"should_fetch": should_fetch}
         upsert = {"inserted": 0, "updated": 0}
         notes: str | None = None
+        had_success = False
 
         if should_fetch:
             next_run = run_count + 1
@@ -108,10 +109,13 @@ def main(argv: list[str]) -> int:
                     errors.append({"feed": feed.key, "error": str(e)})
 
             upsert = db.upsert_links(links, now_ts=now_ts)
-            db.update_fetch_state(key=state_key, last_fetch_ts=now_ts, last_offset=0, run_count=next_run)
+            had_success = feeds_ok > 0
+            if had_success:
+                db.update_fetch_state(key=state_key, last_fetch_ts=now_ts, last_offset=0, run_count=next_run)
 
             fetch_summary = {
                 "should_fetch": True,
+                "ok": bool(had_success),
                 "feeds_total": len(feeds),
                 "feeds_ok": feeds_ok,
                 "feeds_failed": feeds_failed,
@@ -155,7 +159,7 @@ def main(argv: list[str]) -> int:
         )
 
     out = {
-        "ok": True,
+        "ok": bool((not should_fetch) or had_success),
         "source": "rss",
         "db": str(db_path),
         "window_hours": hours,
