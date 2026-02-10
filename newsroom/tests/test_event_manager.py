@@ -156,7 +156,16 @@ class TestClusterLink(unittest.TestCase):
                 eid = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
 
                 gemini = MagicMock()
-                gemini.generate_json.return_value = {"action": "assign", "event_id": eid}
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.9,
+                    "summary_en": "UK PM crisis",
+                    "category": "Politics",
+                    "jurisdiction": "UK",
+                    "link_flags": [],
+                    "match_basis": "Same incident; different source",
+                }
 
                 fresh = db.get_fresh_events()
                 result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
@@ -186,7 +195,16 @@ class TestClusterLink(unittest.TestCase):
                 eid = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
 
                 gemini = MagicMock()
-                gemini.generate_json.return_value = {"action": "assign", "event_id": eid}
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.9,
+                    "summary_en": "UK PM crisis",
+                    "category": "Politics",
+                    "jurisdiction": "UK",
+                    "link_flags": [],
+                    "match_basis": "Same incident; different source",
+                }
                 gemini.last_model_name = "gemini-test-model"
 
                 fresh = db.get_fresh_events()
@@ -216,6 +234,123 @@ class TestClusterLink(unittest.TestCase):
                 self.assertEqual(int(cand[0]["event_id"]), eid)
                 self.assertGreater(float(cand[0]["score"]), 0.0)
 
+    def test_cluster_link_enforces_new_event_on_low_confidence_assign(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/lowconf-1", norm_url="https://bbc.co.uk/lowconf-1",
+                    domain="bbc.co.uk", title="PM crisis", description="...",
+                    age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                link_id = int(links[0]["id"])
+
+                eid = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.69,
+                    "summary_en": "UK PM crisis",
+                    "category": "Politics",
+                    "jurisdiction": "UK",
+                    "link_flags": [],
+                    "match_basis": "Weak match",
+                }
+
+                fresh = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "new_event")
+                self.assertIn("event_id", result)
+                self.assertIn("enforcement", result)
+
+                enforced_event_id = int(result["event_id"])
+                self.assertNotEqual(enforced_event_id, eid)
+
+                original = db.get_event(eid)
+                assert original is not None
+                self.assertEqual(int(original["link_count"]), 0)
+
+                enforced_ev = db.get_event(enforced_event_id)
+                assert enforced_ev is not None
+                self.assertEqual(int(enforced_ev["link_count"]), 1)
+
+                row = db._conn.execute(
+                    "SELECT * FROM clustering_decisions WHERE link_id = ? ORDER BY id DESC LIMIT 1",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["validated_action"], "assign")
+                self.assertEqual(row["enforced_action"], "new_event")
+
+                enforced_obj = json.loads(str(row["enforced_action_json"]))
+                self.assertIn("enforcement", enforced_obj)
+                reasons = enforced_obj["enforcement"].get("reasons") if isinstance(enforced_obj["enforcement"], dict) else None
+                self.assertIsInstance(reasons, list)
+                assert isinstance(reasons, list)
+                self.assertTrue(any(str(r).startswith("low_confidence:") for r in reasons))
+
+    def test_cluster_link_enforces_new_event_on_roundup_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/roundup-1", norm_url="https://bbc.co.uk/roundup-1",
+                    domain="bbc.co.uk", title="Morning briefing: PM crisis", description="...",
+                    age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                link_id = int(links[0]["id"])
+
+                eid = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.95,
+                    "summary_en": "Morning briefing includes PM crisis and other topics",
+                    "category": "Politics",
+                    "jurisdiction": "UK",
+                    "link_flags": ["roundup"],
+                    "match_basis": "Roundup / briefing",
+                }
+
+                fresh = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "new_event")
+                self.assertIn("event_id", result)
+                self.assertIn("enforcement", result)
+
+                row = db._conn.execute(
+                    "SELECT * FROM clustering_decisions WHERE link_id = ? ORDER BY id DESC LIMIT 1",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["validated_action"], "assign")
+                self.assertEqual(row["enforced_action"], "new_event")
+
+                enforced_obj = json.loads(str(row["enforced_action_json"]))
+                self.assertIn("enforcement", enforced_obj)
+                reasons = enforced_obj["enforcement"].get("reasons") if isinstance(enforced_obj["enforcement"], dict) else None
+                self.assertIsInstance(reasons, list)
+                assert isinstance(reasons, list)
+                self.assertIn("link_flag:roundup", reasons)
+
     def test_cluster_link_new_event(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
@@ -232,9 +367,12 @@ class TestClusterLink(unittest.TestCase):
                 gemini = MagicMock()
                 gemini.generate_json.return_value = {
                     "action": "new_event",
+                    "confidence": 0.9,
                     "summary_en": "Scientists discover new species",
                     "category": "Global News",
                     "jurisdiction": "GLOBAL",
+                    "link_flags": [],
+                    "match_basis": None,
                 }
 
                 result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
@@ -322,8 +460,13 @@ class TestClusterLink(unittest.TestCase):
 
                 gemini = MagicMock()
                 gemini.generate_json.return_value = {
-                    "action": "new_event", "summary_en": "Test event",
-                    "category": "AI", "jurisdiction": "US",
+                    "action": "new_event",
+                    "confidence": 0.9,
+                    "summary_en": "Test event",
+                    "category": "AI",
+                    "jurisdiction": "US",
+                    "link_flags": [],
+                    "match_basis": None,
                 }
 
                 # Use fresh_events (old param name).
@@ -351,7 +494,16 @@ class TestClusterLink(unittest.TestCase):
                 db.mark_event_posted(eid, thread_id="t1", run_id="r1")
 
                 gemini = MagicMock()
-                gemini.generate_json.return_value = {"action": "assign", "event_id": eid}
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.9,
+                    "summary_en": "Jimmy Lai sentenced to 20 years in prison",
+                    "category": "Hong Kong News",
+                    "jurisdiction": "HK",
+                    "link_flags": [],
+                    "match_basis": "Same sentencing story",
+                }
 
                 events = db.get_all_fresh_events()
                 result = cluster_link(link=links[0], all_events=events, gemini=gemini, db=db)
@@ -385,12 +537,24 @@ class TestClusterAllPending(unittest.TestCase):
                     # Prompt-aware: if candidates shown in prompt, assign to first.
                     ids_in_prompt = [int(m) for m in _re.findall(r'\[id=(\d+)\]', prompt)]
                     if ids_in_prompt:
-                        return {"action": "assign", "event_id": ids_in_prompt[0]}
+                        return {
+                            "action": "assign",
+                            "event_id": ids_in_prompt[0],
+                            "confidence": 0.92,
+                            "summary_en": "Jimmy Lai sentenced to 20 years",
+                            "category": "Hong Kong News",
+                            "jurisdiction": "HK",
+                            "link_flags": [],
+                            "match_basis": "Same sentencing story",
+                        }
                     return {
                         "action": "new_event",
+                        "confidence": 0.9,
                         "summary_en": "Jimmy Lai sentenced to 20 years",
                         "category": "Hong Kong News",
                         "jurisdiction": "HK",
+                        "link_flags": [],
+                        "match_basis": None,
                     }
 
                 gemini = MagicMock()

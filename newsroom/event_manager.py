@@ -41,6 +41,10 @@ CATEGORY_LIST = [
     "Hong Kong News",
 ]
 
+_ASSIGNMENT_MIN_CONFIDENCE = 0.70
+_LINK_FLAGS_ALLOWED = {"roundup", "opinion", "live_updates", "multi_topic"}
+_LINK_FLAGS_FORCE_NEW_EVENT = {"roundup", "multi_topic"}
+
 
 # ---------------------------------------------------------------------------
 # Retrieve-then-decide helpers
@@ -337,8 +341,11 @@ No candidate events matched this link. Create a NEW EVENT.
 
 Return STRICT JSON:
 {{"action":"new_event",
+  "confidence":<0.0-1.0>,
   "summary_en":"<one-sentence English summary>",
-  "category":"<category>","jurisdiction":"<jurisdiction>"}}
+  "category":"<category>","jurisdiction":"<jurisdiction>",
+  "link_flags":[],
+  "match_basis":[]}}
 
 Categories: {categories_str}
 Jurisdictions: "US", "UK", "HK", "CN", "EU", "JP", "KR", "GLOBAL", or other 2-letter code.
@@ -370,20 +377,31 @@ These candidate events share significant vocabulary with this link:
 Choose ONE action:
 
 A) ASSIGN to existing event (same incident, different source, no new material)
-   → {{"action":"assign","event_id":<id>}}
+   → {{"action":"assign","event_id":<id>,
+      "confidence":<0.0-1.0>,
+      "summary_en":"<one-sentence English summary>",
+      "category":"<category>","jurisdiction":"<jurisdiction>",
+      "link_flags":[],
+      "match_basis":["<entity|number|location|time|other>"]}}
    ASSIGN is likely correct if a candidate covers the same story from a different source.
 
 B) NEW DEVELOPMENT of existing event (significant escalation, verdict, arrest, resignation)
    → {{"action":"development","parent_event_id":<id>,
+      "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
-      "category":"<category>","jurisdiction":"<jurisdiction>"}}
+      "category":"<category>","jurisdiction":"<jurisdiction>",
+      "link_flags":[],
+      "match_basis":["<entity|number|location|time|other>"]}}
    DEVELOPMENT = new phase only. Same facts from different source = ASSIGN, not DEVELOPMENT.
 
 C) NEW EVENT (completely new story, none of the candidates match)
    → {{"action":"new_event",
+      "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
-      "category":"<category>","jurisdiction":"<jurisdiction>"}}
+      "category":"<category>","jurisdiction":"<jurisdiction>",
+      "link_flags":[],
+      "match_basis":[]}}
 
 Categories: {categories_str}
 Jurisdictions: "US", "UK", "HK", "CN", "EU", "JP", "KR", "GLOBAL", or other 2-letter code.
@@ -394,6 +412,10 @@ Rules:
 - Completely unrelated story → C
 - Match across languages (Chinese headline about same event = same event)
 - Only use ASSIGN if a matching event exists in the candidates above
+- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty)
+- link_flags may include: "roundup", "opinion", "live_updates", "multi_topic"
+- If you are NOT at least 70% sure for ASSIGN or DEVELOPMENT, choose NEW EVENT instead
+- If the link is a roundup/briefing, opinion, live updates, or clearly multi-topic, set link_flags accordingly and choose NEW EVENT
 
 Return STRICT JSON only, no explanation."""
 
@@ -456,18 +478,29 @@ Here are the current FRESH EVENTS (last 48h):
 Choose ONE action:
 
 A) ASSIGN to existing event (same incident, different source, no new material)
-   → {{"action":"assign","event_id":<id>}}
+   → {{"action":"assign","event_id":<id>,
+      "confidence":0.0,
+      "summary_en":"<one-sentence English summary>",
+      "category":"<category>","jurisdiction":"<jurisdiction>",
+      "link_flags":[],
+      "match_basis":"<optional brief basis>"}}
 
 B) NEW DEVELOPMENT of existing event (significant escalation, result, reversal)
    → {{"action":"development","parent_event_id":<id>,
+      "confidence":0.0,
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
-      "category":"<category>","jurisdiction":"<jurisdiction>"}}
+      "category":"<category>","jurisdiction":"<jurisdiction>",
+      "link_flags":[],
+      "match_basis":"<optional brief basis>"}}
 
 C) NEW EVENT (completely new story)
    → {{"action":"new_event",
+      "confidence":0.0,
       "summary_en":"<one-sentence English summary>",
-      "category":"<category>","jurisdiction":"<jurisdiction>"}}
+      "category":"<category>","jurisdiction":"<jurisdiction>",
+      "link_flags":[],
+      "match_basis":null}}
 
 Categories: {categories_str}
 Jurisdictions: "US", "UK", "HK", "CN", "EU", "JP", "KR", "GLOBAL", or other 2-letter code.
@@ -479,6 +512,9 @@ Rules:
 - Match across languages (Chinese headline about same event = same event)
 - Only use ASSIGN if a matching event exists in the list above
 - Do NOT assign to events with status=posted unless it's truly the same event
+- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags, match_basis (optional)
+- If you are NOT at least 70% sure for ASSIGN or DEVELOPMENT, choose NEW EVENT instead
+- If the link is a roundup/briefing or clearly multi-topic, set link_flags to include "roundup" and/or "multi_topic" and choose NEW EVENT
 
 Return STRICT JSON only, no explanation."""
 
@@ -494,7 +530,75 @@ def parse_clustering_response(
 
     Returns a validated action dict or None if invalid.
     """
+    def _parse_confidence(v: Any) -> float | None:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            f = float(v)
+        elif isinstance(v, str):
+            t = v.strip()
+            if not t:
+                return None
+            try:
+                f = float(t)
+            except Exception:
+                return None
+        else:
+            return None
+        if f < 0.0 or f > 1.0:
+            return None
+        return f
+
+    def _parse_match_basis(v: Any) -> str | None:
+        if not isinstance(v, str):
+            return None
+        t = v.strip()
+        if not t:
+            return None
+        # Keep logs bounded; this is for human debugging only.
+        return t[:240]
+
+    def _parse_link_flags(v: Any) -> list[str]:
+        items: list[Any]
+        if v is None:
+            items = []
+        elif isinstance(v, (list, tuple)):
+            items = list(v)
+        elif isinstance(v, str):
+            t = v.strip()
+            if not t:
+                items = []
+            else:
+                # Accept either a single flag or a comma-separated string.
+                parts = [p.strip() for p in t.split(",")] if "," in t else [t]
+                items = [p for p in parts if p]
+        else:
+            items = []
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for it in items:
+            if not isinstance(it, str):
+                continue
+            flag = it.strip().lower()
+            if not flag or flag not in _LINK_FLAGS_ALLOWED:
+                continue
+            if flag in seen:
+                continue
+            seen.add(flag)
+            out.append(flag)
+        return out
+
     action = str(response.get("action") or "").strip().lower()
+    confidence = _parse_confidence(response.get("confidence"))
+    match_basis = _parse_match_basis(response.get("match_basis"))
+    link_flags = _parse_link_flags(response.get("link_flags"))
+
+    summary_en = str(response.get("summary_en") or "").strip() or None
+    category = str(response.get("category") or "").strip() or None
+    jurisdiction = str(response.get("jurisdiction") or "").strip() or None
 
     if action == "assign":
         event_id = response.get("event_id")
@@ -506,7 +610,16 @@ def parse_clustering_response(
         if event_id not in valid_ids:
             logger.warning("assign: event_id %d not in fresh events", event_id)
             return None
-        return {"action": "assign", "event_id": event_id}
+        return {
+            "action": "assign",
+            "event_id": event_id,
+            "confidence": confidence,
+            "match_basis": match_basis,
+            "link_flags": link_flags,
+            "summary_en": summary_en,
+            "category": category,
+            "jurisdiction": jurisdiction,
+        }
 
     if action == "development":
         parent_id = response.get("parent_event_id")
@@ -517,29 +630,33 @@ def parse_clustering_response(
         if parent_id not in valid_ids:
             logger.warning("development: parent_event_id %d not in fresh events", parent_id)
             return None
-        summary = str(response.get("summary_en") or "").strip()
-        if not summary:
+        if not summary_en:
             logger.warning("development: empty summary_en")
             return None
         return {
             "action": "development",
             "parent_event_id": parent_id,
-            "summary_en": summary,
+            "confidence": confidence,
+            "match_basis": match_basis,
+            "link_flags": link_flags,
+            "summary_en": summary_en,
             "development": str(response.get("development") or "").strip() or None,
-            "category": str(response.get("category") or "").strip() or None,
-            "jurisdiction": str(response.get("jurisdiction") or "").strip() or None,
+            "category": category,
+            "jurisdiction": jurisdiction,
         }
 
     if action in ("new_event", "new"):
-        summary = str(response.get("summary_en") or "").strip()
-        if not summary:
+        if not summary_en:
             logger.warning("new_event: empty summary_en")
             return None
         return {
             "action": "new_event",
-            "summary_en": summary,
-            "category": str(response.get("category") or "").strip() or None,
-            "jurisdiction": str(response.get("jurisdiction") or "").strip() or None,
+            "confidence": confidence,
+            "match_basis": match_basis,
+            "link_flags": link_flags,
+            "summary_en": summary_en,
+            "category": category,
+            "jurisdiction": jurisdiction,
         }
 
     logger.warning("Unknown clustering action: %s", action)
@@ -674,78 +791,126 @@ def cluster_link(
     link_title = str(link.get("title") or "").strip() or None
     link_url = str(link.get("url") or "").strip() or None
 
-    action = validated["action"]
+    def _fallback_summary_en_for_override() -> str:
+        title = str(link.get("title") or "").strip()
+        desc = str(link.get("description") or "").strip()
+        base = title or desc
+        if not base:
+            return "News link"
+        # Keep to a short single-sentence summary to avoid bloating DB logs.
+        return base.replace("\n", " ").strip()[:240]
+
+    enforced: dict[str, Any] = dict(validated)
+    override_reasons: list[str] = []
+    if enforced.get("action") in ("assign", "development"):
+        flags = set(enforced.get("link_flags") or [])
+        for f in sorted(flags & _LINK_FLAGS_FORCE_NEW_EVENT):
+            override_reasons.append(f"link_flag:{f}")
+
+        conf = enforced.get("confidence")
+        if conf is None:
+            override_reasons.append("missing_confidence")
+        else:
+            try:
+                if float(conf) < _ASSIGNMENT_MIN_CONFIDENCE:
+                    override_reasons.append(f"low_confidence:{float(conf):.2f}")
+            except Exception:
+                override_reasons.append("invalid_confidence")
+
+        if override_reasons:
+            # Deterministic abstain behaviour: do not ASSIGN/DEVELOP on low confidence or noisy link types.
+            enforced = {
+                "action": "new_event",
+                "confidence": enforced.get("confidence"),
+                "match_basis": enforced.get("match_basis"),
+                "link_flags": list(enforced.get("link_flags") or []),
+                "summary_en": enforced.get("summary_en") or _fallback_summary_en_for_override(),
+                "category": enforced.get("category"),
+                "jurisdiction": enforced.get("jurisdiction"),
+                "enforcement": {
+                    "original_action": str(validated_action_obj.get("action") or ""),
+                    "reasons": override_reasons,
+                },
+            }
+            logger.info(
+                "Enforced new_event for link %d (validated=%s): %s",
+                link_id,
+                validated_action_obj.get("action"),
+                ", ".join(override_reasons),
+            )
+
+    action = str(enforced.get("action") or "").strip().lower()
 
     if action == "assign":
-        event_id = validated["event_id"]
+        event_id = enforced["event_id"]
         assigned_to_posted = False
         for ev in candidate_events:
             if ev["id"] == event_id and ev.get("status") == "posted":
                 assigned_to_posted = True
                 break
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
-        validated["assigned_to_posted"] = assigned_to_posted
+        enforced["assigned_to_posted"] = assigned_to_posted
         logger.info("Assigned link %d to event %d%s", link_id, event_id, " (posted)" if assigned_to_posted else "")
         _log_decision(
             llm_response=response,
             validated_action=validated_action_obj,
-            enforced_action=dict(validated),
+            enforced_action=dict(enforced),
             llm_started_at_ts=llm_started_at_ts,
             llm_finished_at_ts=llm_finished_at_ts,
         )
-        return validated
+        return enforced
 
     if action == "development":
-        parent_id = validated["parent_event_id"]
+        parent_id = enforced["parent_event_id"]
         model_name = _pick_model_name(gemini) or "gemini-flash"
         event_id = db.create_event(
-            summary_en=validated["summary_en"],
-            category=validated.get("category"),
-            jurisdiction=validated.get("jurisdiction"),
+            summary_en=enforced["summary_en"],
+            category=enforced.get("category"),
+            jurisdiction=enforced.get("jurisdiction"),
             title=link_title,
             primary_url=link_url,
             parent_event_id=parent_id,
-            development=validated.get("development"),
+            development=enforced.get("development"),
             model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
-        validated["event_id"] = event_id
+        enforced["event_id"] = event_id
         logger.info("Created development event %d (parent=%d) for link %d", event_id, parent_id, link_id)
         _log_decision(
             llm_response=response,
             validated_action=validated_action_obj,
-            enforced_action=dict(validated),
+            enforced_action=dict(enforced),
             llm_started_at_ts=llm_started_at_ts,
             llm_finished_at_ts=llm_finished_at_ts,
         )
-        return validated
+        return enforced
 
     if action == "new_event":
         model_name = _pick_model_name(gemini) or "gemini-flash"
         event_id = db.create_event(
-            summary_en=validated["summary_en"],
-            category=validated.get("category"),
-            jurisdiction=validated.get("jurisdiction"),
+            summary_en=enforced["summary_en"],
+            category=enforced.get("category"),
+            jurisdiction=enforced.get("jurisdiction"),
             title=link_title,
             primary_url=link_url,
             model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
-        validated["event_id"] = event_id
+        enforced["event_id"] = event_id
         logger.info("Created new event %d for link %d", event_id, link_id)
         _log_decision(
             llm_response=response,
             validated_action=validated_action_obj,
-            enforced_action=dict(validated),
+            enforced_action=dict(enforced),
             llm_started_at_ts=llm_started_at_ts,
             llm_finished_at_ts=llm_finished_at_ts,
         )
-        return validated
+        return enforced
 
     _log_decision(
         llm_response=response,
         validated_action=validated_action_obj,
-        enforced_action=dict(validated),
+        enforced_action=dict(enforced),
         llm_started_at_ts=llm_started_at_ts,
         llm_finished_at_ts=llm_finished_at_ts,
     )
