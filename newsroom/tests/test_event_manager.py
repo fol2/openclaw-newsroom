@@ -168,6 +168,54 @@ class TestClusterLink(unittest.TestCase):
                 assert ev is not None
                 self.assertEqual(ev["link_count"], 1)
 
+    def test_cluster_link_logs_decision_assign(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/log-1", norm_url="https://bbc.co.uk/log-1",
+                    domain="bbc.co.uk", title="PM crisis", description="...",
+                    age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                link_id = int(links[0]["id"])
+
+                eid = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {"action": "assign", "event_id": eid}
+                gemini.last_model_name = "gemini-test-model"
+
+                fresh = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+
+                row = db._conn.execute(
+                    "SELECT * FROM clustering_decisions WHERE link_id = ? ORDER BY id DESC LIMIT 1",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(int(row["link_id"]), link_id)
+                self.assertEqual(row["validated_action"], "assign")
+                self.assertEqual(row["enforced_action"], "assign")
+                self.assertEqual(row["model_name"], "gemini-test-model")
+                self.assertIsInstance(row["prompt_sha256"], str)
+                self.assertEqual(len(str(row["prompt_sha256"])), 64)
+                self.assertIsInstance(row["llm_response_json"], str)
+
+                decision_id = int(row["id"])
+                cand = db._conn.execute(
+                    "SELECT rank, event_id, score FROM clustering_decision_candidates WHERE decision_id = ? ORDER BY rank ASC",
+                    (decision_id,),
+                ).fetchall()
+                self.assertGreaterEqual(len(cand), 1)
+                self.assertEqual(int(cand[0]["event_id"]), eid)
+                self.assertGreater(float(cand[0]["score"]), 0.0)
+
     def test_cluster_link_new_event(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
@@ -221,6 +269,42 @@ class TestClusterLink(unittest.TestCase):
 
                 remaining = db.get_unassigned_links()
                 self.assertEqual(len(remaining), 1)
+
+    def test_cluster_link_logs_decision_empty_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/log-2", norm_url="https://bbc.co.uk/log-2",
+                    domain="bbc.co.uk", title="Some news", description="...",
+                    age=None, page_age=None, query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                link_id = int(links[0]["id"])
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = None
+
+                result = cluster_link(link=links[0], all_events=[], gemini=gemini, db=db)
+                self.assertIsNone(result)
+
+                row = db._conn.execute(
+                    "SELECT * FROM clustering_decisions WHERE link_id = ? ORDER BY id DESC LIMIT 1",
+                    (link_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertIsNone(row["validated_action"])
+                self.assertIsNone(row["enforced_action"])
+                cand = db._conn.execute(
+                    "SELECT COUNT(1) AS n FROM clustering_decision_candidates WHERE decision_id = ?",
+                    (int(row["id"]),),
+                ).fetchone()
+                assert cand is not None
+                self.assertEqual(int(cand["n"]), 0)
 
     def test_cluster_link_backward_compat_fresh_events(self) -> None:
         """fresh_events param still works as backward compat alias."""

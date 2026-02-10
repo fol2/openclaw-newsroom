@@ -7,6 +7,7 @@ semantic fingerprinting (semantic_cluster.py).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -376,6 +377,11 @@ def cluster_link(
     Uses *all_events* (preferred) or *fresh_events* (backward compat alias).
     Returns the action result dict or None on failure.
     """
+    link_id = link.get("id")
+    if not isinstance(link_id, int):
+        logger.warning("link missing id")
+        return None
+
     events = all_events if all_events is not None else (fresh_events or [])
 
     # Stage 1: Retrieve candidates (deterministic).
@@ -385,14 +391,79 @@ def cluster_link(
 
     # Stage 2: Focused LLM prompt.
     prompt = build_focused_clustering_prompt(link, candidates)
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
+    candidate_pairs: list[tuple[int, float]] = []
+    for ev, score in candidates:
+        try:
+            candidate_pairs.append((int(ev["id"]), float(score)))
+        except Exception:
+            continue
+
+    def _pick_model_name(obj: Any) -> str | None:
+        for attr in ("last_model_name", "last_model", "model_name", "model"):
+            v = getattr(obj, attr, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
+    def _log_decision(
+        *,
+        llm_response: Any | None,
+        validated_action: dict[str, Any] | None,
+        enforced_action: dict[str, Any] | None,
+        llm_started_at_ts: int | None,
+        llm_finished_at_ts: int | None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        # Logging is best-effort only; it must never change clustering behaviour.
+        insert_fn = getattr(db, "insert_clustering_decision", None)
+        if not callable(insert_fn):
+            return
+        try:
+            insert_fn(
+                link_id=link_id,
+                candidates=candidate_pairs,
+                prompt_sha256=prompt_sha256,
+                model_name=_pick_model_name(gemini),
+                llm_response=llm_response,
+                validated_action=validated_action,
+                enforced_action=enforced_action,
+                llm_started_at_ts=llm_started_at_ts,
+                llm_finished_at_ts=llm_finished_at_ts,
+                error_type=error_type,
+                error_message=error_message,
+            )
+        except Exception:
+            logger.debug("Failed to log clustering decision for link_id=%d", link_id, exc_info=True)
+
+    llm_started_at_ts = int(time.time())
     try:
         response = gemini.generate_json(prompt)
     except Exception as e:
+        llm_finished_at_ts = int(time.time())
+        _log_decision(
+            llm_response=None,
+            validated_action=None,
+            enforced_action=None,
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
         logger.warning("Gemini call failed for link %s: %s", link.get("norm_url", "?"), e)
         return None
+    llm_finished_at_ts = int(time.time())
 
     if not response:
+        _log_decision(
+            llm_response=response,
+            validated_action=None,
+            enforced_action=None,
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+        )
         logger.warning("Empty Gemini response for link %s", link.get("norm_url", "?"))
         return None
 
@@ -400,12 +471,15 @@ def cluster_link(
     candidate_events = [ev for ev, _score in candidates]
     validated = parse_clustering_response(response, link, candidate_events)
     if not validated:
+        _log_decision(
+            llm_response=response,
+            validated_action=None,
+            enforced_action=None,
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+        )
         return None
-
-    link_id = link.get("id")
-    if not isinstance(link_id, int):
-        logger.warning("link missing id")
-        return None
+    validated_action_obj = dict(validated)
 
     link_title = str(link.get("title") or "").strip() or None
     link_url = str(link.get("url") or "").strip() or None
@@ -422,10 +496,18 @@ def cluster_link(
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
         validated["assigned_to_posted"] = assigned_to_posted
         logger.info("Assigned link %d to event %d%s", link_id, event_id, " (posted)" if assigned_to_posted else "")
+        _log_decision(
+            llm_response=response,
+            validated_action=validated_action_obj,
+            enforced_action=dict(validated),
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+        )
         return validated
 
     if action == "development":
         parent_id = validated["parent_event_id"]
+        model_name = _pick_model_name(gemini) or "gemini-flash"
         event_id = db.create_event(
             summary_en=validated["summary_en"],
             category=validated.get("category"),
@@ -434,27 +516,49 @@ def cluster_link(
             primary_url=link_url,
             parent_event_id=parent_id,
             development=validated.get("development"),
-            model="gemini-flash",
+            model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
         validated["event_id"] = event_id
         logger.info("Created development event %d (parent=%d) for link %d", event_id, parent_id, link_id)
+        _log_decision(
+            llm_response=response,
+            validated_action=validated_action_obj,
+            enforced_action=dict(validated),
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+        )
         return validated
 
     if action == "new_event":
+        model_name = _pick_model_name(gemini) or "gemini-flash"
         event_id = db.create_event(
             summary_en=validated["summary_en"],
             category=validated.get("category"),
             jurisdiction=validated.get("jurisdiction"),
             title=link_title,
             primary_url=link_url,
-            model="gemini-flash",
+            model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
         validated["event_id"] = event_id
         logger.info("Created new event %d for link %d", event_id, link_id)
+        _log_decision(
+            llm_response=response,
+            validated_action=validated_action_obj,
+            enforced_action=dict(validated),
+            llm_started_at_ts=llm_started_at_ts,
+            llm_finished_at_ts=llm_finished_at_ts,
+        )
         return validated
 
+    _log_decision(
+        llm_response=response,
+        validated_action=validated_action_obj,
+        enforced_action=dict(validated),
+        llm_started_at_ts=llm_started_at_ts,
+        llm_finished_at_ts=llm_finished_at_ts,
+    )
     return None
 
 
