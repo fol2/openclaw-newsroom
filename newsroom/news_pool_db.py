@@ -1716,6 +1716,79 @@ class NewsPoolDB:
         logger.info("Pruned %d expired events (max_age_hours=%d)", n, max_age_hours)
         return n
 
+    def prune_stale_unposted_events(
+        self,
+        *,
+        stale_after_hours: int = 96,
+        low_link_max: int = 1,
+        low_quality_summary_chars: int = 80,
+        now_ts: int | None = None,
+    ) -> int:
+        """Delete stale, expired unposted events that are low-link or low-quality.
+
+        Safety constraints:
+        - Never deletes posted events (audit trail).
+        - Only deletes events that are already expired and stale.
+        - Only deletes leaf events (no children), to avoid breaking parent links.
+        """
+        now = now_ts if now_ts is not None else _utc_now_ts()
+        stale_cutoff = now - max(1, int(stale_after_hours)) * 3600
+        low_link_threshold = max(0, int(low_link_max))
+        summary_chars_threshold = max(1, int(low_quality_summary_chars))
+        cur = self._conn.cursor()
+
+        rows = cur.execute(
+            """
+            SELECT e.id
+            FROM events AS e
+            WHERE e.status != 'posted'
+              AND COALESCE(e.expires_at_ts, 0) < ?
+              AND COALESCE(e.updated_at_ts, e.created_at_ts, 0) < ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM events AS child
+                WHERE child.parent_event_id = e.id
+              )
+              AND (
+                COALESCE(e.link_count, 0) <= ?
+                OR e.primary_url IS NULL
+                OR TRIM(e.primary_url) = ''
+                OR (
+                  (e.title IS NULL OR TRIM(e.title) = '')
+                  AND LENGTH(TRIM(COALESCE(e.summary_en, ''))) < ?
+                )
+              )
+            """,
+            (now, stale_cutoff, low_link_threshold, summary_chars_threshold),
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        ids = [int(r["id"]) for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+
+        # Nullify event_id on orphaned links.
+        cur.execute(
+            f"UPDATE links SET event_id = NULL WHERE event_id IN ({placeholders})",
+            ids,
+        )
+
+        cur.execute(
+            f"DELETE FROM events WHERE id IN ({placeholders})",
+            ids,
+        )
+
+        n = len(ids)
+        logger.info(
+            "Pruned %d stale unposted events (stale_after_hours=%d, low_link_max=%d, low_quality_summary_chars=%d)",
+            n,
+            int(stale_after_hours),
+            int(low_link_max),
+            int(low_quality_summary_chars),
+        )
+        return n
+
     def get_daily_candidates(self, *, limit: int = 15, now_ts: int | None = None) -> list[dict[str, Any]]:
         """Select events for daily posting with category balance and HK guarantee.
 
