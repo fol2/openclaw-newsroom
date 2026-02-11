@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 from newsroom.event_manager import (
     CATEGORY_LIST,
     EventTokens,
-    _find_cross_category_duplicates,
+    _cross_category_pairs_by_retrieval,
     _tokenize_event,
     _tokenize_link,
     build_clustering_prompt,
@@ -1173,16 +1173,16 @@ class TestMergeIncludesPosted(unittest.TestCase):
                 self.assertEqual(winner["status"], "posted")
 
     def test_cross_category_merge(self) -> None:
-        """Events in different categories with shared anchors should be detected."""
+        """Events in different categories with strong retrieval similarity should be detected."""
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
                 eid1 = db.create_event(
-                    summary_en="Jimmy Lai sentenced to 20 years in prison under national security law",
+                    summary_en="alpha beta gamma delta",
                     category="Hong Kong News", jurisdiction="HK",
                 )
                 eid2 = db.create_event(
-                    summary_en="Jimmy Lai sentenced to 20 years for sedition under Hong Kong national security law",
+                    summary_en="alpha beta gamma delta",
                     category="Global News", jurisdiction="HK",
                 )
 
@@ -1228,33 +1228,55 @@ class TestDedupeMarkerRootAncestor(unittest.TestCase):
                 self.assertEqual(db.get_root_event_id(root_id), root_id)
 
 
-class TestFindCrossCategoryDuplicates(unittest.TestCase):
-    def test_finds_cross_category_pairs(self) -> None:
+class TestCrossCategoryPairsByRetrieval(unittest.TestCase):
+    def test_does_not_require_anchor_overlap(self) -> None:
         events = [
-            {"id": 1, "summary_en": "Jimmy Lai sentenced to 20 years in prison",
-             "title": "Lai trial", "category": "Hong Kong News"},
-            {"id": 2, "summary_en": "Jimmy Lai sentenced to 20 years under national security law",
-             "title": "Lai jailed", "category": "Global News"},
+            {"id": 1, "summary_en": "alpha beta gamma delta", "title": "x", "category": "Hong Kong News"},
+            {"id": 2, "summary_en": "alpha beta gamma delta", "title": "y", "category": "Global News"},
         ]
-        pairs = _find_cross_category_duplicates(events, min_anchor_overlap=2)
-        self.assertTrue(len(pairs) > 0)
-        self.assertIn((1, 2), pairs)
+        self.assertEqual(len(_tokenize_event(events[0]).anchor_tokens), 0)
+        self.assertEqual(len(_tokenize_event(events[1]).anchor_tokens), 0)
+
+        pairs = _cross_category_pairs_by_retrieval(
+            events,
+            token_cache={},
+            drop_high_df=set(),
+            min_score=0.25,
+            top_k=10,
+            max_pairs=10,
+        )
+        self.assertEqual([(a, b) for a, b, _ in pairs], [(1, 2)])
+        self.assertGreaterEqual(pairs[0][2], 0.25)
 
     def test_same_category_excluded(self) -> None:
         events = [
-            {"id": 1, "summary_en": "Jimmy Lai sentenced", "title": "Lai", "category": "HK News"},
-            {"id": 2, "summary_en": "Jimmy Lai jailed", "title": "Lai", "category": "HK News"},
+            {"id": 1, "summary_en": "alpha beta gamma delta", "title": "x", "category": "Global News"},
+            {"id": 2, "summary_en": "alpha beta gamma delta", "title": "y", "category": "Global News"},
         ]
-        pairs = _find_cross_category_duplicates(events)
-        self.assertEqual(len(pairs), 0)
+        pairs = _cross_category_pairs_by_retrieval(
+            events,
+            token_cache={},
+            drop_high_df=set(),
+            min_score=0.25,
+            top_k=10,
+            max_pairs=10,
+        )
+        self.assertEqual(pairs, [])
 
     def test_unrelated_events_excluded(self) -> None:
         events = [
-            {"id": 1, "summary_en": "Jimmy Lai sentenced", "title": "Lai", "category": "HK News"},
-            {"id": 2, "summary_en": "Tesla Q4 earnings beat", "title": "Tesla", "category": "US Stocks"},
+            {"id": 1, "summary_en": "alpha beta gamma delta", "title": "x", "category": "Hong Kong News"},
+            {"id": 2, "summary_en": "omega psi chi phi", "title": "y", "category": "Global News"},
         ]
-        pairs = _find_cross_category_duplicates(events, min_anchor_overlap=2)
-        self.assertEqual(len(pairs), 0)
+        pairs = _cross_category_pairs_by_retrieval(
+            events,
+            token_cache={},
+            drop_high_df=set(),
+            min_score=0.25,
+            top_k=10,
+            max_pairs=10,
+        )
+        self.assertEqual(pairs, [])
 
 
 class TestGetAllFreshEvents(unittest.TestCase):
