@@ -34,6 +34,7 @@ dev = [
 ]
 
 [project.scripts]
+build-clustering-eval-dataset = "scripts._cli:build_clustering_eval_dataset"
 gdelt-pool-update = "scripts._cli:gdelt_pool_update"
 news-pool-status = "scripts._cli:news_pool_status"
 news-pool-update = "scripts._cli:news_pool_update"
@@ -42,6 +43,7 @@ newsroom-daily-inputs = "scripts._cli:newsroom_daily_inputs"
 newsroom-hourly-inputs = "scripts._cli:newsroom_hourly_inputs"
 newsroom-runner = "scripts._cli:newsroom_runner"
 newsroom-write-run-job = "scripts._cli:newsroom_write_run_job"
+replay-clustering-eval-dataset = "scripts._cli:replay_clustering_eval_dataset"
 rss-pool-update = "scripts._cli:rss_pool_update"
 
 [tool.hatch.build.targets.wheel]

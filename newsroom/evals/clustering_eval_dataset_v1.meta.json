@@ -1,0 +1,39 @@
+{
+  "schema_version": "clustering_eval_dataset_meta_v1",
+  "dataset_schema_version": "clustering_eval_sample_v1",
+  "generated_at": "2026-02-11T11:17:58+00:00",
+  "source_db": "/home/fol2hk/.openclaw/data/newsroom/news_pool.sqlite3",
+  "sample_size": 240,
+  "seed": 25,
+  "since_hours": 1080,
+  "low_score_threshold": 0.22,
+  "lang_min": {
+    "en": 150,
+    "zh": 40,
+    "mixed": 15
+  },
+  "summary": {
+    "rows": 240,
+    "languages": {
+      "en": 184,
+      "mixed": 15,
+      "zh": 41
+    },
+    "correctness": {
+      "correct": 234,
+      "incorrect": 6
+    },
+    "actions": {
+      "assign": 59,
+      "development": 18,
+      "new_event": 163
+    },
+    "flags": {
+      "development": 18,
+      "live_updates": 3,
+      "low_retrieval_score": 27,
+      "opinion": 6,
+      "policy_override": 5
+    }
+  }
+}

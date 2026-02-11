@@ -20,6 +20,7 @@ openclaw-newsroom is a pipeline that transforms raw news links into polished, cl
 - [AGENTS.md](AGENTS.md) -- Cron agent system, planner/runner architecture, job file formats
 - [PROMPTS.md](PROMPTS.md) -- Prompt template system, category routing, validators
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- How to add news sources, prompts, and validators
+- [docs/evaluation/clustering_eval_dataset_v1.md](docs/evaluation/clustering_eval_dataset_v1.md) -- Labelled clustering evaluation dataset schema, criteria, build, and replay workflow
 
 ## Prerequisites
 
@@ -97,6 +98,8 @@ uv run python scripts/newsroom_runner.py --dry-run
 | `news_pool_status.py` | Diagnostic tool -- shows pool statistics, cluster counts, and link freshness. |
 | `news_pool_dump_jsonl.py` | Dumps a consistent snapshot of `links` + `events` to JSONL for sandbox rebuilds. |
 | `news_pool_restore_jsonl.py` | Restores a JSONL dump into a fresh SQLite DB (refuses to overwrite without `--overwrite`). |
+| `build_clustering_eval_dataset.py` | Builds a reproducible labelled clustering evaluation dataset from `clustering_decisions`. |
+| `replay_clustering_eval_dataset.py` | Replays dataset rows through parser logic and reports label consistency metrics. |
 
 All scripts live in the `scripts/` directory and are invoked as standalone Python scripts.
 
