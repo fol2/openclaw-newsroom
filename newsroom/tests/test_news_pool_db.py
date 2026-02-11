@@ -262,6 +262,31 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                 self.assertEqual(ev["link_count"], 0)
                 self.assertIsNotNone(ev["expires_at_ts"])
 
+    def test_create_event_persists_entity_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced in Hong Kong",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                    entity_aliases=[
+                        {"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]},
+                        {"entity": "Hong Kong Court", "zh": "香港法院"},
+                    ],
+                )
+                ev = db.get_event(eid)
+                self.assertIsNotNone(ev)
+                assert ev is not None
+                self.assertIsInstance(ev.get("entity_aliases_json"), str)
+                self.assertEqual(
+                    ev.get("entity_aliases"),
+                    [
+                        {"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]},
+                        {"label": "Hong Kong Court", "aliases": ["香港法院"]},
+                    ],
+                )
+
     def test_create_development(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
@@ -793,6 +818,49 @@ class TestCandidateEnrichment(unittest.TestCase):
                 self.assertIn("domains", c)
                 self.assertIn("lang_hint", c)
                 self.assertEqual(c["lang_hint"], "mixed")
+
+    def test_candidate_enrichment_includes_entity_aliases_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Sentencing update",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                    entity_aliases=[
+                        {"label": "Jimmy Lai", "aliases": ["黎智英"]},
+                        {"label": "Hong Kong Court", "aliases": ["香港法院"]},
+                    ],
+                )
+                link = PoolLink(
+                    url="https://example.com/hk-case",
+                    norm_url="https://example.com/hk-case",
+                    domain="example.com",
+                    title="Case update",
+                    description="Sentencing update",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                unassigned = db.get_unassigned_links()
+                self.assertEqual(len(unassigned), 1)
+                db.assign_link_to_event(link_id=unassigned[0]["id"], event_id=eid)
+
+                candidates = db.get_daily_candidates(limit=5)
+                self.assertGreater(len(candidates), 0)
+                c = candidates[0]
+                self.assertEqual(
+                    c.get("entity_aliases"),
+                    [
+                        {"label": "Jimmy Lai", "aliases": ["黎智英"]},
+                        {"label": "Hong Kong Court", "aliases": ["香港法院"]},
+                    ],
+                )
+                self.assertIn("Jimmy Lai", c.get("cluster_terms", []))
+                self.assertIn("黎智英", c.get("anchor_terms", []))
 
 
 class TestMergeEventsInto(unittest.TestCase):
