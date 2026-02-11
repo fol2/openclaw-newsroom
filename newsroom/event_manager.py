@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -265,9 +265,17 @@ def _entity_alias_surface_forms(event: dict[str, Any], *, max_terms: int = 32) -
 class EventTokens:
     key_tokens: frozenset[str]
     anchor_tokens: frozenset[str]
+    feature_entity_tokens: frozenset[str] = field(default_factory=frozenset)
+    feature_number_tokens: frozenset[str] = field(default_factory=frozenset)
 
 _TOKEN_CACHE_DF_SIG_KEY = "__nr_drop_high_df_sig__"
+_TOKEN_CACHE_EVENT_SIG_KEY = "__nr_event_sig__"
+_TOKEN_CACHE_FEATURE_ENTITY_INDEX_KEY = "__nr_feature_entity_index__"
+_TOKEN_CACHE_FEATURE_NUMBER_INDEX_KEY = "__nr_feature_number_index__"
 _CJK_LANG_HINT_PREFIXES = ("cjk", "zh", "ja", "ko", "cn", "hk")
+_NUMBER_SIGNAL_RE = re.compile(r"\d[\d,\.]*")
+_YEAR_SIGNAL_MIN = 1900
+_YEAR_SIGNAL_MAX = 2099
 
 
 def _drop_high_df_signature(drop_high_df: set[str]) -> str:
@@ -306,6 +314,271 @@ def _compute_drop_high_df(events: list[dict[str, Any]]) -> set[str]:
     return {t for t, c in df.items() if c >= df_cap}
 
 
+def _event_retrieval_signature(events: list[dict[str, Any]]) -> str:
+    """Return a stable signature for the current retrieval universe."""
+    if not events:
+        return "ev0"
+    h = hashlib.sha1()
+    for ev in events:
+        eid = int(ev.get("id") or 0)
+        updated = int(
+            ev.get("feature_updated_at_ts")
+            or ev.get("updated_at_ts")
+            or ev.get("best_published_ts")
+            or 0
+        )
+        h.update(f"{eid}:{updated}\n".encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def _clean_feature_token(raw: Any, *, max_len: int = 120) -> str | None:
+    cleaned = _clean_alias_text(raw, max_len=max_len)
+    if not cleaned:
+        return None
+    token = " ".join(cleaned.casefold().split())
+    return token or None
+
+
+def _normalise_number_signal(raw: Any) -> str | None:
+    token = _clean_feature_token(raw, max_len=40)
+    if not token:
+        return None
+    token = token.replace(",", "")
+    if token.startswith("."):
+        token = f"0{token}"
+    if token.endswith("."):
+        token = token[:-1]
+    if not re.fullmatch(r"\d+(?:\.\d+)?", token):
+        return None
+    if token.isdigit() and len(token) == 4:
+        year = int(token)
+        if _YEAR_SIGNAL_MIN <= year <= _YEAR_SIGNAL_MAX:
+            return None
+    return token
+
+
+def _extract_number_signals_from_text(*values: Any) -> set[str]:
+    out: set[str] = set()
+    for v in values:
+        text = str(v or "").strip()
+        if not text:
+            continue
+        for m in _NUMBER_SIGNAL_RE.findall(text):
+            norm = _normalise_number_signal(m)
+            if norm:
+                out.add(norm)
+    return out
+
+
+def _is_entity_signal_token(token: str) -> bool:
+    if not token or any(ch.isdigit() for ch in token):
+        return False
+    if any("\u4e00" <= ch <= "\u9fff" for ch in token):
+        return len(token) >= 2
+    if token.isupper() and 2 <= len(token) <= 6:
+        return True
+    if token.isascii():
+        has_alpha = any(("a" <= ch <= "z") or ("A" <= ch <= "Z") for ch in token)
+        return has_alpha and len(token) >= 4
+    return False
+
+
+def _entity_signal_tokens_from_text(raw: Any) -> set[str]:
+    text = _clean_alias_text(raw)
+    if not text:
+        return set()
+    out: set[str] = set()
+    base = _clean_feature_token(text)
+    if base:
+        out.add(base)
+
+    for tok in _si_anchor_terms(text, None):
+        norm = _clean_feature_token(tok, max_len=80)
+        if norm and _is_entity_signal_token(norm):
+            out.add(norm)
+    for tok in _si_tokenize_text(text, None):
+        norm = _clean_feature_token(tok, max_len=80)
+        if norm and _is_entity_signal_token(norm):
+            out.add(norm)
+    return out
+
+
+def _parse_feature_entities(raw: Any) -> set[str]:
+    parsed = raw
+    if isinstance(parsed, str):
+        s = parsed.strip()
+        if not s:
+            return set()
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            parsed = [s]
+    if isinstance(parsed, dict):
+        parsed = parsed.get("entity_aliases", parsed)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return set()
+
+    out: set[str] = set()
+    for item in parsed:
+        if isinstance(item, dict):
+            for key in (
+                "label",
+                "entity",
+                "name",
+                "canonical",
+                "zh",
+                "zh_hant",
+                "zh_tw",
+                "english",
+                "en",
+            ):
+                out.update(_entity_signal_tokens_from_text(item.get(key)))
+            aliases = item.get("aliases")
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    out.update(_entity_signal_tokens_from_text(alias))
+            elif aliases is not None:
+                out.update(_entity_signal_tokens_from_text(aliases))
+            continue
+        out.update(_entity_signal_tokens_from_text(item))
+    return out
+
+
+def _parse_feature_numbers(raw: Any) -> set[str]:
+    parsed = raw
+    if isinstance(parsed, str):
+        s = parsed.strip()
+        if not s:
+            return set()
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            parsed = [s]
+    if isinstance(parsed, dict):
+        parsed = parsed.get("key_numbers", parsed)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return set()
+
+    out: set[str] = set()
+    for item in parsed:
+        norm = _normalise_number_signal(item)
+        if norm:
+            out.add(norm)
+            continue
+        out.update(_extract_number_signals_from_text(item))
+    return out
+
+
+def _event_feature_entity_tokens(event: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for field_name in (
+        "feature_entities",
+        "entities",
+        "feature_entities_json",
+        "entities_json",
+    ):
+        out.update(_parse_feature_entities(event.get(field_name)))
+    for alias in _entity_alias_surface_forms(event):
+        out.update(_entity_signal_tokens_from_text(alias))
+    return out
+
+
+def _event_feature_number_tokens(event: dict[str, Any], *, primary_text: str) -> set[str]:
+    out: set[str] = set()
+    for field_name in (
+        "feature_key_numbers",
+        "key_numbers",
+        "feature_key_numbers_json",
+        "key_numbers_json",
+    ):
+        out.update(_parse_feature_numbers(event.get(field_name)))
+    out.update(_extract_number_signals_from_text(primary_text))
+    return out
+
+
+def _link_feature_entity_tokens(
+    *,
+    title: str,
+    desc: str,
+    key_tokens: set[str],
+    anchor_tokens: set[str],
+) -> set[str]:
+    out: set[str] = set()
+    out.update(_entity_signal_tokens_from_text(title))
+    out.update(_entity_signal_tokens_from_text(desc))
+    for tok in key_tokens:
+        norm = _clean_feature_token(tok, max_len=80)
+        if norm and _is_entity_signal_token(norm):
+            out.add(norm)
+    for tok in anchor_tokens:
+        norm = _clean_feature_token(tok, max_len=80)
+        if norm and _is_entity_signal_token(norm):
+            out.add(norm)
+    return out
+
+
+def _link_feature_number_tokens(*, title: str, desc: str, anchor_tokens: set[str]) -> set[str]:
+    out = _extract_number_signals_from_text(title, desc)
+    for tok in anchor_tokens:
+        norm = _normalise_number_signal(tok)
+        if norm:
+            out.add(norm)
+    return out
+
+
+def _ensure_token_cache_epoch(
+    *,
+    token_cache: dict[Any, Any],
+    drop_high_df_sig: str,
+    event_sig: str,
+) -> None:
+    prev_df = token_cache.get(_TOKEN_CACHE_DF_SIG_KEY)
+    prev_ev = token_cache.get(_TOKEN_CACHE_EVENT_SIG_KEY)
+    if prev_df == drop_high_df_sig and prev_ev == event_sig:
+        return
+    token_cache.clear()
+    token_cache[_TOKEN_CACHE_DF_SIG_KEY] = drop_high_df_sig
+    token_cache[_TOKEN_CACHE_EVENT_SIG_KEY] = event_sig
+
+
+def _build_feature_indexes(
+    *,
+    events: list[dict[str, Any]],
+    token_cache: dict[Any, Any],
+    drop_high_df: set[str],
+) -> tuple[dict[str, frozenset[int]], dict[str, frozenset[int]]]:
+    entity_cached = token_cache.get(_TOKEN_CACHE_FEATURE_ENTITY_INDEX_KEY)
+    number_cached = token_cache.get(_TOKEN_CACHE_FEATURE_NUMBER_INDEX_KEY)
+    if isinstance(entity_cached, dict) and isinstance(number_cached, dict):
+        return entity_cached, number_cached
+
+    entity_index: dict[str, set[int]] = {}
+    number_index: dict[str, set[int]] = {}
+
+    for ev in events:
+        eid = ev.get("id")
+        if not isinstance(eid, int) or eid <= 0:
+            continue
+        et = token_cache.get(eid)
+        if not isinstance(et, EventTokens):
+            et = _tokenize_event(ev, drop_high_df=drop_high_df)
+            token_cache[eid] = et
+        for tok in et.feature_entity_tokens:
+            entity_index.setdefault(tok, set()).add(eid)
+        for tok in et.feature_number_tokens:
+            number_index.setdefault(tok, set()).add(eid)
+
+    entity_frozen = {k: frozenset(v) for k, v in entity_index.items() if v}
+    number_frozen = {k: frozenset(v) for k, v in number_index.items() if v}
+    token_cache[_TOKEN_CACHE_FEATURE_ENTITY_INDEX_KEY] = entity_frozen
+    token_cache[_TOKEN_CACHE_FEATURE_NUMBER_INDEX_KEY] = number_frozen
+    return entity_frozen, number_frozen
+
+
 def _tokenize_event(event: dict[str, Any], *, drop_high_df: set[str] | None = None) -> EventTokens:
     """Tokenize event summary_en + title for retrieval matching."""
     drop_high_df = drop_high_df or set()
@@ -320,7 +593,14 @@ def _tokenize_event(event: dict[str, Any], *, drop_high_df: set[str] | None = No
     tokens = _si_tokenize_text(primary_text, title if summary else None)
     anchors = _si_anchor_terms(primary_text, title if summary else None)
     key = choose_key_tokens(tokens, drop_high_df=drop_high_df)
-    return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
+    feature_entities = _event_feature_entity_tokens(event)
+    feature_numbers = _event_feature_number_tokens(event, primary_text=primary_text)
+    return EventTokens(
+        key_tokens=frozenset(key),
+        anchor_tokens=frozenset(anchors),
+        feature_entity_tokens=frozenset(feature_entities),
+        feature_number_tokens=frozenset(feature_numbers),
+    )
 
 
 def _tokenize_link(link: dict[str, Any], *, drop_high_df: set[str] | None = None) -> EventTokens:
@@ -331,7 +611,23 @@ def _tokenize_link(link: dict[str, Any], *, drop_high_df: set[str] | None = None
     tokens = _si_tokenize_text(title, desc)
     anchors = _si_anchor_terms(title, desc)
     key = choose_key_tokens(tokens, drop_high_df=drop_high_df)
-    return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
+    feature_entities = _link_feature_entity_tokens(
+        title=title,
+        desc=desc,
+        key_tokens=key,
+        anchor_tokens=anchors,
+    )
+    feature_numbers = _link_feature_number_tokens(
+        title=title,
+        desc=desc,
+        anchor_tokens=anchors,
+    )
+    return EventTokens(
+        key_tokens=frozenset(key),
+        anchor_tokens=frozenset(anchors),
+        feature_entity_tokens=frozenset(feature_entities),
+        feature_number_tokens=frozenset(feature_numbers),
+    )
 
 
 def _link_lang_hint(link: dict[str, Any]) -> str:
@@ -633,7 +929,7 @@ def retrieve_candidates(
     *,
     top_k: int = 5,
     min_score: float = 0.18,
-    token_cache: dict[int, EventTokens] | None = None,
+    token_cache: dict[Any, Any] | None = None,
     drop_high_df: set[str] | None = None,
     drop_high_df_sig: str | None = None,
 ) -> list[tuple[dict[str, Any], float]]:
@@ -652,13 +948,20 @@ def retrieve_candidates(
 
     if drop_high_df_sig is None:
         drop_high_df_sig = _drop_high_df_signature(drop_high_df)
-    prev_sig = token_cache.get(_TOKEN_CACHE_DF_SIG_KEY)  # type: ignore[assignment]
-    if prev_sig != drop_high_df_sig:
-        token_cache.clear()
-        token_cache[_TOKEN_CACHE_DF_SIG_KEY] = drop_high_df_sig  # type: ignore[index]
+    event_sig = _event_retrieval_signature(events)
+    _ensure_token_cache_epoch(
+        token_cache=token_cache,
+        drop_high_df_sig=drop_high_df_sig,
+        event_sig=event_sig,
+    )
 
     link_tok = _tokenize_link(link, drop_high_df=drop_high_df)
-    if not link_tok.key_tokens and not link_tok.anchor_tokens:
+    if (
+        not link_tok.key_tokens
+        and not link_tok.anchor_tokens
+        and not link_tok.feature_entity_tokens
+        and not link_tok.feature_number_tokens
+    ):
         return []
 
     noisy_or_roundup = _is_noisy_or_roundup_link(link)
@@ -670,8 +973,33 @@ def retrieve_candidates(
     )
     link_ts = _link_published_ts(link)
 
-    scored: list[tuple[dict[str, Any], float]] = []
+    ev_by_id: dict[int, dict[str, Any]] = {}
     for ev in events:
+        eid = ev.get("id")
+        if isinstance(eid, int) and eid > 0:
+            ev_by_id[eid] = ev
+
+    entity_index, number_index = _build_feature_indexes(
+        events=events,
+        token_cache=token_cache,
+        drop_high_df=drop_high_df,
+    )
+    preselected_ids: set[int] = set()
+    for tok in link_tok.feature_entity_tokens:
+        preselected_ids.update(entity_index.get(tok, ()))
+    for tok in link_tok.feature_number_tokens:
+        preselected_ids.update(number_index.get(tok, ()))
+
+    candidate_events: list[dict[str, Any]]
+    if preselected_ids and len(preselected_ids) < len(events):
+        candidate_events = [ev_by_id[eid] for eid in sorted(preselected_ids) if eid in ev_by_id]
+    else:
+        # Fallback preserves legacy behaviour whenever feature matching is empty
+        # or too broad to provide meaningful preselection.
+        candidate_events = events
+
+    scored: list[tuple[dict[str, Any], float]] = []
+    for ev in candidate_events:
         eid = ev.get("id", 0)
         et: EventTokens | None = None
         if isinstance(eid, int) and eid > 0:
@@ -700,6 +1028,16 @@ def retrieve_candidates(
                 score += 0.05 * numeric_overlap
             if entity_overlap:
                 score += 0.05 * entity_overlap
+
+        # First-class event_features signals (entity/number).
+        feature_entity_overlap = link_tok.feature_entity_tokens & et.feature_entity_tokens
+        feature_number_overlap = link_tok.feature_number_tokens & et.feature_number_tokens
+        if feature_entity_overlap:
+            score += min(0.14, 0.07 * float(len(feature_entity_overlap)))
+        if feature_number_overlap:
+            score += min(0.14, 0.07 * float(len(feature_number_overlap)))
+        if feature_entity_overlap and feature_number_overlap:
+            score += 0.04
 
         # Recency weighting: small bonus for events close in time to the link.
         score += _recency_bonus(link_ts, _event_best_ts(ev))
@@ -1154,7 +1492,7 @@ def cluster_link(
     fresh_events: list[dict[str, Any]] | None = None,
     gemini: Any,
     db: Any,
-    token_cache: dict[int, EventTokens] | None = None,
+    token_cache: dict[Any, Any] | None = None,
     drop_high_df: set[str] | None = None,
     drop_high_df_sig: str | None = None,
 ) -> dict[str, Any] | None:
@@ -1506,7 +1844,7 @@ def parse_merge_response(
 def _cross_category_pairs_by_retrieval(
     events: list[dict[str, Any]],
     *,
-    token_cache: dict[int, EventTokens] | None = None,
+    token_cache: dict[Any, Any] | None = None,
     drop_high_df: set[str] | None = None,
     min_score: float = 0.25,
     top_k: int = 10,
@@ -1688,7 +2026,7 @@ def merge_events(
         return stats
 
     # --- Cross-category merge pass ---
-    token_cache: dict[int, EventTokens] = {}
+    token_cache: dict[Any, Any] = {}
     drop_high_df = _compute_drop_high_df(root_events)
     cross_pairs = _cross_category_pairs_by_retrieval(
         root_events,
@@ -1883,7 +2221,7 @@ def cluster_all_pending(
     stats = {"processed": 0, "assigned": 0, "new_events": 0, "developments": 0,
              "assigned_to_posted": 0, "errors": 0, "skipped": 0}
     consecutive_failures = 0
-    token_cache: dict[int, EventTokens] = {}
+    token_cache: dict[Any, Any] = {}
 
     # Load all events once (cross-category, includes posted).
     try:

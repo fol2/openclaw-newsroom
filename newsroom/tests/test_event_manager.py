@@ -1379,6 +1379,58 @@ class TestRetrieveCandidates(unittest.TestCase):
         self.assertTrue(len(candidates) > 0)
         self.assertEqual(candidates[0][0]["id"], 1)
 
+    def test_retrieval_uses_event_feature_entities_and_numbers(self) -> None:
+        # Two events share the same base summary. Feature entities/numbers should
+        # break the tie and prioritise the semantically correct event.
+        events = [
+            {
+                "id": 2,
+                "summary_en": "Court confirms sentencing in high-profile case",
+                "title": "Sentencing update",
+                "category": "Global News",
+                "status": "active",
+                "feature_entities_json": json.dumps([{"label": "Other Defendant"}], ensure_ascii=False),
+                "feature_key_numbers_json": json.dumps(["15"], ensure_ascii=False),
+            },
+            {
+                "id": 9,
+                "summary_en": "Court confirms sentencing in high-profile case",
+                "title": "Sentencing update",
+                "category": "Hong Kong News",
+                "status": "active",
+                "feature_entities_json": json.dumps([{"label": "Jimmy Lai", "aliases": ["黎智英"]}], ensure_ascii=False),
+                "feature_key_numbers_json": json.dumps(["20"], ensure_ascii=False),
+            },
+        ]
+        link = {"title": "黎智英被判囚20年", "description": "Jimmy Lai receives a 20-year sentence"}
+        candidates = retrieve_candidates(link, events, min_score=0.05)
+        self.assertTrue(len(candidates) > 0)
+        self.assertEqual(candidates[0][0]["id"], 9)
+
+    def test_feature_preselection_falls_back_to_legacy_scan(self) -> None:
+        # No event_features are present; retrieval should still match using legacy
+        # token/anchor similarity via fallback full scan.
+        events = [
+            {
+                "id": 11,
+                "summary_en": "Volcano eruption in Iceland forces evacuations",
+                "title": "Iceland volcano update",
+                "category": "Global News",
+                "status": "active",
+            },
+            {
+                "id": 12,
+                "summary_en": "Football transfer rumours continue in Europe",
+                "title": "Sports transfer",
+                "category": "Sports",
+                "status": "active",
+            },
+        ]
+        link = {"title": "Iceland volcano eruption continues", "description": "Evacuations near Reykjavik"}
+        candidates = retrieve_candidates(link, events, min_score=0.05)
+        found_ids = [ev["id"] for ev, _ in candidates]
+        self.assertIn(11, found_ids)
+
     def test_respects_top_k(self) -> None:
         events = self._make_events()
         link = {"title": "Jimmy Lai sentenced", "description": "Lai trial"}
@@ -1653,6 +1705,36 @@ class TestGetAllFreshEvents(unittest.TestCase):
 
                 events = db.get_all_fresh_events(now_ts=now)
                 self.assertFalse(any(e["id"] == eid for e in events))
+
+    def test_get_all_fresh_events_projects_event_features(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                eid = db.create_event(summary_en="Sentencing update", category="Hong Kong News", jurisdiction="HK")
+                db._conn.execute(
+                    """
+                    UPDATE event_features
+                    SET entities_json = ?, key_numbers_json = ?, flags_json = ?, updated_at_ts = ?
+                    WHERE event_id = ?
+                    """,
+                    (
+                        json.dumps([{"label": "Jimmy Lai", "aliases": ["黎智英"]}], ensure_ascii=False),
+                        json.dumps(["20"], ensure_ascii=False),
+                        json.dumps(["breaking"], ensure_ascii=False),
+                        int(time.time()),
+                        eid,
+                    ),
+                )
+                events = db.get_all_fresh_events()
+                event = next((e for e in events if e["id"] == eid), None)
+                self.assertIsNotNone(event)
+                assert event is not None
+                self.assertIn("feature_entities", event)
+                self.assertIn("feature_key_numbers", event)
+                self.assertIn("feature_flags", event)
+                self.assertEqual(event["feature_key_numbers"], ["20"])
+                labels = [item.get("label") for item in event["feature_entities"] if isinstance(item, dict)]
+                self.assertIn("Jimmy Lai", labels)
 
 
 if __name__ == "__main__":
