@@ -49,6 +49,11 @@ def newsroom_clustering_decisions() -> None:
     raise SystemExit(main(sys.argv[1:]))
 
 
+def newsroom_decision_log_inspector() -> None:
+    from scripts.newsroom_clustering_decisions import main
+    raise SystemExit(main(sys.argv[1:]))
+
+
 def build_clustering_eval_dataset() -> None:
     from scripts.build_clustering_eval_dataset import main
     raise SystemExit(main(sys.argv[1:]))
@@ -57,8 +62,6 @@ def build_clustering_eval_dataset() -> None:
 def replay_clustering_eval_dataset() -> None:
     from scripts.replay_clustering_eval_dataset import main
     raise SystemExit(main(sys.argv[1:]))
-
-
 def rss_pool_update() -> None:
     from scripts.rss_pool_update import main
     raise SystemExit(main(sys.argv[1:]))

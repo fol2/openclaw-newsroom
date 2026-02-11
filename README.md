@@ -96,6 +96,7 @@ uv run python scripts/newsroom_runner.py --dry-run
 | `gdelt_pool_update.py` | Fetches articles from GDELT DOC 2.0 API (free, no auth) and upserts into the pool. |
 | `rss_pool_update.py` | Fetches articles from curated RSS/Atom feeds and upserts into the pool. |
 | `news_pool_status.py` | Diagnostic tool -- shows pool statistics, cluster counts, and link freshness. |
+| `newsroom_clustering_decisions.py` | Decision log inspector -- audits clustering decisions by decision/link/event with similarity and outlier hints. |
 | `news_pool_dump_jsonl.py` | Dumps a consistent snapshot of `links` + `events` to JSONL for sandbox rebuilds. |
 | `news_pool_restore_jsonl.py` | Restores a JSONL dump into a fresh SQLite DB (refuses to overwrite without `--overwrite`). |
 | `build_clustering_eval_dataset.py` | Builds a reproducible labelled clustering evaluation dataset from `clustering_decisions`. |
