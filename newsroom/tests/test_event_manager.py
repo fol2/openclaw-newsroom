@@ -155,6 +155,39 @@ class TestParseClusteringResponse(unittest.TestCase):
         )
         self.assertEqual(result["enforced"]["action"], "new_event")
 
+    def test_parse_carries_event_features_payload(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": [
+                {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
+            ],
+            "event_features": {
+                "canonical_summary_en": "Tesla reports stronger-than-expected Q4 earnings",
+                "entities": ["Tesla", "Elon Musk"],
+                "numbers": ["Q4", "20%"],
+                "flags": ["breaking", "finance"],
+                "time_hints": "next earnings call in 2h",
+            },
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": ["live_updates"],
+            "match_basis": ["entity", "number"],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        features = result["validated"].get("event_features")
+        self.assertIsInstance(features, dict)
+        assert isinstance(features, dict)
+        self.assertEqual(features.get("canonical_summary_en"), "Tesla reports stronger-than-expected Q4 earnings")
+        self.assertEqual(features.get("entities"), ["Tesla", "Elon Musk"])
+        self.assertEqual(features.get("numbers"), ["Q4", "20%"])
+        self.assertEqual(features.get("time_hints"), "next earnings call in 2h")
+        self.assertIn("breaking", features.get("flags") or [])
+        self.assertIn("live_updates", features.get("flags") or [])
+
     def test_parse_new_event_single_object_entity_aliases(self) -> None:
         response = {
             "action": "new_event",
@@ -400,6 +433,134 @@ class TestClusterLink(unittest.TestCase):
                 ev = db.get_event(eid)
                 assert ev is not None
                 self.assertEqual(ev["link_count"], 1)
+
+    def test_cluster_link_assign_event_features_safe_merge_non_destructive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                eid = db.create_event(
+                    summary_en="UK PM crisis",
+                    category="Politics",
+                    jurisdiction="UK",
+                    event_features={
+                        "canonical_summary_en": "Initial PM crisis summary",
+                        "entities": ["Prime Minister"],
+                        "numbers": ["1 vote"],
+                        "flags": ["breaking"],
+                        "time_hints": "next 2h",
+                    },
+                )
+                link = PoolLink(
+                    url="https://bbc.co.uk/assign-features-1",
+                    norm_url="https://bbc.co.uk/assign-features-1",
+                    domain="bbc.co.uk",
+                    title="PM crisis update after key vote",
+                    description="Parliament crisis coverage",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.9,
+                    "summary_en": "UK PM crisis",
+                    "event_features": {
+                        "canonical_summary_en": "Attempted overwrite summary",
+                        "entities": ["House of Commons"],
+                        "numbers": ["320-300"],
+                        "flags": ["parliament"],
+                        "time_hints": "overwrite",
+                    },
+                    "category": "Politics",
+                    "jurisdiction": "UK",
+                    "link_flags": [],
+                    "match_basis": ["entity", "number"],
+                }
+
+                fresh = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "assign")
+
+                features = db.get_event_features(event_id=eid)
+                self.assertIsNotNone(features)
+                assert features is not None
+                self.assertEqual(features.get("canonical_summary_en"), "Initial PM crisis summary")
+                self.assertEqual(features.get("time_hints"), "next 2h")
+                self.assertEqual(features.get("entities"), ["Prime Minister", "House of Commons"])
+                self.assertEqual(features.get("key_numbers"), ["1 vote", "320-300"])
+                self.assertEqual(features.get("flags"), ["breaking", "parliament"])
+
+    def test_cluster_link_development_populates_event_features(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                parent_id = db.create_event(summary_en="UK PM crisis", category="Politics", jurisdiction="UK")
+                link = PoolLink(
+                    url="https://bbc.co.uk/dev-features-1",
+                    norm_url="https://bbc.co.uk/dev-features-1",
+                    domain="bbc.co.uk",
+                    title="PM crisis escalates after cabinet resignation",
+                    description="A new phase in the same political crisis",
+                    age=None,
+                    page_age="2026-02-07T11:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "development",
+                    "parent_event_id": parent_id,
+                    "confidence": 0.92,
+                    "summary_en": "UK PM crisis escalates after cabinet resignation",
+                    "development": "Cabinet resignation",
+                    "entity_aliases": [
+                        {"label": "Prime Minister", "aliases": ["PM"]},
+                    ],
+                    "event_features": {
+                        "canonical_summary_en": "Cabinet resignation escalates ongoing UK PM crisis",
+                        "entities": ["Prime Minister", "Cabinet"],
+                        "numbers": ["1 resignation"],
+                        "flags": ["breaking"],
+                        "time_hints": "next 6h",
+                    },
+                    "category": "Politics",
+                    "jurisdiction": "UK",
+                    "link_flags": [],
+                    "match_basis": ["entity", "time"],
+                }
+
+                fresh = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=fresh, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "development")
+                child_id = int(result["event_id"])
+                self.assertNotEqual(child_id, parent_id)
+
+                features = db.get_event_features(event_id=child_id)
+                self.assertIsNotNone(features)
+                assert features is not None
+                self.assertEqual(features.get("canonical_summary_en"), "Cabinet resignation escalates ongoing UK PM crisis")
+                self.assertEqual(features.get("entities"), ["Prime Minister", "Cabinet"])
+                self.assertEqual(features.get("key_numbers"), ["1 resignation"])
+                self.assertIn("breaking", features.get("flags") or [])
+                self.assertIn("developing", features.get("flags") or [])
+                self.assertEqual(features.get("time_hints"), "next 6h")
 
     def test_cluster_link_cjk_translation_fallback_assigns_and_caches(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -822,6 +983,13 @@ class TestClusterLink(unittest.TestCase):
                     "entity_aliases": [
                         {"label": "Ocean Institute", "aliases": ["海洋研究所"]},
                     ],
+                    "event_features": {
+                        "canonical_summary_en": "Scientists confirm discovery of a new species",
+                        "entities": ["Ocean Institute", "Pacific Ocean"],
+                        "numbers": ["3 specimens", "2026"],
+                        "flags": ["breaking", "science"],
+                        "time_hints": "follow-up briefing in 24h",
+                    },
                     "category": "Global News",
                     "jurisdiction": "GLOBAL",
                     "link_flags": [],
@@ -842,6 +1010,14 @@ class TestClusterLink(unittest.TestCase):
                     ev.get("entity_aliases"),
                     [{"label": "Ocean Institute", "aliases": ["海洋研究所"]}],
                 )
+                features = db.get_event_features(event_id=result["event_id"])
+                self.assertIsNotNone(features)
+                assert features is not None
+                self.assertEqual(features.get("canonical_summary_en"), "Scientists confirm discovery of a new species")
+                self.assertEqual(features.get("entities"), ["Ocean Institute", "Pacific Ocean"])
+                self.assertEqual(features.get("key_numbers"), ["3 specimens", "2026"])
+                self.assertIn("breaking", features.get("flags") or [])
+                self.assertEqual(features.get("time_hints"), "follow-up briefing in 24h")
 
     def test_cluster_link_normalises_category_before_db_write(self) -> None:
         with tempfile.TemporaryDirectory() as td:
