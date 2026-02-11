@@ -137,7 +137,7 @@ class TestParseClusteringResponse(unittest.TestCase):
             "confidence": 0.95,
             "summary_en": "Tesla Q4 earnings beat expectations",
             "entity_aliases": [
-                {"label": "Elon Musk", "aliases": ["馬斯克"]},
+                {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
             ],
             "category": "US Stocks",
             "jurisdiction": "US",
@@ -151,7 +151,7 @@ class TestParseClusteringResponse(unittest.TestCase):
         self.assertEqual(result["validated"]["summary_en"], "Tesla Q4 earnings beat expectations")
         self.assertEqual(
             result["validated"]["entity_aliases"],
-            [{"label": "Elon Musk", "aliases": ["馬斯克"]}],
+            [{"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]}],
         )
         self.assertEqual(result["enforced"]["action"], "new_event")
 
@@ -162,6 +162,7 @@ class TestParseClusteringResponse(unittest.TestCase):
             "summary_en": "Tesla Q4 earnings beat expectations",
             "entity_aliases": {
                 "label": "Elon Musk",
+                "type": "person",
                 "aliases": ["馬斯克"],
             },
             "category": "US Stocks",
@@ -174,7 +175,70 @@ class TestParseClusteringResponse(unittest.TestCase):
         assert result is not None
         self.assertEqual(
             result["validated"]["entity_aliases"],
-            [{"label": "Elon Musk", "aliases": ["馬斯克"]}],
+            [{"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]}],
+        )
+
+    def test_parse_entity_alias_types_persist_to_db(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": [
+                {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
+                {"label": "Tesla", "type": "organisation", "aliases": ["特斯拉"]},
+                {"label": "Austin", "type": "location", "aliases": ["奧斯汀"]},
+            ],
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
+        }
+        parsed = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                event_id = db.create_event(
+                    summary_en=parsed["validated"]["summary_en"],
+                    category=parsed["validated"]["category"],
+                    jurisdiction=parsed["validated"]["jurisdiction"] or "US",
+                    entity_aliases=parsed["validated"]["entity_aliases"],
+                )
+                ev = db.get_event(event_id)
+                self.assertIsNotNone(ev)
+                assert ev is not None
+                self.assertEqual(
+                    ev.get("entity_aliases"),
+                    [
+                        {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
+                        {"label": "Tesla", "type": "org", "aliases": ["特斯拉"]},
+                        {"label": "Austin", "type": "location", "aliases": ["奧斯汀"]},
+                    ],
+                )
+
+    def test_parse_entity_aliases_preserves_type_on_single_object(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": {
+                "label": "Elon Musk",
+                "type": "person",
+                "aliases": ["馬斯克"],
+            },
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result["validated"]["entity_aliases"],
+            [{"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]}],
         )
 
     def test_parse_normalises_category_aliases(self) -> None:

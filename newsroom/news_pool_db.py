@@ -55,8 +55,28 @@ def _clean_alias_text(v: Any, *, max_len: int = 120) -> str | None:
     return s
 
 
+def _normalise_entity_type(v: Any) -> str | None:
+    """Normalise entity type labels to person/org/location."""
+    raw = _clean_alias_text(v, max_len=40)
+    if not raw:
+        return None
+    key = " ".join(raw.casefold().replace("-", " ").replace("_", " ").split())
+    if key in {"person", "people", "human", "individual"}:
+        return "person"
+    if key in {"org", "organisation", "organization", "company", "institution", "agency"}:
+        return "org"
+    if key in {"location", "place", "country", "city", "region", "state"}:
+        return "location"
+    return None
+
+
 def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_per_entity: int = 8) -> list[dict[str, Any]]:
-    """Normalise entity aliases into a stable list-of-dicts structure."""
+    """Normalise entity aliases into a stable list-of-dicts structure.
+
+    Output shape:
+      [{"label": "<canonical>", "type": "<person|org|location>", "aliases": ["<alias1>", ...]}, ...]
+    Type is optional and only included when recognised.
+    """
     parsed = raw
     if isinstance(parsed, str):
         s = parsed.strip()
@@ -77,13 +97,19 @@ def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_p
     out: list[dict[str, Any]] = []
     by_label: dict[str, int] = {}
 
-    def _parse_item(item: Any) -> tuple[str | None, list[str]]:
+    def _parse_item(item: Any) -> tuple[str | None, str | None, list[str]]:
         if isinstance(item, dict):
             label = _clean_alias_text(
                 item.get("label")
                 or item.get("entity")
                 or item.get("name")
                 or item.get("canonical")
+            )
+            entity_type = _normalise_entity_type(
+                item.get("type")
+                or item.get("entity_type")
+                or item.get("entityType")
+                or item.get("kind")
             )
             aliases_raw = item.get("aliases")
             aliases: list[Any]
@@ -96,12 +122,12 @@ def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_p
             for k in ("zh", "zh_hant", "zh_tw", "english", "en"):
                 if k in item:
                     aliases.append(item.get(k))
-            return label, [_clean_alias_text(v) for v in aliases if _clean_alias_text(v)]
+            return label, entity_type, [_clean_alias_text(v) for v in aliases if _clean_alias_text(v)]
         label = _clean_alias_text(item)
-        return label, []
+        return label, None, []
 
     for item in parsed:
-        label, aliases_raw = _parse_item(item)
+        label, entity_type, aliases_raw = _parse_item(item)
         all_terms: list[str] = []
         seen_terms: set[str] = set()
 
@@ -129,11 +155,16 @@ def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_p
         if existing_idx is None:
             if len(out) >= max_entities:
                 break
-            out.append({"label": canonical, "aliases": aliases})
+            row: dict[str, Any] = {"label": canonical, "aliases": aliases}
+            if entity_type:
+                row["type"] = entity_type
+            out.append(row)
             by_label[canonical_key] = len(out) - 1
             continue
 
         existing = out[existing_idx]
+        if entity_type and _normalise_entity_type(existing.get("type")) is None:
+            existing["type"] = entity_type
         existing_aliases = existing.get("aliases")
         if not isinstance(existing_aliases, list):
             existing_aliases = []

@@ -271,8 +271,8 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                     category="Hong Kong News",
                     jurisdiction="HK",
                     entity_aliases=[
-                        {"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]},
-                        {"entity": "Hong Kong Court", "zh": "香港法院"},
+                        {"label": "Jimmy Lai", "type": "person", "aliases": ["黎智英", "Lai"]},
+                        {"entity": "Hong Kong Court", "type": "organisation", "zh": "香港法院"},
                     ],
                 )
                 ev = db.get_event(eid)
@@ -282,8 +282,8 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                 self.assertEqual(
                     ev.get("entity_aliases"),
                     [
-                        {"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]},
-                        {"label": "Hong Kong Court", "aliases": ["香港法院"]},
+                        {"label": "Jimmy Lai", "type": "person", "aliases": ["黎智英", "Lai"]},
+                        {"label": "Hong Kong Court", "type": "org", "aliases": ["香港法院"]},
                     ],
                 )
 
@@ -295,7 +295,7 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                     summary_en="Jimmy Lai sentenced in Hong Kong",
                     category="Hong Kong News",
                     jurisdiction="HK",
-                    entity_aliases={"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]},
+                    entity_aliases={"label": "Jimmy Lai", "type": "person", "aliases": ["黎智英", "Lai"]},
                 )
                 ev = db.get_event(eid)
                 self.assertIsNotNone(ev)
@@ -303,7 +303,7 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                 self.assertIsInstance(ev.get("entity_aliases_json"), str)
                 self.assertEqual(
                     ev.get("entity_aliases"),
-                    [{"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]}],
+                    [{"label": "Jimmy Lai", "type": "person", "aliases": ["黎智英", "Lai"]}],
                 )
 
     def test_create_development(self) -> None:
