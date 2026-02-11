@@ -932,6 +932,7 @@ def retrieve_candidates(
     token_cache: dict[Any, Any] | None = None,
     drop_high_df: set[str] | None = None,
     drop_high_df_sig: str | None = None,
+    candidate_event_ids: set[int] | None = None,
 ) -> list[tuple[dict[str, Any], float]]:
     """Deterministic token/anchor similarity retrieval for candidate events.
 
@@ -979,6 +980,12 @@ def retrieve_candidates(
         if isinstance(eid, int) and eid > 0:
             ev_by_id[eid] = ev
 
+    scoped_event_ids: set[int] | None = None
+    if candidate_event_ids is not None:
+        scoped_event_ids = {eid for eid in candidate_event_ids if isinstance(eid, int) and eid > 0}
+        if not scoped_event_ids:
+            return []
+
     entity_index, number_index = _build_feature_indexes(
         events=events,
         token_cache=token_cache,
@@ -989,14 +996,27 @@ def retrieve_candidates(
         preselected_ids.update(entity_index.get(tok, ()))
     for tok in link_tok.feature_number_tokens:
         preselected_ids.update(number_index.get(tok, ()))
+    if scoped_event_ids is not None:
+        preselected_ids.intersection_update(scoped_event_ids)
+
+    scope_events: list[dict[str, Any]]
+    if scoped_event_ids is not None:
+        scope_events = [
+            ev for ev in events
+            if isinstance(ev.get("id"), int) and int(ev["id"]) in scoped_event_ids
+        ]
+        if not scope_events:
+            return []
+    else:
+        scope_events = events
 
     candidate_events: list[dict[str, Any]]
-    if preselected_ids and len(preselected_ids) < len(events):
+    if preselected_ids and len(preselected_ids) < len(scope_events):
         candidate_events = [ev_by_id[eid] for eid in sorted(preselected_ids) if eid in ev_by_id]
     else:
         # Fallback preserves legacy behaviour whenever feature matching is empty
         # or too broad to provide meaningful preselection.
-        candidate_events = events
+        candidate_events = scope_events
 
     scored: list[tuple[dict[str, Any], float]] = []
     for ev in candidate_events:
@@ -1887,21 +1907,24 @@ def _cross_category_pairs_by_retrieval(
         }
 
         # Dedup pairs by only comparing against later events.
-        others = [
-            ev for ev in events[i + 1 :]
-            if (ev.get("category") or "") != cat_a
-        ]
-        if not others:
+        candidate_ids = {
+            int(ev.get("id"))
+            for ev in events[i + 1 :]
+            if isinstance(ev.get("id"), int) and int(ev.get("id")) > 0
+            and (ev.get("category") or "") != cat_a
+        }
+        if not candidate_ids:
             continue
 
         candidates = retrieve_candidates(
             link_like,
-            others,
+            events,
             top_k=top_k,
             min_score=min_score,
             token_cache=token_cache,
             drop_high_df=drop_high_df,
             drop_high_df_sig=drop_high_df_sig,
+            candidate_event_ids=candidate_ids,
         )
         for ev_b, score in candidates:
             bid = ev_b.get("id", 0)

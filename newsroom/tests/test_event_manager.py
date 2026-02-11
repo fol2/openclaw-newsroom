@@ -1610,6 +1610,15 @@ class TestDedupeMarkerRootAncestor(unittest.TestCase):
 
 
 class TestCrossCategoryPairsByRetrieval(unittest.TestCase):
+    class _ClearCountingDict(dict[Any, Any]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+            super().clear()
+
     def test_does_not_require_anchor_overlap(self) -> None:
         events = [
             {"id": 1, "summary_en": "alpha beta gamma delta", "title": "x", "category": "Hong Kong News"},
@@ -1643,6 +1652,26 @@ class TestCrossCategoryPairsByRetrieval(unittest.TestCase):
             max_pairs=10,
         )
         self.assertEqual(pairs, [])
+
+    def test_reuses_token_cache_epoch_across_iterations(self) -> None:
+        events = [
+            {"id": 1, "summary_en": "alpha beta gamma delta", "title": "x", "category": "Hong Kong News"},
+            {"id": 2, "summary_en": "alpha beta gamma delta", "title": "y", "category": "Global News"},
+            {"id": 3, "summary_en": "alpha beta gamma delta", "title": "z", "category": "AI"},
+        ]
+        cache = self._ClearCountingDict()
+        pairs = _cross_category_pairs_by_retrieval(
+            events,
+            token_cache=cache,
+            drop_high_df=set(),
+            min_score=0.25,
+            top_k=10,
+            max_pairs=10,
+        )
+        self.assertGreaterEqual(len(pairs), 2)
+        # Regression guard for RED review: per-iteration subset retrieval used to
+        # churn cache epoch and clear repeatedly.
+        self.assertEqual(cache.clear_calls, 1)
 
     def test_unrelated_events_excluded(self) -> None:
         events = [
