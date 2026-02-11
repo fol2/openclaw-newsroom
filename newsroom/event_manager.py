@@ -107,6 +107,8 @@ def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_p
 
     if isinstance(parsed, dict):
         parsed = parsed.get("entity_aliases", parsed)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
 
     if not isinstance(parsed, list):
         return []

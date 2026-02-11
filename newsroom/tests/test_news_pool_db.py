@@ -287,6 +287,25 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                     ],
                 )
 
+    def test_create_event_persists_single_object_entity_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced in Hong Kong",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                    entity_aliases={"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]},
+                )
+                ev = db.get_event(eid)
+                self.assertIsNotNone(ev)
+                assert ev is not None
+                self.assertIsInstance(ev.get("entity_aliases_json"), str)
+                self.assertEqual(
+                    ev.get("entity_aliases"),
+                    [{"label": "Jimmy Lai", "aliases": ["黎智英", "Lai"]}],
+                )
+
     def test_create_development(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
