@@ -1479,6 +1479,141 @@ class TestPruneExpiredEvents(unittest.TestCase):
                 self.assertEqual(pruned, 0)
 
 
+class TestPruneStaleUnpostedEvents(unittest.TestCase):
+    """Test NewsPoolDB.prune_stale_unposted_events()."""
+
+    def _setup_db(self, td: str) -> NewsPoolDB:
+        return NewsPoolDB(path=Path(td) / "news_pool.sqlite3")
+
+    def test_prunes_expired_stale_low_link_event(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Low-link stale event", category="AI", jurisdiction="US")
+                db._conn.execute(
+                    """
+                    UPDATE events
+                    SET created_at_ts = ?, updated_at_ts = ?, expires_at_ts = ?, link_count = 1
+                    WHERE id = ?
+                    """,
+                    (now - 120 * 3600, now - 110 * 3600, now - 24 * 3600, eid),
+                )
+
+                pruned = db.prune_stale_unposted_events(
+                    stale_after_hours=96,
+                    low_link_max=1,
+                    low_quality_summary_chars=80,
+                    now_ts=now,
+                )
+                self.assertEqual(pruned, 1)
+                self.assertIsNone(db.get_event(eid))
+
+    def test_prunes_expired_stale_low_quality_event(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Brief", category="AI", jurisdiction="US")
+                db._conn.execute(
+                    """
+                    UPDATE events
+                    SET created_at_ts = ?, updated_at_ts = ?, expires_at_ts = ?, link_count = 5
+                    WHERE id = ?
+                    """,
+                    (now - 120 * 3600, now - 110 * 3600, now - 24 * 3600, eid),
+                )
+
+                pruned = db.prune_stale_unposted_events(
+                    stale_after_hours=96,
+                    low_link_max=1,
+                    low_quality_summary_chars=80,
+                    now_ts=now,
+                )
+                self.assertEqual(pruned, 1)
+                self.assertIsNone(db.get_event(eid))
+
+    def test_posted_events_are_never_pruned(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Posted stale event", category="AI", jurisdiction="US")
+                db.mark_event_posted(eid, thread_id="thread-1", run_id="run-1")
+                db._conn.execute(
+                    """
+                    UPDATE events
+                    SET created_at_ts = ?, updated_at_ts = ?, expires_at_ts = ?, link_count = 0
+                    WHERE id = ?
+                    """,
+                    (now - 120 * 3600, now - 110 * 3600, now - 24 * 3600, eid),
+                )
+
+                pruned = db.prune_stale_unposted_events(
+                    stale_after_hours=96,
+                    low_link_max=1,
+                    low_quality_summary_chars=80,
+                    now_ts=now,
+                )
+                self.assertEqual(pruned, 0)
+                self.assertIsNotNone(db.get_event(eid))
+
+    def test_expired_stale_but_good_events_are_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                eid = db.create_event(
+                    summary_en="This summary is intentionally long enough to clear the low-quality threshold for stale GC.",
+                    category="AI",
+                    jurisdiction="US",
+                    title="High-quality event",
+                    primary_url="https://example.com/high-quality",
+                )
+                db._conn.execute(
+                    """
+                    UPDATE events
+                    SET created_at_ts = ?, updated_at_ts = ?, expires_at_ts = ?, link_count = 4
+                    WHERE id = ?
+                    """,
+                    (now - 120 * 3600, now - 110 * 3600, now - 24 * 3600, eid),
+                )
+
+                pruned = db.prune_stale_unposted_events(
+                    stale_after_hours=96,
+                    low_link_max=1,
+                    low_quality_summary_chars=80,
+                    now_ts=now,
+                )
+                self.assertEqual(pruned, 0)
+                self.assertIsNotNone(db.get_event(eid))
+
+    def test_parent_with_child_is_not_pruned(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self._setup_db(td) as db:
+                now = int(time.time())
+                parent_id = db.create_event(summary_en="Parent stale event", category="Politics", jurisdiction="UK")
+                db.create_event(
+                    summary_en="Child event",
+                    category="Politics",
+                    jurisdiction="UK",
+                    parent_event_id=parent_id,
+                )
+                db._conn.execute(
+                    """
+                    UPDATE events
+                    SET created_at_ts = ?, updated_at_ts = ?, expires_at_ts = ?, link_count = 0
+                    WHERE id = ?
+                    """,
+                    (now - 120 * 3600, now - 110 * 3600, now - 24 * 3600, parent_id),
+                )
+
+                pruned = db.prune_stale_unposted_events(
+                    stale_after_hours=96,
+                    low_link_max=1,
+                    low_quality_summary_chars=80,
+                    now_ts=now,
+                )
+                self.assertEqual(pruned, 0)
+                self.assertIsNotNone(db.get_event(parent_id))
+
+
 class TestLinkCountDrift(unittest.TestCase):
     """Test that link_count stays accurate across reassignments and pruning."""
 
