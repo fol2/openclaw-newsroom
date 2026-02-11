@@ -11,15 +11,44 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 OPENCLAW_HOME = Path(__file__).resolve().parents[1]
 os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
+from newsroom.news_pool_db import _domain_quality_rule  # noqa: E402
+
 _LOW_TOP_SIMILARITY = 0.22
 _AMBIGUOUS_TOP_GAP = 0.04
 _STRONG_TOP_SIMILARITY = 0.55
 _ASSIGN_GAP_OUTLIER = 0.12
+
+_SOFT_NEWS_CATEGORIES = frozenset({
+    "sports",
+    "entertainment",
+    "hong kong entertainment",
+})
+
+_SOCIAL_DOMAIN_SUFFIXES = frozenset({
+    "instagram.com",
+    "reddit.com",
+    "tiktok.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+})
+
+_BLOG_DOMAIN_SUFFIXES = frozenset({
+    "blogspot.com",
+    "medium.com",
+    "substack.com",
+})
+
+_TABLOID_DOMAIN_SUFFIXES = frozenset({
+    "dailymail.co.uk",
+    "nypost.com",
+})
 
 
 def _iso(ts: int | None) -> str | None:
@@ -113,6 +142,102 @@ def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
     return row is not None
 
 
+def _normalise_domain(domain: Any) -> str | None:
+    if not isinstance(domain, str):
+        return None
+    raw = domain.strip().lower()
+    if not raw:
+        return None
+    if "://" in raw:
+        parsed = urlparse(raw)
+        raw = parsed.netloc or parsed.path
+    raw = raw.split("@")[-1]
+    raw = raw.split(":")[0]
+    while raw.startswith("www."):
+        raw = raw[4:]
+    raw = raw.strip(".")
+    return raw or None
+
+
+def _domain_matches_suffix(domain: str | None, suffixes: set[str] | frozenset[str]) -> bool:
+    if not domain:
+        return False
+    for suffix in suffixes:
+        if domain == suffix or domain.endswith(f".{suffix}"):
+            return True
+    return False
+
+
+def _domain_type(domain: str | None) -> str:
+    norm = _normalise_domain(domain)
+    if _domain_matches_suffix(norm, _SOCIAL_DOMAIN_SUFFIXES):
+        return "social"
+    if _domain_matches_suffix(norm, _BLOG_DOMAIN_SUFFIXES):
+        return "blog"
+    if _domain_matches_suffix(norm, _TABLOID_DOMAIN_SUFFIXES):
+        return "tabloid"
+
+    rule = _domain_quality_rule(norm)
+    if bool(getattr(rule, "roundup_heavy", False)):
+        return "roundup_heavy"
+
+    tier = str(getattr(rule, "tier", "") or "").strip().lower()
+    if tier in {"tier_1", "tier_2"}:
+        return "mainstream"
+    if tier == "tier_3":
+        return "low_tier"
+    return "unknown"
+
+
+def _category_type(category: str | None) -> str:
+    if not isinstance(category, str) or not category.strip():
+        return "unknown"
+    low = category.strip().casefold()
+    if low in _SOFT_NEWS_CATEGORIES:
+        return "soft_news"
+    return "hard_news"
+
+
+def _domain_signals(*, domain: str | None, category: str | None) -> dict[str, Any]:
+    norm_domain = _normalise_domain(domain)
+    rule = _domain_quality_rule(norm_domain)
+    tier = str(getattr(rule, "tier", "") or "").strip().lower() or "unknown"
+    return {
+        "domain": norm_domain,
+        "tier": tier,
+        "domain_type": _domain_type(norm_domain),
+        "roundup_heavy": bool(getattr(rule, "roundup_heavy", False)),
+        "category_type": _category_type(category),
+    }
+
+
+def _wrong_domain_type_mismatch(*, action_name: str | None, similarity: dict[str, Any], domain_signals: dict[str, Any]) -> bool:
+    category_type = str(domain_signals.get("category_type") or "")
+    domain_type = str(domain_signals.get("domain_type") or "")
+    tier = str(domain_signals.get("tier") or "")
+    if category_type != "hard_news":
+        return False
+
+    low_signal_domain = domain_type in {"social", "blog", "tabloid", "roundup_heavy", "low_tier"} or tier in {"tier_3", "unknown"}
+    if not low_signal_domain:
+        return False
+
+    target_rank = _as_int(similarity.get("target_rank"))
+    target_score = _as_float(similarity.get("target_score"))
+    top_score = _as_float(similarity.get("top_score"))
+    top_gap = _as_float(similarity.get("score_gap"))
+
+    if target_rank is not None and target_rank > 1:
+        return True
+    if target_score is not None and target_score < 0.45:
+        return True
+    if target_score is None and top_score is not None and top_score < 0.35:
+        return True
+    if action_name in {"assign", "development"} and top_gap is not None and top_gap > 0.12:
+        return True
+    return False
+
+
 def _score_similarity(candidates: list[dict[str, Any]], *, target_event_id: int | None) -> dict[str, Any]:
     top_score: float | None = None
     top_event_id: int | None = None
@@ -173,7 +298,13 @@ def _unique_preserve(items: list[str]) -> list[str]:
     return out
 
 
-def _build_hints(*, action_name: str | None, error_type: str | None, similarity: dict[str, Any]) -> list[str]:
+def _build_hints(
+    *,
+    action_name: str | None,
+    error_type: str | None,
+    similarity: dict[str, Any],
+    domain_signals: dict[str, Any],
+) -> list[str]:
     hints: list[str] = []
 
     top_score = _as_float(similarity.get("top_score"))
@@ -205,6 +336,9 @@ def _build_hints(*, action_name: str | None, error_type: str | None, similarity:
 
     if action_name == "development" and candidate_count <= 0:
         hints.append("development_without_candidates")
+
+    if _wrong_domain_type_mismatch(action_name=action_name, similarity=similarity, domain_signals=domain_signals):
+        hints.append("wrong_domain_type_mismatch")
 
     return _unique_preserve(hints)
 
@@ -437,6 +571,292 @@ def _aggregate_by_event(decisions: list[dict[str, Any]], event_by_id: dict[int, 
     return out
 
 
+def _event_similarity_for_decision(*, decision: dict[str, Any], event_id: int) -> tuple[float | None, int | None]:
+    similarity = decision.get("similarity") or {}
+    target_event_id = _as_int(similarity.get("target_event_id"))
+    target_score = _as_float(similarity.get("target_score"))
+    target_rank = _as_int(similarity.get("target_rank"))
+
+    if target_event_id == event_id and target_score is not None:
+        return target_score, target_rank
+
+    for cand in decision.get("candidates") or []:
+        eid = _as_int(cand.get("event_id"))
+        if eid != event_id:
+            continue
+        return _as_float(cand.get("score")), _as_int(cand.get("rank"))
+
+    link_event_id = _as_int((decision.get("link") or {}).get("event_id"))
+    if link_event_id == event_id and target_score is not None:
+        return target_score, target_rank
+    return None, None
+
+
+def _minimal_decision_context(*, decision: dict[str, Any], event_id: int) -> dict[str, Any]:
+    enforced = decision.get("enforced_action") or {}
+    validated = decision.get("validated_action") or {}
+    action = None
+    if isinstance(enforced, dict):
+        action = enforced.get("action")
+    if not action and isinstance(validated, dict):
+        action = validated.get("action")
+
+    event_similarity, event_rank = _event_similarity_for_decision(decision=decision, event_id=event_id)
+    return {
+        "decision_id": _as_int(decision.get("decision_id")),
+        "created_at": decision.get("created_at"),
+        "created_at_ts": _as_int(decision.get("created_at_ts")),
+        "action": action or "unknown",
+        "target_event_id": _as_int(decision.get("target_event_id")),
+        "target_event_category": decision.get("target_event_category"),
+        "hints": [h for h in (decision.get("hints") or []) if isinstance(h, str) and h],
+        "similarity": decision.get("similarity") or {},
+        "event_similarity": event_similarity,
+        "event_similarity_rank": event_rank,
+    }
+
+
+def _hydrate_latest_decision_for_link(
+    *,
+    cur: sqlite3.Cursor,
+    link_id: int,
+    event_id: int,
+    has_decision_table: bool,
+    has_candidate_table: bool,
+    event_by_id: dict[int, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not has_decision_table:
+        return None
+
+    row = cur.execute(
+        """
+        SELECT
+          d.id AS decision_id,
+          d.link_id,
+          l.norm_url AS link_norm_url,
+          l.title AS link_title,
+          l.domain AS link_domain,
+          l.event_id AS link_event_id,
+          d.prompt_sha256,
+          d.model_name,
+          d.llm_started_at_ts,
+          d.llm_finished_at_ts,
+          d.llm_response_json,
+          d.validated_action,
+          d.validated_action_json,
+          d.enforced_action,
+          d.enforced_action_json,
+          d.error_type,
+          d.error_message,
+          d.created_at_ts
+        FROM clustering_decisions d
+        JOIN links l ON l.id = d.link_id
+        WHERE d.link_id = ?
+        ORDER BY d.created_at_ts DESC, d.id DESC
+        LIMIT 1
+        """,
+        (int(link_id),),
+    ).fetchone()
+    if row is None:
+        return None
+
+    decision_id = int(row["decision_id"])
+    candidates: list[dict[str, Any]] = []
+    candidate_event_ids: set[int] = set()
+    if has_candidate_table:
+        cand_rows = cur.execute(
+            """
+            SELECT rank, event_id, score
+            FROM clustering_decision_candidates
+            WHERE decision_id = ?
+            ORDER BY rank ASC
+            """,
+            (decision_id,),
+        ).fetchall()
+        for c in cand_rows:
+            eid = int(c["event_id"])
+            candidate_event_ids.add(eid)
+            candidates.append(
+                {
+                    "rank": int(c["rank"]),
+                    "event_id": eid,
+                    "score": float(c["score"]),
+                }
+            )
+
+    unresolved_event_ids = [eid for eid in candidate_event_ids if eid not in event_by_id]
+    if unresolved_event_ids and _table_exists(cur, "events"):
+        placeholders = ",".join(["?"] * len(unresolved_event_ids))
+        event_rows = cur.execute(
+            f"""
+            SELECT id, category, jurisdiction, title, summary_en, status
+            FROM events
+            WHERE id IN ({placeholders})
+            """,
+            unresolved_event_ids,
+        ).fetchall()
+        for er in event_rows:
+            event_by_id[int(er["id"])] = dict(er)
+
+    for cand in candidates:
+        ev = event_by_id.get(int(cand["event_id"]))
+        if ev and isinstance(ev.get("category"), str) and ev["category"].strip():
+            cand["event_category"] = ev["category"].strip()
+
+    validated_obj = _maybe_json_text(row["validated_action_json"])
+    enforced_obj = _maybe_json_text(row["enforced_action_json"])
+    validated_action_name = _normalise_action_name(row["validated_action"])
+    if validated_action_name is None and isinstance(validated_obj, dict):
+        validated_action_name = _normalise_action_name(validated_obj.get("action"))
+    enforced_action_name = _normalise_action_name(row["enforced_action"])
+    if enforced_action_name is None and isinstance(enforced_obj, dict):
+        enforced_action_name = _normalise_action_name(enforced_obj.get("action"))
+
+    target_event_id = _extract_target_event_id(enforced_obj)
+    if target_event_id is None:
+        target_event_id = _extract_target_event_id(validated_obj)
+
+    similarity = _score_similarity(candidates, target_event_id=target_event_id)
+    action_obj = enforced_obj if isinstance(enforced_obj, dict) else validated_obj
+    linked_event_category = _event_category(event_by_id, _as_int(row["link_event_id"]))
+    target_event_category = _event_category(event_by_id, target_event_id)
+    category, _action_category = _resolve_category(
+        action_obj=action_obj,
+        linked_event_category=linked_event_category,
+        target_event_category=target_event_category,
+    )
+    domain_signals = _domain_signals(domain=row["link_domain"], category=category)
+    hints = _build_hints(
+        action_name=enforced_action_name or validated_action_name,
+        error_type=row["error_type"] if isinstance(row["error_type"], str) else None,
+        similarity=similarity,
+        domain_signals=domain_signals,
+    )
+
+    decision = {
+        "decision_id": decision_id,
+        "created_at_ts": _as_int(row["created_at_ts"]),
+        "created_at": _iso(_as_int(row["created_at_ts"])),
+        "link": {
+            "link_id": _as_int(row["link_id"]),
+            "norm_url": row["link_norm_url"],
+            "title": row["link_title"],
+            "domain": row["link_domain"],
+            "event_id": _as_int(row["link_event_id"]),
+        },
+        "validated_action": {
+            "action": validated_action_name,
+            "obj": validated_obj,
+        },
+        "enforced_action": {
+            "action": enforced_action_name,
+            "obj": enforced_obj,
+        },
+        "target_event_id": target_event_id,
+        "target_event_category": target_event_category,
+        "candidates": candidates,
+        "similarity": similarity,
+        "hints": hints,
+    }
+    return _minimal_decision_context(decision=decision, event_id=event_id)
+
+
+def _build_event_link_listing(
+    *,
+    cur: sqlite3.Cursor,
+    event_id: int,
+    domain_filters: set[str],
+    event_by_id: dict[int, dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    has_decision_table: bool,
+    has_candidate_table: bool,
+) -> dict[str, Any]:
+    where: list[str] = ["event_id = ?"]
+    params: list[Any] = [int(event_id)]
+    if domain_filters:
+        placeholders = ", ".join(["?"] * len(domain_filters))
+        where.append(f"LOWER(COALESCE(domain, '')) IN ({placeholders})")
+        params.extend(sorted(domain_filters))
+
+    where_sql = " AND ".join(where)
+    link_rows = cur.execute(
+        f"""
+        SELECT id, norm_url, title, domain, event_id
+        FROM links
+        WHERE {where_sql}
+        ORDER BY id ASC
+        """,
+        params,
+    ).fetchall()
+
+    latest_by_link: dict[int, dict[str, Any]] = {}
+    for decision in sorted(
+        decisions,
+        key=lambda d: (
+            -int(_as_int(d.get("created_at_ts")) or 0),
+            -int(_as_int(d.get("decision_id")) or 0),
+        ),
+    ):
+        link_id = _as_int((decision.get("link") or {}).get("link_id"))
+        if link_id is None or link_id in latest_by_link:
+            continue
+        latest_by_link[link_id] = _minimal_decision_context(decision=decision, event_id=event_id)
+
+    links: list[dict[str, Any]] = []
+    for row in link_rows:
+        link_id = int(row["id"])
+        context = latest_by_link.get(link_id)
+        if context is None:
+            context = _hydrate_latest_decision_for_link(
+                cur=cur,
+                link_id=link_id,
+                event_id=event_id,
+                has_decision_table=has_decision_table,
+                has_candidate_table=has_candidate_table,
+                event_by_id=event_by_id,
+            )
+
+        event_similarity = _as_float((context or {}).get("event_similarity"))
+        links.append(
+            {
+                "link_id": link_id,
+                "norm_url": row["norm_url"],
+                "title": row["title"],
+                "domain": row["domain"],
+                "assigned_event_id": _as_int(row["event_id"]),
+                "event_similarity": event_similarity,
+                "event_similarity_rank": _as_int((context or {}).get("event_similarity_rank")),
+                "decision_context": context,
+            }
+        )
+
+    links.sort(
+        key=lambda item: (
+            1 if _as_float(item.get("event_similarity")) is None else 0,
+            -float(_as_float(item.get("event_similarity")) or 0.0),
+            -int(_as_int(((item.get("decision_context") or {}).get("created_at_ts"))) or 0),
+            int(_as_int(item.get("link_id")) or 0),
+        )
+    )
+
+    event_meta = event_by_id.get(event_id)
+    if event_meta is None and _table_exists(cur, "events"):
+        row = cur.execute(
+            "SELECT id, category, jurisdiction, title, summary_en, status FROM events WHERE id = ?",
+            (int(event_id),),
+        ).fetchone()
+        if row is not None:
+            event_meta = dict(row)
+            event_by_id[event_id] = event_meta
+
+    return {
+        "event_id": int(event_id),
+        "event": event_meta,
+        "link_count": len(links),
+        "links": links,
+    }
+
+
 def _fmt_score(value: Any) -> str:
     score = _as_float(value)
     if score is None:
@@ -478,59 +898,75 @@ def _print_human(out: dict[str, Any]) -> None:
         print(f"Warning: {warning}")
 
     decisions = out.get("decisions") or []
-    if not decisions:
-        return
+    if decisions:
+        group_by = out.get("group_by")
+        if group_by == "link":
+            print("\nBy link:")
+            for g in out.get("groups") or []:
+                print(
+                    f"- link#{g.get('link_id')} domain={g.get('domain') or '-'} "
+                    f"decisions={g.get('decision_count')} avg_top_similarity={_fmt_score(g.get('avg_top_similarity'))}"
+                )
+                print(
+                    f"  last={g.get('last_decision_at') or '-'} "
+                    f"actions={g.get('actions') or {}} hints={g.get('hints') or {}}"
+                )
+        elif group_by == "event":
+            print("\nBy event:")
+            for g in out.get("groups") or []:
+                print(
+                    f"- event#{g.get('event_id')} category={g.get('category') or '-'} "
+                    f"decisions={g.get('decision_count')} targets={g.get('target_hits')} outliers={g.get('outlier_hits')}"
+                )
+                print(
+                    f"  avg_similarity={_fmt_score(g.get('avg_candidate_similarity'))} "
+                    f"actions={g.get('actions') or {}} hints={g.get('hints') or {}}"
+                )
+        else:
+            print("\nDecisions:")
+            for d in decisions:
+                link = d.get("link") or {}
+                sim = d.get("similarity") or {}
+                action = (d.get("enforced_action") or {}).get("action") or (d.get("validated_action") or {}).get("action") or "unknown"
+                target = d.get("target_event_id")
 
-    group_by = out.get("group_by")
-    if group_by == "link":
-        print("\nBy link:")
-        for g in out.get("groups") or []:
+                print(
+                    f"- d#{d.get('decision_id')} @ {d.get('created_at') or '-'} "
+                    f"link#{link.get('link_id')} domain={link.get('domain') or '-'}"
+                )
+                print(
+                    f"  action={action} target_event={target or '-'} category={d.get('category') or '-'}"
+                )
+                print(
+                    "  similarity="
+                    f"top:{_fmt_score(sim.get('top_score'))} "
+                    f"gap:{_fmt_score(sim.get('score_gap'))} "
+                    f"target_rank:{sim.get('target_rank') or '-'} "
+                    f"target_score:{_fmt_score(sim.get('target_score'))}"
+                )
+                hints = d.get("hints") or []
+                print(f"  hints={', '.join(hints) if hints else '-'}")
+
+    event_link_listing = out.get("event_link_listing")
+    if isinstance(event_link_listing, dict) and (event_link_listing.get("links") or []):
+        print(f"\nAssigned links for event#{event_link_listing.get('event_id')}:")
+        ev = event_link_listing.get("event") or {}
+        if isinstance(ev, dict):
             print(
-                f"- link#{g.get('link_id')} domain={g.get('domain') or '-'} "
-                f"decisions={g.get('decision_count')} avg_top_similarity={_fmt_score(g.get('avg_top_similarity'))}"
+                f"Event: category={ev.get('category') or '-'} "
+                f"status={ev.get('status') or '-'} title={ev.get('title') or ev.get('summary_en') or '-'}"
+            )
+        for item in event_link_listing.get("links") or []:
+            ctx = item.get("decision_context") or {}
+            print(
+                f"- link#{item.get('link_id')} domain={item.get('domain') or '-'} "
+                f"event_similarity={_fmt_score(item.get('event_similarity'))}"
             )
             print(
-                f"  last={g.get('last_decision_at') or '-'} "
-                f"actions={g.get('actions') or {}} hints={g.get('hints') or {}}"
+                f"  decision={ctx.get('decision_id') or '-'} action={ctx.get('action') or '-'} "
+                f"target_event={ctx.get('target_event_id') or '-'} "
+                f"hints={', '.join(ctx.get('hints') or []) if ctx.get('hints') else '-'}"
             )
-        return
-
-    if group_by == "event":
-        print("\nBy event:")
-        for g in out.get("groups") or []:
-            print(
-                f"- event#{g.get('event_id')} category={g.get('category') or '-'} "
-                f"decisions={g.get('decision_count')} targets={g.get('target_hits')} outliers={g.get('outlier_hits')}"
-            )
-            print(
-                f"  avg_similarity={_fmt_score(g.get('avg_candidate_similarity'))} "
-                f"actions={g.get('actions') or {}} hints={g.get('hints') or {}}"
-            )
-        return
-
-    print("\nDecisions:")
-    for d in decisions:
-        link = d.get("link") or {}
-        sim = d.get("similarity") or {}
-        action = (d.get("enforced_action") or {}).get("action") or (d.get("validated_action") or {}).get("action") or "unknown"
-        target = d.get("target_event_id")
-
-        print(
-            f"- d#{d.get('decision_id')} @ {d.get('created_at') or '-'} "
-            f"link#{link.get('link_id')} domain={link.get('domain') or '-'}"
-        )
-        print(
-            f"  action={action} target_event={target or '-'} category={d.get('category') or '-'}"
-        )
-        print(
-            "  similarity="
-            f"top:{_fmt_score(sim.get('top_score'))} "
-            f"gap:{_fmt_score(sim.get('score_gap'))} "
-            f"target_rank:{sim.get('target_rank') or '-'} "
-            f"target_score:{_fmt_score(sim.get('target_score'))}"
-        )
-        hints = d.get("hints") or []
-        print(f"  hints={', '.join(hints) if hints else '-'}")
 
 
 def main(argv: list[str]) -> int:
@@ -570,15 +1006,19 @@ def main(argv: list[str]) -> int:
     warnings: list[str] = []
     decisions: list[dict[str, Any]] = []
     event_by_id: dict[int, dict[str, Any]] = {}
+    event_link_listing: dict[str, Any] | None = None
 
     try:
         with sqlite3.connect(str(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
+            has_links_table = _table_exists(cur, "links")
+            has_decision_table = _table_exists(cur, "clustering_decisions")
+            has_candidate_table = _table_exists(cur, "clustering_decision_candidates")
 
-            if not _table_exists(cur, "clustering_decisions"):
+            if not has_decision_table:
                 warnings.append("clustering_decisions table is missing; no decision logs are available.")
-            elif not _table_exists(cur, "links"):
+            elif not has_links_table:
                 warnings.append("links table is missing; cannot resolve decision links.")
             else:
                 where: list[str] = []
@@ -633,7 +1073,6 @@ def main(argv: list[str]) -> int:
                 decision_ids = [int(r["decision_id"]) for r in rows]
 
                 candidate_map: dict[int, list[dict[str, Any]]] = {}
-                has_candidate_table = _table_exists(cur, "clustering_decision_candidates")
                 if has_candidate_table and decision_ids:
                     chunk_size = 500
                     for i in range(0, len(decision_ids), chunk_size):
@@ -753,18 +1192,20 @@ def main(argv: list[str]) -> int:
                         action_obj = raw.get("validated_action_obj")
 
                     action_name = raw.get("enforced_action_name") or raw.get("validated_action_name")
-                    hints = _build_hints(
-                        action_name=action_name if isinstance(action_name, str) else None,
-                        error_type=raw.get("error_type") if isinstance(raw.get("error_type"), str) else None,
-                        similarity=similarity,
-                    )
-
                     linked_event_category = _event_category(event_by_id, _as_int(raw.get("link_event_id")))
                     target_event_category = _event_category(event_by_id, target_event_id)
                     category, action_category = _resolve_category(
                         action_obj=action_obj,
                         linked_event_category=linked_event_category,
                         target_event_category=target_event_category,
+                    )
+                    domain_signals = _domain_signals(domain=raw.get("link_domain"), category=category)
+
+                    hints = _build_hints(
+                        action_name=action_name if isinstance(action_name, str) else None,
+                        error_type=raw.get("error_type") if isinstance(raw.get("error_type"), str) else None,
+                        similarity=similarity,
+                        domain_signals=domain_signals,
                     )
 
                     event_ids_touched = _event_ids_touched(
@@ -805,6 +1246,7 @@ def main(argv: list[str]) -> int:
                         "event_ids_touched": event_ids_touched,
                         "candidates": candidates,
                         "similarity": similarity,
+                        "domain_signals": domain_signals,
                         "hints": hints,
                         "error": {
                             "type": raw.get("error_type"),
@@ -825,6 +1267,17 @@ def main(argv: list[str]) -> int:
                     decisions.append(decision)
                     if len(decisions) >= limit:
                         break
+
+            if args.event_id is not None and has_links_table:
+                event_link_listing = _build_event_link_listing(
+                    cur=cur,
+                    event_id=int(args.event_id),
+                    domain_filters=domain_filters,
+                    event_by_id=event_by_id,
+                    decisions=decisions,
+                    has_decision_table=has_decision_table,
+                    has_candidate_table=has_candidate_table,
+                )
 
         if not decisions:
             warnings.append("No clustering decision logs found for the selected filters.")
@@ -881,6 +1334,7 @@ def main(argv: list[str]) -> int:
         "decisions": decisions,
         "group_by": args.group_by,
         "groups": groups,
+        "event_link_listing": event_link_listing,
     }
 
     if args.json:
