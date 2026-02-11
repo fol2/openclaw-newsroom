@@ -8,13 +8,13 @@ from newsroom.news_pool_db import NewsPoolDB, PoolLink, SCHEMA_VERSION, _RESERVA
 
 
 class TestNewsPoolDBV5Fresh(unittest.TestCase):
-    """Test fresh v5 database creation."""
+    """Test fresh database creation."""
 
-    def test_fresh_db_creates_v6_schema(self) -> None:
+    def test_fresh_db_creates_latest_schema(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=db_path) as db:
-                self.assertEqual(db.get_meta_int("schema_version"), 6)
+                self.assertEqual(db.get_meta_int("schema_version"), SCHEMA_VERSION)
 
     def test_fresh_db_has_events_table(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -196,13 +196,13 @@ class TestNewsPoolDBV5Migration(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    def test_migration_v4_to_v6(self) -> None:
+    def test_migration_v4_to_latest(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             self._create_v4_db(db_path)
 
             with NewsPoolDB(path=db_path) as db:
-                self.assertEqual(db.get_meta_int("schema_version"), 6)
+                self.assertEqual(db.get_meta_int("schema_version"), SCHEMA_VERSION)
                 row = db._conn.execute("PRAGMA foreign_keys;").fetchone()
                 assert row is not None
                 self.assertEqual(int(row[0]), 1)
@@ -215,12 +215,14 @@ class TestNewsPoolDBV5Migration(unittest.TestCase):
 
                 # New events table exists and has migrated data.
                 self.assertTrue(NewsPoolDB._table_exists(conn.cursor(), "events"))
+                self.assertTrue(NewsPoolDB._table_exists(conn.cursor(), "event_features"))
                 events = db.get_fresh_events(now_ts=0)
                 self.assertGreaterEqual(len(events), 1)
                 migrated = events[-1]  # Oldest first in fresh_events (DESC by created_at_ts)
                 self.assertEqual(migrated["status"], "posted")
                 self.assertEqual(migrated["jurisdiction"], "UK")
                 self.assertIn("crisis", migrated["summary_en"].lower())
+                self.assertIsNotNone(db.get_event_features(event_id=int(migrated["id"])))
 
                 # Links have new columns.
                 links = list(db.iter_links_since(cutoff_ts=0))
@@ -399,9 +401,43 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                 events = db.get_fresh_events(now_ts=future)
                 self.assertEqual(len(events), 0)
 
+    def test_create_event_creates_event_features_row(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(summary_en="Feature seed event", category="AI", jurisdiction="US")
+                features = db.get_event_features(event_id=eid)
+                self.assertIsNotNone(features)
+                assert features is not None
+                self.assertEqual(features["event_id"], eid)
+                self.assertEqual(features.get("features"), {})
+                self.assertEqual(features.get("features_json"), "{}")
 
-class TestNewsPoolDBV5ToV6Migration(unittest.TestCase):
-    """Test migration from v5 to v6 (reserved_until_ts column)."""
+    def test_ensure_event_features_row_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(summary_en="Idempotent features", category="AI", jurisdiction="US")
+                first = db.get_event_features(event_id=eid)
+                self.assertIsNotNone(first)
+                assert first is not None
+
+                db.ensure_event_features_row(event_id=eid)
+
+                second = db.get_event_features(event_id=eid)
+                self.assertIsNotNone(second)
+                assert second is not None
+                count_row = db._conn.execute(
+                    "SELECT COUNT(1) AS n FROM event_features WHERE event_id = ?",
+                    (eid,),
+                ).fetchone()
+                assert count_row is not None
+                self.assertEqual(int(count_row["n"]), 1)
+                self.assertEqual(second["created_at_ts"], first["created_at_ts"])
+
+
+class TestNewsPoolDBV5ToLatestMigration(unittest.TestCase):
+    """Test migration from v5 to latest schema."""
 
     def _create_v5_db(self, path: Path) -> None:
         conn = sqlite3.connect(str(path))
@@ -442,13 +478,13 @@ class TestNewsPoolDBV5ToV6Migration(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    def test_migration_v5_to_v6_adds_column(self) -> None:
+    def test_migration_v5_to_latest_adds_columns_and_features_rows(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             self._create_v5_db(db_path)
 
             with NewsPoolDB(path=db_path) as db:
-                self.assertEqual(db.get_meta_int("schema_version"), 6)
+                self.assertEqual(db.get_meta_int("schema_version"), SCHEMA_VERSION)
                 row = db._conn.execute("PRAGMA foreign_keys;").fetchone()
                 assert row is not None
                 self.assertEqual(int(row[0]), 1)
@@ -456,12 +492,14 @@ class TestNewsPoolDBV5ToV6Migration(unittest.TestCase):
                 # reserved_until_ts column should exist.
                 cur = db._conn.cursor()
                 self.assertTrue(NewsPoolDB._column_exists(cur, "events", "reserved_until_ts"))
+                self.assertTrue(NewsPoolDB._table_exists(cur, "event_features"))
 
                 # Existing events should still be queryable.
                 events = db.get_fresh_events(now_ts=0)
                 self.assertGreaterEqual(len(events), 1)
+                self.assertIsNotNone(db.get_event_features(event_id=int(events[0]["id"])))
 
-    def test_migration_v5_to_v6_existing_events_have_null_reservation(self) -> None:
+    def test_migration_v5_to_latest_existing_events_have_null_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             self._create_v5_db(db_path)
@@ -471,6 +509,68 @@ class TestNewsPoolDBV5ToV6Migration(unittest.TestCase):
                 candidates = db.get_daily_candidates(limit=10)
                 self.assertGreater(len(candidates), 0)
 
+
+class TestNewsPoolDBV6ToV7Migration(unittest.TestCase):
+    """Test migration from v6 to v7 (event_features table)."""
+
+    def _create_v6_db(self, path: Path) -> None:
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
+        conn.execute("INSERT INTO meta(k, v) VALUES('schema_version', '6');")
+        conn.execute("""
+            CREATE TABLE events (
+              id INTEGER PRIMARY KEY,
+              parent_event_id INTEGER REFERENCES events(id),
+              category TEXT, jurisdiction TEXT, summary_en TEXT NOT NULL,
+              development TEXT, title TEXT, primary_url TEXT,
+              link_count INTEGER NOT NULL DEFAULT 0, best_published_ts INTEGER,
+              status TEXT NOT NULL DEFAULT 'new'
+                CHECK (status IN ('new', 'active', 'posted')),
+              created_at_ts INTEGER NOT NULL, updated_at_ts INTEGER NOT NULL,
+              expires_at_ts INTEGER, posted_at_ts INTEGER,
+              thread_id TEXT, run_id TEXT, model TEXT,
+              reserved_until_ts INTEGER
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE links (
+              id INTEGER PRIMARY KEY, url TEXT NOT NULL, norm_url TEXT NOT NULL UNIQUE,
+              domain TEXT, title TEXT, description TEXT, age TEXT, page_age TEXT,
+              first_seen_ts INTEGER NOT NULL, last_seen_ts INTEGER NOT NULL,
+              seen_count INTEGER NOT NULL DEFAULT 1, last_query TEXT NOT NULL,
+              last_offset INTEGER NOT NULL, last_fetched_at_ts INTEGER NOT NULL,
+              event_id INTEGER REFERENCES events(id), published_at_ts INTEGER
+            );
+        """)
+        conn.execute("CREATE TABLE fetch_state (key TEXT PRIMARY KEY, last_fetch_ts INTEGER NOT NULL, last_offset INTEGER NOT NULL DEFAULT 1, run_count INTEGER NOT NULL DEFAULT 0);")
+        conn.execute("CREATE TABLE article_cache (norm_url TEXT PRIMARY KEY, url TEXT NOT NULL, final_url TEXT, domain TEXT, http_status INTEGER, extracted_title TEXT, extracted_text TEXT, extractor TEXT, fetched_at_ts INTEGER NOT NULL, text_chars INTEGER NOT NULL, quality_score INTEGER NOT NULL, error TEXT);")
+        conn.execute("CREATE TABLE pool_runs (id INTEGER PRIMARY KEY, run_ts INTEGER NOT NULL, state_key TEXT NOT NULL, window_hours INTEGER NOT NULL, should_fetch INTEGER NOT NULL, query TEXT, offset_start INTEGER, pages INTEGER, count INTEGER, freshness TEXT, requests_made INTEGER NOT NULL DEFAULT 0, results INTEGER NOT NULL DEFAULT 0, inserted INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0, pruned INTEGER NOT NULL DEFAULT 0, pruned_articles INTEGER NOT NULL DEFAULT 0, notes TEXT);")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO events(category, jurisdiction, summary_en, status, created_at_ts, updated_at_ts, expires_at_ts) VALUES(?, ?, ?, 'new', ?, ?, ?)",
+            ("AI", "US", "Test v6 event", now, now, now + 48 * 3600),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_migration_v6_to_v7_adds_event_features_and_backfills(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            self._create_v6_db(db_path)
+
+            with NewsPoolDB(path=db_path) as db:
+                self.assertEqual(db.get_meta_int("schema_version"), SCHEMA_VERSION)
+                cur = db._conn.cursor()
+                self.assertTrue(NewsPoolDB._table_exists(cur, "event_features"))
+
+                events = db._conn.execute("SELECT id FROM events ORDER BY id ASC").fetchall()
+                self.assertGreaterEqual(len(events), 1)
+                for row in events:
+                    features = db.get_event_features(event_id=int(row["id"]))
+                    self.assertIsNotNone(features)
+                    assert features is not None
+                    self.assertEqual(features.get("features"), {})
+                    self.assertEqual(features.get("features_json"), "{}")
 
 class TestEventReservation(unittest.TestCase):
     """Test planner-level event reservation to prevent concurrent selection."""

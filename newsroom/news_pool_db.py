@@ -13,7 +13,7 @@ from .lang_hint import detect_link_lang_hint, normalise_lang_hint
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _RESERVATION_SECONDS = 600  # 10 minutes
 
@@ -288,21 +288,12 @@ class NewsPoolDB:
         if schema is None:
             # Fresh database — create all tables directly.
             self._create_all_tables_v5(cur)
-            self._create_clustering_decisions_tables(cur)
-            self._create_retrieval_translation_cache_table(cur)
-            self._ensure_links_skip_cluster_columns(cur)
-            self._ensure_links_lang_hint_column(cur)
-            self._ensure_events_entity_aliases_column(cur)
+            self._ensure_auxiliary_tables(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
         if schema == SCHEMA_VERSION:
-            # Auxiliary tables should exist regardless of schema_version.
-            self._create_clustering_decisions_tables(cur)
-            self._create_retrieval_translation_cache_table(cur)
-            self._ensure_links_skip_cluster_columns(cur)
-            self._ensure_links_lang_hint_column(cur)
-            self._ensure_events_entity_aliases_column(cur)
+            self._ensure_auxiliary_tables(cur)
             return
 
         if schema <= 4:
@@ -311,18 +302,21 @@ class NewsPoolDB:
 
         if schema == 5:
             self._migrate_to_v6(cur)
-            self._create_clustering_decisions_tables(cur)
-            self._create_retrieval_translation_cache_table(cur)
-            self._ensure_links_skip_cluster_columns(cur)
-            self._ensure_links_lang_hint_column(cur)
-            self._ensure_events_entity_aliases_column(cur)
+            schema = 6
+
+        if schema == 6:
+            self._migrate_to_v7(cur)
+            schema = 7
+
+        if schema == SCHEMA_VERSION:
+            self._ensure_auxiliary_tables(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
         raise RuntimeError(f"Unsupported news pool schema_version={schema}, expected={SCHEMA_VERSION}")
 
     def _create_all_tables_v5(self, cur: sqlite3.Cursor) -> None:
-        """Create all tables for a fresh v5 database."""
+        """Create core tables for a fresh event-centric database."""
         # links
         cur.execute(
             """
@@ -413,6 +407,16 @@ class NewsPoolDB:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_runs_run_ts ON pool_runs(run_ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pool_runs_state_key_run_ts ON pool_runs(state_key, run_ts);")
+
+    def _ensure_auxiliary_tables(self, cur: sqlite3.Cursor) -> None:
+        """Ensure auxiliary tables/columns exist regardless of schema version."""
+        self._create_clustering_decisions_tables(cur)
+        self._create_retrieval_translation_cache_table(cur)
+        self._ensure_links_skip_cluster_columns(cur)
+        self._ensure_links_lang_hint_column(cur)
+        self._ensure_events_entity_aliases_column(cur)
+        self._create_event_features_table(cur)
+        self._backfill_event_features_rows(cur)
 
     def _create_clustering_decisions_tables(self, cur: sqlite3.Cursor) -> None:
         """Create clustering decision audit tables (auxiliary, schema-version agnostic)."""
@@ -534,6 +538,39 @@ class NewsPoolDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_status ON events(status, created_at_ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at_ts) WHERE expires_at_ts IS NOT NULL;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_category ON events(category, status);")
+
+    def _create_event_features_table(self, cur: sqlite3.Cursor) -> None:
+        """Create per-event feature rows (one row per event)."""
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_features (
+              event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+              features_json TEXT NOT NULL DEFAULT '{}',
+              model TEXT,
+              created_at_ts INTEGER NOT NULL,
+              updated_at_ts INTEGER NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_event_features_updated_at_ts "
+            "ON event_features(updated_at_ts);"
+        )
+
+    def _backfill_event_features_rows(self, cur: sqlite3.Cursor, *, now_ts: int | None = None) -> None:
+        """Ensure every event has a matching row in event_features."""
+        now = _utc_now_ts() if now_ts is None else int(now_ts)
+        cur.execute(
+            """
+            INSERT INTO event_features(event_id, features_json, created_at_ts, updated_at_ts)
+            SELECT e.id, '{}', COALESCE(e.created_at_ts, ?), ?
+            FROM events AS e
+            LEFT JOIN event_features AS ef
+              ON ef.event_id = e.id
+            WHERE ef.event_id IS NULL
+            """,
+            (now, now),
+        )
 
     def insert_clustering_decision(
         self,
@@ -704,6 +741,11 @@ class NewsPoolDB:
         """Migrate from schema v5 to v6: add reserved_until_ts column."""
         if not self._column_exists(cur, "events", "reserved_until_ts"):
             cur.execute("ALTER TABLE events ADD COLUMN reserved_until_ts INTEGER;")
+
+    def _migrate_to_v7(self, cur: sqlite3.Cursor) -> None:
+        """Migrate from schema v6 to v7: add event_features table and backfill rows."""
+        self._create_event_features_table(cur)
+        self._backfill_event_features_rows(cur)
 
     @staticmethod
     def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
@@ -1021,6 +1063,16 @@ class NewsPoolDB:
         )
         event_id = cur.lastrowid or 0
 
+        if event_id:
+            cur.execute(
+                """
+                INSERT INTO event_features(event_id, features_json, created_at_ts, updated_at_ts)
+                VALUES (?, '{}', ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (event_id, now, now),
+            )
+
         # If this is a development, bump parent's expires_at_ts.
         if parent_event_id is not None:
             cur.execute(
@@ -1038,6 +1090,40 @@ class NewsPoolDB:
             return None
         out = dict(row)
         out["entity_aliases"] = _entity_aliases_from_json(out.get("entity_aliases_json"))
+        return out
+
+    def ensure_event_features_row(self, *, event_id: int, now_ts: int | None = None) -> None:
+        """Create an empty event_features row if missing (idempotent)."""
+        now = _utc_now_ts() if now_ts is None else int(now_ts)
+        self._conn.execute(
+            """
+            INSERT INTO event_features(event_id, features_json, created_at_ts, updated_at_ts)
+            VALUES (?, '{}', ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (int(event_id), now, now),
+        )
+
+    def get_event_features(self, *, event_id: int) -> dict[str, Any] | None:
+        """Get the event_features row and parsed features payload for an event."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            """
+            SELECT event_id, features_json, model, created_at_ts, updated_at_ts
+            FROM event_features
+            WHERE event_id = ?
+            """,
+            (int(event_id),),
+        ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        payload = out.get("features_json")
+        try:
+            parsed = json.loads(payload) if isinstance(payload, str) and payload else {}
+        except Exception:
+            parsed = {}
+        out["features"] = parsed if isinstance(parsed, dict) else {}
         return out
 
     def get_all_fresh_events(
