@@ -24,7 +24,7 @@ from newsroom.event_manager import (
     parse_merge_response,
     retrieve_candidates,
 )
-from newsroom.news_pool_db import NewsPoolDB, PoolLink
+from newsroom.news_pool_db import NewsPoolDB, PoolLink, _HARD_MAX_EVENT_TTL_SECONDS
 
 
 class TestBuildClusteringPrompt(unittest.TestCase):
@@ -1210,12 +1210,12 @@ class TestClusterLink(unittest.TestCase):
                 gemini.generate_json.return_value = {
                     "action": "assign",
                     "event_id": eid,
-                    "confidence": 0.9,
+                    "confidence": 0.95,
                     "summary_en": "Jimmy Lai sentenced to 20 years in prison",
                     "category": "Hong Kong News",
                     "jurisdiction": "HK",
                     "link_flags": [],
-                    "match_basis": "Same sentencing story",
+                    "match_basis": ["entity", "number", "time"],
                 }
 
                 events = db.get_all_fresh_events()
@@ -1224,6 +1224,56 @@ class TestClusterLink(unittest.TestCase):
                 assert result is not None
                 self.assertEqual(result["action"], "assign")
                 self.assertTrue(result.get("assigned_to_posted"))
+
+    def test_cluster_link_routes_posted_assign_to_development_when_not_strict_enough(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://bbc.co.uk/5b", norm_url="https://bbc.co.uk/5b",
+                    domain="bbc.co.uk", title="Jimmy Lai case: new update",
+                    description="Fresh update in Jimmy Lai sentencing case",
+                    age=None, page_age="2026-02-07T10:00:00", query="test", offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years in prison",
+                    category="Hong Kong News", jurisdiction="HK",
+                )
+                db.mark_event_posted(eid, thread_id="t1", run_id="r1")
+
+                gemini = MagicMock()
+                gemini.generate_json.return_value = {
+                    "action": "assign",
+                    "event_id": eid,
+                    "confidence": 0.88,
+                    "summary_en": "Jimmy Lai case has another update",
+                    "category": "Hong Kong News",
+                    "jurisdiction": "HK",
+                    "link_flags": [],
+                    "match_basis": ["entity"],
+                }
+
+                events = db.get_all_fresh_events()
+                result = cluster_link(link=links[0], all_events=events, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "development")
+                self.assertEqual(result.get("parent_event_id"), eid)
+                self.assertTrue(result.get("routed_from_posted_assign"))
+
+                parent = db.get_event(eid)
+                assert parent is not None
+                self.assertEqual(parent["link_count"], 0)
+
+                child = db.get_event(int(result["event_id"]))
+                self.assertIsNotNone(child)
+                assert child is not None
+                self.assertEqual(child["parent_event_id"], eid)
+                self.assertEqual(child["link_count"], 1)
 
 
 class TestClusterAllPending(unittest.TestCase):
@@ -1906,6 +1956,37 @@ class TestGetAllFreshEvents(unittest.TestCase):
                 db._conn.execute(
                     "UPDATE events SET posted_at_ts = ? WHERE id = ?",
                     (now - (49 * 3600), eid),
+                )
+
+                events = db.get_all_fresh_events(now_ts=now)
+                self.assertFalse(any(e["id"] == eid for e in events))
+
+    def test_excludes_hard_expired_even_if_soft_expiry_is_in_future(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Old but soft-unexpired", category="AI", jurisdiction="US")
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - (_HARD_MAX_EVENT_TTL_SECONDS + 3600), now + (24 * 3600), eid),
+                )
+
+                fresh = db.get_fresh_events(now_ts=now)
+                all_events = db.get_all_fresh_events(now_ts=now)
+                self.assertFalse(any(e["id"] == eid for e in fresh))
+                self.assertFalse(any(e["id"] == eid for e in all_events))
+
+    def test_excludes_hard_expired_posted_even_if_posted_recently(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                now = int(time.time())
+                eid = db.create_event(summary_en="Hard-expired posted event", category="AI", jurisdiction="US")
+                db.mark_event_posted(eid, thread_id="t1", run_id="r1")
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, posted_at_ts = ?, expires_at_ts = ? WHERE id = ?",
+                    (now - (_HARD_MAX_EVENT_TTL_SECONDS + 3600), now - 60, now + (24 * 3600), eid),
                 )
 
                 events = db.get_all_fresh_events(now_ts=now)
