@@ -27,6 +27,7 @@ from newsroom.event_manager import (  # noqa: E402
     EventTokens,
     _tokenize_event,
     build_merge_prompt,
+    _compute_drop_high_df,
     parse_merge_response,
     retrieve_candidates,
 )
@@ -41,8 +42,10 @@ _DB_PATH = OPENCLAW_HOME / "data" / "newsroom" / "news_pool.sqlite3"
 def _pairwise_scores(
     events: list[dict[str, Any]],
     *,
+    top_k: int,
     min_score: float = 0.25,
     token_cache: dict[int, EventTokens],
+    drop_high_df: set[str],
 ) -> list[tuple[int, int, float]]:
     """Compute pairwise retrieval scores between all root events.
 
@@ -64,8 +67,9 @@ def _pairwise_scores(
 
         candidates = retrieve_candidates(
             link_like, others,
-            top_k=10, min_score=min_score,
+            top_k=int(top_k), min_score=float(min_score),
             token_cache=token_cache,
+            drop_high_df=drop_high_df,
         )
         for ev_b, score in candidates:
             pairs.append((ev_a["id"], ev_b["id"], score))
@@ -80,6 +84,9 @@ def recluster_pass(
     gemini: GeminiClient,
     max_merges: int,
     dry_run: bool,
+    min_score: float,
+    top_k: int,
+    max_consecutive_failures: int,
     delay_seconds: float = 3.0,
 ) -> dict[str, int]:
     """Run one reclustering pass. Returns stats."""
@@ -90,6 +97,7 @@ def recluster_pass(
         "merges": 0,
         "links_moved": 0,
         "errors": 0,
+        "early_exit": 0,
     }
 
     all_events = db.get_all_fresh_events(max_age_hours=168)
@@ -103,7 +111,14 @@ def recluster_pass(
         return stats
 
     token_cache: dict[int, EventTokens] = {}
-    pairs = _pairwise_scores(root_events, token_cache=token_cache)
+    drop_high_df = _compute_drop_high_df(root_events)
+    pairs = _pairwise_scores(
+        root_events,
+        token_cache=token_cache,
+        drop_high_df=drop_high_df,
+        min_score=float(min_score),
+        top_k=int(top_k),
+    )
     stats["pairs_found"] = len(pairs)
 
     if not pairs:
@@ -111,8 +126,17 @@ def recluster_pass(
 
     ev_lookup = {ev["id"]: ev for ev in root_events}
     merged_this_pass: set[int] = set()
+    consecutive_failures = 0
 
     for eid_a, eid_b, score in pairs:
+        if consecutive_failures >= max(1, int(max_consecutive_failures)):
+            logger.warning(
+                "Early exit: %d consecutive LLM failures, stopping this pass",
+                consecutive_failures,
+            )
+            stats["early_exit"] = 1
+            break
+
         if stats["merges"] >= max_merges:
             break
         if eid_a in merged_this_pass or eid_b in merged_this_pass:
@@ -134,12 +158,14 @@ def recluster_pass(
         except Exception as e:
             logger.warning("LLM call failed for pair (%d, %d): %s", eid_a, eid_b, e)
             stats["errors"] += 1
+            consecutive_failures += 1
             continue
 
         stats["llm_calls"] += 1
 
         if not raw_text:
             stats["errors"] += 1
+            consecutive_failures += 1
             continue
 
         sanitized = re.sub(r'\bE(\d+)\b', r'\1', raw_text)
@@ -149,7 +175,9 @@ def recluster_pass(
             )
         except (json.JSONDecodeError, ValueError):
             stats["errors"] += 1
+            consecutive_failures += 1
             continue
+        consecutive_failures = 0
 
         valid_ids = {eid_a, eid_b}
         groups = parse_merge_response(response, valid_ids)
@@ -161,11 +189,22 @@ def recluster_pass(
             if len(group_events) < 2:
                 continue
 
-            # Pick winner: most links, tiebreak oldest.
-            winner = max(
-                group_events,
-                key=lambda e: (e.get("link_count", 0), -(e.get("created_at_ts", 0))),
-            )
+            posted_events = [e for e in group_events if e.get("status") == "posted"]
+            if len(posted_events) > 1:
+                logger.info(
+                    "Skip merge group with multiple posted events: %s",
+                    [int(e.get("id") or 0) for e in posted_events],
+                )
+                continue
+
+            if len(posted_events) == 1:
+                winner = posted_events[0]
+            else:
+                # Pick winner: most links, tiebreak oldest.
+                winner = max(
+                    group_events,
+                    key=lambda e: (e.get("link_count", 0), -(e.get("created_at_ts", 0))),
+                )
             loser_ids = [e["id"] for e in group_events if e["id"] != winner["id"]]
 
             if dry_run:
@@ -180,21 +219,6 @@ def recluster_pass(
                 stats["merges"] += 1
                 merged_this_pass.update(loser_ids)
             else:
-                # Handle posted status transfer.
-                winner_posted = winner.get("status") == "posted"
-                for lid in loser_ids:
-                    loser = ev_lookup.get(lid, {})
-                    if loser.get("status") == "posted" and not winner_posted:
-                        try:
-                            db.mark_event_posted(
-                                winner["id"],
-                                thread_id=loser.get("thread_id"),
-                                run_id=loser.get("run_id"),
-                            )
-                            winner_posted = True
-                        except Exception:
-                            pass
-
                 try:
                     links_moved = db.merge_events_into(
                         winner_id=winner["id"], loser_ids=loser_ids,
@@ -219,6 +243,14 @@ def recluster_pass(
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Re-cluster fragmented events using retrieve-then-decide.")
     parser.add_argument("--dry-run", action="store_true", help="Show proposed merges without executing.")
+    parser.add_argument("--min-score", type=float, default=0.30, help="Retrieval min score threshold (default: 0.30).")
+    parser.add_argument("--top-k", type=int, default=10, help="Top-k retrieval candidates per event (default: 10).")
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=10,
+        help="Stop early after this many consecutive LLM failures (default: 10).",
+    )
     parser.add_argument("--max-merges", type=int, default=50, help="Max merges per pass (default: 50).")
     parser.add_argument("--passes", type=int, default=3, help="Max re-clustering passes (default: 3).")
     parser.add_argument("--delay", type=float, default=3.0, help="Delay between LLM calls in seconds (default: 3.0).")
@@ -248,6 +280,9 @@ def main(argv: list[str]) -> int:
                 gemini=gemini,
                 max_merges=args.max_merges,
                 dry_run=args.dry_run,
+                min_score=float(args.min_score),
+                top_k=int(args.top_k),
+                max_consecutive_failures=int(args.max_consecutive_failures),
                 delay_seconds=args.delay,
             )
 

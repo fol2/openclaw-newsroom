@@ -1,0 +1,146 @@
+{
+  "category_distribution_all": [
+    {
+      "category": "Global News",
+      "count": 314
+    },
+    {
+      "category": "Entertainment",
+      "count": 281
+    },
+    {
+      "category": "Hong Kong News",
+      "count": 280
+    },
+    {
+      "category": "UK News",
+      "count": 263
+    },
+    {
+      "category": "Politics",
+      "count": 154
+    },
+    {
+      "category": "Sports",
+      "count": 135
+    },
+    {
+      "category": "UK Parliament / Politics",
+      "count": 115
+    },
+    {
+      "category": "US Stocks",
+      "count": 58
+    },
+    {
+      "category": "AI",
+      "count": 43
+    },
+    {
+      "category": "Hong Kong Entertainment",
+      "count": 19
+    },
+    {
+      "category": "Crypto",
+      "count": 12
+    },
+    {
+      "category": "US News",
+      "count": 8
+    },
+    {
+      "category": "Precious Metals",
+      "count": 7
+    },
+    {
+      "category": "Technology",
+      "count": 1
+    }
+  ],
+  "category_distribution_root": [
+    {
+      "category": "Global News",
+      "count": 268
+    },
+    {
+      "category": "Entertainment",
+      "count": 248
+    },
+    {
+      "category": "UK News",
+      "count": 238
+    },
+    {
+      "category": "Hong Kong News",
+      "count": 123
+    },
+    {
+      "category": "Politics",
+      "count": 83
+    },
+    {
+      "category": "Sports",
+      "count": 83
+    },
+    {
+      "category": "UK Parliament / Politics",
+      "count": 45
+    },
+    {
+      "category": "US Stocks",
+      "count": 45
+    },
+    {
+      "category": "AI",
+      "count": 42
+    },
+    {
+      "category": "Hong Kong Entertainment",
+      "count": 19
+    },
+    {
+      "category": "Crypto",
+      "count": 12
+    },
+    {
+      "category": "Precious Metals",
+      "count": 7
+    },
+    {
+      "category": "US News",
+      "count": 4
+    },
+    {
+      "category": "Technology",
+      "count": 1
+    }
+  ],
+  "db": {
+    "schema_version": "6"
+  },
+  "db_path": "/home/fol2hk/.openclaw/data/newsroom/news_pool.sqlite3",
+  "events": {
+    "avg_link_count_root": 2.0229885057471266,
+    "max_link_count_root": 98,
+    "p50_link_count_root": 1,
+    "p90_link_count_root": 3,
+    "posted_events": 151,
+    "posted_missing_run_id": 5,
+    "posted_missing_thread_id": 0,
+    "root_events_posted": 69,
+    "root_events_total": 1218,
+    "root_events_unposted": 1149,
+    "total_events": 1690
+  },
+  "generated_at_ts": 1770771648,
+  "generated_at_utc": "2026-02-11T01:00:48Z",
+  "posted_integrity": {
+    "baseline_posted_events": null,
+    "changed": [],
+    "compare_enabled": false,
+    "current_posted_events": null,
+    "missing_event_ids": [],
+    "ok": null
+  },
+  "schema_version": "news_pool_metrics_v1"
+}

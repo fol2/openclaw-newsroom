@@ -51,6 +51,13 @@ _HEADERS_BASE = {
 
 _PROVIDER = "google-gemini-cli"
 
+# HTTP timeouts (seconds).
+# These are intentionally configurable for one-off maintenance runs where prompts
+# may be larger than usual and SSE responses can take longer.
+_HTTP_TIMEOUT_CONNECT_S = int(os.environ.get("GEMINI_HTTP_CONNECT_TIMEOUT_SECONDS", "10"))
+_HTTP_TIMEOUT_READ_S = int(os.environ.get("GEMINI_HTTP_READ_TIMEOUT_SECONDS", "30"))
+_HTTP_TIMEOUT = (_HTTP_TIMEOUT_CONNECT_S, _HTTP_TIMEOUT_READ_S)
+
 # OAuth2 credentials — defaults are the public "installed app" values from gemini-cli.
 # Override via GEMINI_OAUTH_CLIENT_ID / GEMINI_OAUTH_CLIENT_SECRET env vars if needed.
 _OAUTH_CLIENT_ID = os.environ.get(
@@ -549,7 +556,7 @@ class GeminiClient:
 
         try:
             resp = requests.post(
-                _ENDPOINT, headers=headers, json=body, stream=True, timeout=(10, 30)
+                _ENDPOINT, headers=headers, json=body, stream=True, timeout=_HTTP_TIMEOUT
             )
         except Exception as e:
             logger.warning("Gemini request failed: %s", e)
@@ -624,7 +631,7 @@ class GeminiClient:
             "generationConfig": {"temperature": 0.1},
         }
         try:
-            resp = requests.post(url, json=body, timeout=(10, 30))
+            resp = requests.post(url, json=body, timeout=_HTTP_TIMEOUT)
         except Exception as e:
             logger.warning("Gemini API key request failed: %s", e)
             return None
