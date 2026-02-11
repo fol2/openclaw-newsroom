@@ -1114,33 +1114,82 @@ def parse_merge_response(
     return valid_groups if valid_groups else None
 
 
-def _find_cross_category_duplicates(
+def _cross_category_pairs_by_retrieval(
     events: list[dict[str, Any]],
     *,
-    min_anchor_overlap: int = 2,
     token_cache: dict[int, EventTokens] | None = None,
-) -> list[tuple[int, int]]:
-    """Find event pairs across different categories with high anchor overlap."""
+    drop_high_df: set[str] | None = None,
+    min_score: float = 0.25,
+    top_k: int = 10,
+    max_pairs: int = 300,
+) -> list[tuple[int, int, float]]:
+    """Return likely duplicate event pairs across different categories via retrieval.
+
+    This mirrors the retrieve-then-decide approach in scripts/recluster_events.py,
+    but restricts candidate generation to cross-category pairs only.
+    """
+    # Return cross-category event pairs for LLM confirmation, sorted by score desc.
+    #
+    # Args:
+    #   drop_high_df: Optional high-document-frequency token drop set for precision.
+    #   min_score: Minimum retrieval score for a pair to be included.
+    #   top_k: Maximum candidates to keep per event query.
+    #   max_pairs: Global cap on pair count to avoid excessive LLM calls.
     if token_cache is None:
         token_cache = {}
-    pairs: list[tuple[int, int]] = []
+
+    drop_high_df = drop_high_df or set()
+    drop_high_df_sig = _drop_high_df_signature(drop_high_df)
+
+    pairs: list[tuple[int, int, float]] = []
+
     for i, ev_a in enumerate(events):
         aid = ev_a.get("id", 0)
-        if aid not in token_cache:
-            token_cache[aid] = _tokenize_event(ev_a)
-        a_tok = token_cache[aid]
+        if not isinstance(aid, int) or aid <= 0:
+            continue
+
         cat_a = ev_a.get("category") or ""
-        for ev_b in events[i + 1:]:
-            cat_b = ev_b.get("category") or ""
-            if cat_a == cat_b:
-                continue
+        summary = str(ev_a.get("summary_en") or ev_a.get("title") or "").strip()
+        if not summary:
+            continue
+
+        title = str(ev_a.get("title") or "").strip()
+        link_like: dict[str, Any] = {
+            "title": summary,
+            "description": title,
+        }
+
+        # Dedup pairs by only comparing against later events.
+        others = [
+            ev for ev in events[i + 1 :]
+            if (ev.get("category") or "") != cat_a
+        ]
+        if not others:
+            continue
+
+        candidates = retrieve_candidates(
+            link_like,
+            others,
+            top_k=top_k,
+            min_score=min_score,
+            token_cache=token_cache,
+            drop_high_df=drop_high_df,
+            drop_high_df_sig=drop_high_df_sig,
+        )
+        for ev_b, score in candidates:
             bid = ev_b.get("id", 0)
-            if bid not in token_cache:
-                token_cache[bid] = _tokenize_event(ev_b)
-            b_tok = token_cache[bid]
-            overlap = a_tok.anchor_tokens & b_tok.anchor_tokens
-            if len(overlap) >= min_anchor_overlap:
-                pairs.append((aid, bid))
+            if not isinstance(bid, int) or bid <= 0:
+                continue
+            pairs.append((aid, bid, float(score)))
+
+        # Keep the list bounded for large pools.
+        if max_pairs > 0 and len(pairs) >= max_pairs * 3:
+            pairs.sort(key=lambda x: (-x[2], x[0], x[1]))
+            pairs = pairs[:max_pairs]
+
+    pairs.sort(key=lambda x: (-x[2], x[0], x[1]))
+    if max_pairs > 0:
+        pairs = pairs[:max_pairs]
     return pairs
 
 
@@ -1237,12 +1286,20 @@ def merge_events(
 
     # --- Cross-category merge pass ---
     token_cache: dict[int, EventTokens] = {}
-    cross_pairs = _find_cross_category_duplicates(root_events, token_cache=token_cache)
+    drop_high_df = _compute_drop_high_df(root_events)
+    cross_pairs = _cross_category_pairs_by_retrieval(
+        root_events,
+        token_cache=token_cache,
+        drop_high_df=drop_high_df,
+        min_score=0.25,
+        top_k=10,
+        max_pairs=300,
+    )
     stats["cross_category_pairs"] = len(cross_pairs)
     ev_lookup_all = {ev["id"]: ev for ev in root_events}
     merged_ids: set[int] = set()
 
-    for aid, bid in cross_pairs:
+    for aid, bid, _score in cross_pairs:
         if aid in merged_ids or bid in merged_ids:
             continue
         ev_a = ev_lookup_all.get(aid)
