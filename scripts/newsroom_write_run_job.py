@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from shutil import which
@@ -18,12 +19,21 @@ sys.path.insert(0, str(OPENCLAW_HOME))
 from newsroom.brave_news import normalize_url  # noqa: E402
 from newsroom.job_store import atomic_write_json  # noqa: E402
 from newsroom.lang_hint import normalise_lang_hint  # noqa: E402
+from newsroom.news_pool_db import _domain_from_url, _domain_tier, _normalise_domain  # noqa: E402
 from newsroom.prompt_policy import prompt_id_for_category  # noqa: E402
 
 
 _TRIGGER_ALIASES = {"manual_run": "manual"}
 _VALID_TRIGGERS = {"cron_hourly", "cron_daily", "manual"}
 _MIN_TIMEOUT_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class WriterQualityGate:
+    enabled: bool = True
+    min_unique_domains: int = 2
+    min_trusted_domains_tier_1: int = 1
+    min_mid_tier_domains_tier_2: int = 2
 
 
 def _is_snowflake(v: str) -> bool:
@@ -135,6 +145,99 @@ def _candidate_by_index(inputs_obj: dict[str, Any]) -> dict[int, dict[str, Any]]
     return idx
 
 
+def _candidate_domains(c: dict[str, Any]) -> list[str]:
+    domains: set[str] = set()
+    raw_domains = c.get("domains")
+    if isinstance(raw_domains, list):
+        for d in raw_domains:
+            nd = _normalise_domain(str(d))
+            if nd:
+                domains.add(nd)
+
+    primary_domain = _domain_from_url(c.get("primary_url"))
+    if primary_domain:
+        domains.add(primary_domain)
+
+    supporting_raw = c.get("supporting_urls")
+    if isinstance(supporting_raw, list):
+        for u in supporting_raw:
+            sd = _domain_from_url(str(u))
+            if sd:
+                domains.add(sd)
+
+    return sorted(domains)
+
+
+def _domain_tier_counts(c: dict[str, Any], *, domains: list[str]) -> dict[str, int]:
+    raw = c.get("domain_tier_counts")
+    out: dict[str, int] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k.strip():
+                continue
+            iv = _as_int(v)
+            if iv is None or iv <= 0:
+                continue
+            out[k.strip()] = int(iv)
+    if out:
+        return out
+
+    for d in domains:
+        tier = _domain_tier(d)
+        out[tier] = out.get(tier, 0) + 1
+    return out
+
+
+def _evaluate_writer_quality_gate(c: dict[str, Any], *, gate: WriterQualityGate) -> dict[str, Any]:
+    domains = _candidate_domains(c)
+    tier_counts = _domain_tier_counts(c, domains=domains)
+
+    unique_domain_count = _as_int(c.get("unique_domain_count"))
+    if unique_domain_count is None or unique_domain_count < 0:
+        unique_domain_count = len(domains)
+
+    tier_1_count = max(0, int(tier_counts.get("tier_1") or 0))
+    tier_2_count = max(0, int(tier_counts.get("tier_2") or 0))
+
+    if not gate.enabled:
+        return {
+            "passed": True,
+            "reason": None,
+            "domains": domains,
+            "unique_domain_count": int(unique_domain_count),
+            "tier_1_count": tier_1_count,
+            "tier_2_count": tier_2_count,
+            "tier_counts": tier_counts,
+        }
+
+    passes_diversity = int(unique_domain_count) >= int(gate.min_unique_domains)
+    passes_trust = tier_1_count >= int(gate.min_trusted_domains_tier_1)
+    passes_mid_tier = tier_2_count >= int(gate.min_mid_tier_domains_tier_2)
+    passed = bool(passes_diversity and (passes_trust or passes_mid_tier))
+
+    reason: str | None = None
+    if not passed:
+        domains_desc = ", ".join(domains) if domains else "-"
+        reason = (
+            "source_quality_gate_failed: "
+            f"requires unique_domains>={gate.min_unique_domains} and "
+            f"(trusted_domains_tier_1>={gate.min_trusted_domains_tier_1} "
+            f"or mid_tier_domains_tier_2>={gate.min_mid_tier_domains_tier_2}); "
+            f"got unique_domains={int(unique_domain_count)}, "
+            f"tier_1={tier_1_count}, tier_2={tier_2_count}, domains={domains_desc}"
+        )
+
+    return {
+        "passed": passed,
+        "reason": reason,
+        "domains": domains,
+        "unique_domain_count": int(unique_domain_count),
+        "tier_1_count": tier_1_count,
+        "tier_2_count": tier_2_count,
+        "tier_counts": tier_counts,
+    }
+
+
 def _launch_runner_background(*, openclaw_home: Path, run_dir: Path) -> int:
     runner = openclaw_home / "scripts" / "newsroom_runner.py"
     if not runner.exists():
@@ -187,6 +290,25 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--stop-run-on-failure", action="store_true", help="Stop spawning new stories on first failure.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing run folder if present.")
     parser.add_argument("--launch-runner", action="store_true", help="Launch the deterministic runner in the background after writing files.")
+    parser.add_argument(
+        "--quality-gate-min-unique-domains",
+        type=int,
+        default=2,
+        help="Writer quality gate: minimum unique domains before writing (default: 2).",
+    )
+    parser.add_argument(
+        "--quality-gate-min-trusted-domains",
+        type=int,
+        default=1,
+        help="Writer quality gate: minimum tier_1 trusted domains (default: 1).",
+    )
+    parser.add_argument(
+        "--quality-gate-min-mid-tier-domains",
+        type=int,
+        default=2,
+        help="Writer quality gate: minimum tier_2 mid-tier domains (default: 2).",
+    )
+    parser.add_argument("--disable-quality-gate", action="store_true", help="Disable writer source-quality gate.")
     args = parser.parse_args(argv)
 
     channel_id = str(args.channel_id).strip()
@@ -221,6 +343,13 @@ def main(argv: list[str]) -> int:
     if len(picks) != expected:
         raise SystemExit(f"Expected exactly {expected} --pick values, got {len(picks)}")
 
+    quality_gate = WriterQualityGate(
+        enabled=not bool(args.disable_quality_gate),
+        min_unique_domains=max(0, int(args.quality_gate_min_unique_domains)),
+        min_trusted_domains_tier_1=max(0, int(args.quality_gate_min_trusted_domains)),
+        min_mid_tier_domains_tier_2=max(0, int(args.quality_gate_min_mid_tier_domains)),
+    )
+
     selected: list[dict[str, Any]] = []
     for i in picks:
         c = by_i.get(int(i))
@@ -228,9 +357,33 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"--pick {i} not found in candidates list")
         selected.append(c)
 
+    selected_for_write: list[tuple[int, dict[str, Any]]] = []
+    held_candidates: list[dict[str, Any]] = []
+    for pick_i, c in zip(picks, selected):
+        gate_result = _evaluate_writer_quality_gate(c, gate=quality_gate)
+        if gate_result["passed"]:
+            selected_for_write.append((pick_i, c))
+            continue
+
+        held = {
+            "pick": int(pick_i),
+            "title": str(c.get("title") or "").strip() or "Untitled",
+            "primary_url": str(c.get("primary_url") or "").strip(),
+            "reason": gate_result["reason"],
+            "metrics": {
+                "unique_domain_count": gate_result["unique_domain_count"],
+                "tier_1_count": gate_result["tier_1_count"],
+                "tier_2_count": gate_result["tier_2_count"],
+                "tier_counts": gate_result["tier_counts"],
+                "domains": gate_result["domains"],
+            },
+        }
+        held_candidates.append(held)
+        print(f"HOLD pick={held['pick']} title={held['title']!r} reason={held['reason']}", file=sys.stderr)
+
     # Enforce uniqueness within the run (avoid accidental double-picks).
     seen_keys: set[str] = set()
-    for c in selected:
+    for _, c in selected_for_write:
         dk = (
             _norm_dedupe_key(c.get("semantic_event_key"))
             or _norm_dedupe_key(c.get("event_key"))
@@ -264,15 +417,26 @@ def main(argv: list[str]) -> int:
     }
     atomic_write_json(run_dir / "run.json", run_job)
 
+    holds_log_path: Path | None = None
+    if held_candidates:
+        holds_log_path = run_dir / "held_candidates.jsonl"
+        with holds_log_path.open("a", encoding="utf-8") as f:
+            for row in held_candidates:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(
+            f"INFO: held {len(held_candidates)} candidate(s) by source-quality gate; log={holds_log_path}",
+            file=sys.stderr,
+        )
+
     stories_out: list[dict[str, Any]] = []
-    for n, c in enumerate(selected, start=1):
+    for n, (pick_i, c) in enumerate(selected_for_write, start=1):
         story_id = f"story_{n:02d}"
 
         category = str(c.get("suggested_category") or "Global News").strip() or "Global News"
         title = str(c.get("title") or "").strip() or "Untitled"
         primary_url = str(c.get("primary_url") or "").strip()
         if not primary_url.startswith("http"):
-            raise SystemExit(f"Invalid primary_url for pick {picks[n-1]}: {primary_url!r}")
+            raise SystemExit(f"Invalid primary_url for pick {pick_i}: {primary_url!r}")
 
         supporting_raw = c.get("supporting_urls")
         supporting_list = supporting_raw if isinstance(supporting_raw, list) else []
@@ -365,9 +529,32 @@ def main(argv: list[str]) -> int:
 
     runner_pid = None
     if bool(args.launch_runner):
-        runner_pid = _launch_runner_background(openclaw_home=OPENCLAW_HOME, run_dir=run_dir)
+        if stories_out:
+            runner_pid = _launch_runner_background(openclaw_home=OPENCLAW_HOME, run_dir=run_dir)
+        else:
+            print(
+                "INFO: runner launch skipped because no story passed the writer source-quality gate.",
+                file=sys.stderr,
+            )
 
-    out: dict[str, Any] = {"ok": True, "run_dir": str(run_dir), "run_json": str(run_dir / "run.json"), "stories": stories_out}
+    out: dict[str, Any] = {
+        "ok": True,
+        "run_dir": str(run_dir),
+        "run_json": str(run_dir / "run.json"),
+        "stories": stories_out,
+        "story_count": len(stories_out),
+        "held_count": len(held_candidates),
+        "quality_gate": {
+            "enabled": quality_gate.enabled,
+            "min_unique_domains": quality_gate.min_unique_domains,
+            "min_trusted_domains_tier_1": quality_gate.min_trusted_domains_tier_1,
+            "min_mid_tier_domains_tier_2": quality_gate.min_mid_tier_domains_tier_2,
+        },
+    }
+    if held_candidates:
+        out["held_candidates"] = held_candidates
+    if holds_log_path is not None:
+        out["holds_log_path"] = str(holds_log_path)
     if runner_pid is not None:
         out["runner_launched"] = True
         out["runner_pid"] = int(runner_pid)
