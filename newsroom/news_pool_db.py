@@ -42,6 +42,157 @@ def _parse_page_age_ts(page_age: str | None) -> int | None:
     return int(dt.timestamp())
 
 
+def _clean_alias_text(v: Any, *, max_len: int = 120) -> str | None:
+    if not isinstance(v, (str, int, float)):
+        return None
+    s = " ".join(str(v).strip().split())
+    if not s:
+        return None
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_per_entity: int = 8) -> list[dict[str, Any]]:
+    """Normalise entity aliases into a stable list-of-dicts structure."""
+    parsed = raw
+    if isinstance(parsed, str):
+        s = parsed.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            parsed = [s]
+
+    if isinstance(parsed, dict):
+        parsed = parsed.get("entity_aliases", parsed)
+    if not isinstance(parsed, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    by_label: dict[str, int] = {}
+
+    def _parse_item(item: Any) -> tuple[str | None, list[str]]:
+        if isinstance(item, dict):
+            label = _clean_alias_text(
+                item.get("label")
+                or item.get("entity")
+                or item.get("name")
+                or item.get("canonical")
+            )
+            aliases_raw = item.get("aliases")
+            aliases: list[Any]
+            if isinstance(aliases_raw, list):
+                aliases = aliases_raw
+            elif aliases_raw is None:
+                aliases = []
+            else:
+                aliases = [aliases_raw]
+            for k in ("zh", "zh_hant", "zh_tw", "english", "en"):
+                if k in item:
+                    aliases.append(item.get(k))
+            return label, [_clean_alias_text(v) for v in aliases if _clean_alias_text(v)]
+        label = _clean_alias_text(item)
+        return label, []
+
+    for item in parsed:
+        label, aliases_raw = _parse_item(item)
+        all_terms: list[str] = []
+        seen_terms: set[str] = set()
+
+        if label:
+            seen_terms.add(label.casefold())
+            all_terms.append(label)
+
+        for alias in aliases_raw:
+            low = alias.casefold()
+            if low in seen_terms:
+                continue
+            seen_terms.add(low)
+            all_terms.append(alias)
+            if len(all_terms) >= max_aliases_per_entity:
+                break
+
+        if not all_terms:
+            continue
+
+        canonical = all_terms[0]
+        canonical_key = canonical.casefold()
+        aliases = all_terms[1:]
+
+        existing_idx = by_label.get(canonical_key)
+        if existing_idx is None:
+            if len(out) >= max_entities:
+                break
+            out.append({"label": canonical, "aliases": aliases})
+            by_label[canonical_key] = len(out) - 1
+            continue
+
+        existing = out[existing_idx]
+        existing_aliases = existing.get("aliases")
+        if not isinstance(existing_aliases, list):
+            existing_aliases = []
+        existing_seen = {
+            str(existing.get("label", "")).casefold(),
+            *[str(v).casefold() for v in existing_aliases if isinstance(v, str)],
+        }
+        for alias in aliases:
+            low = alias.casefold()
+            if low in existing_seen:
+                continue
+            existing_seen.add(low)
+            existing_aliases.append(alias)
+            if len(existing_aliases) >= max_aliases_per_entity:
+                break
+        existing["aliases"] = existing_aliases
+
+    return out
+
+
+def _entity_aliases_to_json(raw: Any) -> str | None:
+    aliases = _normalise_entity_aliases(raw)
+    if not aliases:
+        return None
+    return json.dumps(aliases, ensure_ascii=False, separators=(",", ":"))
+
+
+def _entity_aliases_from_json(raw: Any) -> list[dict[str, Any]]:
+    return _normalise_entity_aliases(raw)
+
+
+def _entity_alias_terms(raw: Any, *, max_terms: int = 12) -> list[str]:
+    aliases = _normalise_entity_aliases(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in aliases:
+        label = _clean_alias_text(item.get("label"))
+        if label:
+            low = label.casefold()
+            if low not in seen:
+                seen.add(low)
+                out.append(label)
+                if len(out) >= max_terms:
+                    break
+        raw_aliases = item.get("aliases")
+        if not isinstance(raw_aliases, list):
+            continue
+        for a in raw_aliases:
+            alias = _clean_alias_text(a)
+            if not alias:
+                continue
+            low = alias.casefold()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(alias)
+            if len(out) >= max_terms:
+                break
+        if len(out) >= max_terms:
+            break
+    return out
+
+
 @dataclass(frozen=True)
 class PoolLink:
     url: str
@@ -104,6 +255,7 @@ class NewsPoolDB:
             self._create_all_tables_v5(cur)
             self._create_clustering_decisions_tables(cur)
             self._ensure_links_skip_cluster_columns(cur)
+            self._ensure_events_entity_aliases_column(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -111,6 +263,7 @@ class NewsPoolDB:
             # Auxiliary tables should exist regardless of schema_version.
             self._create_clustering_decisions_tables(cur)
             self._ensure_links_skip_cluster_columns(cur)
+            self._ensure_events_entity_aliases_column(cur)
             return
 
         if schema <= 4:
@@ -121,6 +274,7 @@ class NewsPoolDB:
             self._migrate_to_v6(cur)
             self._create_clustering_decisions_tables(cur)
             self._ensure_links_skip_cluster_columns(cur)
+            self._ensure_events_entity_aliases_column(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -277,6 +431,11 @@ class NewsPoolDB:
             "WHERE skip_clustered_at_ts IS NOT NULL;"
         )
 
+    def _ensure_events_entity_aliases_column(self, cur: sqlite3.Cursor) -> None:
+        """Ensure events can persist entity aliases as JSON text."""
+        if not self._column_exists(cur, "events", "entity_aliases_json"):
+            cur.execute("ALTER TABLE events ADD COLUMN entity_aliases_json TEXT;")
+
     def _create_events_table_v5(self, cur: sqlite3.Cursor) -> None:
         """Create the new event-centric events table (v5+v6 columns)."""
         cur.execute(
@@ -300,6 +459,7 @@ class NewsPoolDB:
               posted_at_ts INTEGER,
               thread_id TEXT,
               run_id TEXT,
+              entity_aliases_json TEXT,
               model TEXT,
               reserved_until_ts INTEGER
             );
@@ -751,19 +911,21 @@ class NewsPoolDB:
         primary_url: str | None = None,
         parent_event_id: int | None = None,
         development: str | None = None,
+        entity_aliases: Any | None = None,
         model: str | None = None,
     ) -> int:
         """Insert a new event. Returns the event id."""
         now = _utc_now_ts()
         expires = now + _DEFAULT_TTL_SECONDS
+        aliases_json = _entity_aliases_to_json(entity_aliases)
         cur = self._conn.cursor()
         cur.execute(
             """
             INSERT INTO events (
               parent_event_id, category, jurisdiction, summary_en, development,
-              title, primary_url, link_count, best_published_ts,
+              title, primary_url, link_count, best_published_ts, entity_aliases_json,
               status, created_at_ts, updated_at_ts, expires_at_ts, model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, 'new', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, 'new', ?, ?, ?, ?)
             """,
             (
                 parent_event_id,
@@ -773,6 +935,7 @@ class NewsPoolDB:
                 development,
                 title,
                 primary_url,
+                aliases_json,
                 now,
                 now,
                 expires,
@@ -794,7 +957,11 @@ class NewsPoolDB:
         """Get a single event by id."""
         cur = self._conn.cursor()
         row = cur.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        out = dict(row)
+        out["entity_aliases"] = _entity_aliases_from_json(out.get("entity_aliases_json"))
+        return out
 
     def get_all_fresh_events(
         self,
@@ -827,7 +994,7 @@ class NewsPoolDB:
             """
             SELECT id, parent_event_id, category, jurisdiction, summary_en,
                    development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts,
+                   status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json,
                    posted_at_ts, thread_id, run_id
             FROM events
             WHERE parent_event_id IS NULL
@@ -851,7 +1018,7 @@ class NewsPoolDB:
             """
             SELECT id, parent_event_id, category, jurisdiction, summary_en,
                    development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts,
+                   status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json,
                    posted_at_ts, thread_id, run_id
             FROM events
             WHERE parent_event_id IS NULL
@@ -864,7 +1031,12 @@ class NewsPoolDB:
         ).fetchall()
 
         rows = list(unposted_rows) + list(posted_rows)
-        return [dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            item["entity_aliases"] = _entity_aliases_from_json(item.get("entity_aliases_json"))
+            out.append(item)
+        return out
 
     def get_root_event_id(self, event_id: int) -> int:
         """Walk parent_event_id chain to root. Returns event_id itself if already root."""
@@ -891,14 +1063,19 @@ class NewsPoolDB:
             """
             SELECT id, parent_event_id, category, jurisdiction, summary_en,
                    development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts
+                   status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json
             FROM events
             WHERE expires_at_ts > ?
             ORDER BY created_at_ts DESC
             """,
             (now,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            item["entity_aliases"] = _entity_aliases_from_json(item.get("entity_aliases_json"))
+            out.append(item)
+        return out
 
     def prune_expired_events(self, *, max_age_hours: int = 72, now_ts: int | None = None) -> int:
         """Delete events that are expired AND older than max_age_hours.
@@ -967,7 +1144,7 @@ class NewsPoolDB:
                 """
                 SELECT id, parent_event_id, category, jurisdiction, summary_en,
                        development, title, primary_url, link_count, best_published_ts,
-                       status, created_at_ts, updated_at_ts, expires_at_ts
+                       status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json
                 FROM events
                 WHERE status IN ('new', 'active')
                   AND expires_at_ts > ?
@@ -1085,7 +1262,7 @@ class NewsPoolDB:
                 """
                 SELECT id, parent_event_id, category, jurisdiction, summary_en,
                        development, title, primary_url, link_count, best_published_ts,
-                       status, created_at_ts, updated_at_ts, expires_at_ts
+                       status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json
                 FROM events
                 WHERE status IN ('new', 'active')
                   AND expires_at_ts > ?
@@ -1185,8 +1362,11 @@ class NewsPoolDB:
             c["semantic_event_key"] = f"event:{root_eid}"
             c["anchor_key"] = f"event:{root_eid}"
             c["cluster_size"] = c.get("link_count") or 0
-            c["cluster_terms"] = []
-            c["anchor_terms"] = []
+            aliases = _entity_aliases_from_json(c.get("entity_aliases_json"))
+            alias_terms = _entity_alias_terms(aliases, max_terms=12)
+            c["entity_aliases"] = aliases
+            c["cluster_terms"] = list(alias_terms)
+            c["anchor_terms"] = list(alias_terms[:8])
             c["suggest_flags"] = []
             c["event_id"] = eid
 
@@ -1257,6 +1437,14 @@ class NewsPoolDB:
             ).fetchone()
             best_pub = row["bp"] if row else None
             best_exp = row["ex"] if row else None
+            alias_rows = cur.execute(
+                f"SELECT entity_aliases_json FROM events WHERE id IN (?, {placeholders})",
+                [winner_id] + loser_ids,
+            ).fetchall()
+            merged_aliases: list[dict[str, Any]] = []
+            for arow in alias_rows:
+                merged_aliases.extend(_entity_aliases_from_json(arow["entity_aliases_json"]))
+            merged_aliases_json = _entity_aliases_to_json(merged_aliases)
 
             # 5. Update winner: link_count, timestamps, promote if multi-link.
             new_status_expr = "CASE WHEN ? > 1 AND status = 'new' THEN 'active' ELSE status END"
@@ -1266,11 +1454,20 @@ class NewsPoolDB:
                   link_count = ?,
                   best_published_ts = ?,
                   expires_at_ts = ?,
+                  entity_aliases_json = ?,
                   updated_at_ts = ?,
                   status = {new_status_expr}
                 WHERE id = ?
                 """,
-                (actual_link_count, best_pub, best_exp, now, actual_link_count, winner_id),
+                (
+                    actual_link_count,
+                    best_pub,
+                    best_exp,
+                    merged_aliases_json,
+                    now,
+                    actual_link_count,
+                    winner_id,
+                ),
             )
 
             # 6. Delete losers.

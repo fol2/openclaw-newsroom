@@ -75,6 +75,156 @@ def _normalise_category(raw: str | None) -> str:
     return "Global News"
 
 
+def _clean_alias_text(v: Any, *, max_len: int = 120) -> str | None:
+    if not isinstance(v, (str, int, float)):
+        return None
+    s = " ".join(str(v).strip().split())
+    if not s:
+        return None
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_per_entity: int = 8) -> list[dict[str, Any]]:
+    """Normalise model-provided entity aliases to a stable list[dict] shape.
+
+    Output shape:
+      [{"label": "<canonical>", "aliases": ["<alias1>", ...]}, ...]
+    """
+    parsed = raw
+    if isinstance(parsed, str):
+        s = parsed.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            parsed = [s]
+
+    if isinstance(parsed, dict):
+        parsed = parsed.get("entity_aliases", parsed)
+
+    if not isinstance(parsed, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    by_label: dict[str, int] = {}
+
+    def _parse_item(item: Any) -> tuple[str | None, list[str]]:
+        if isinstance(item, dict):
+            label = _clean_alias_text(
+                item.get("label")
+                or item.get("entity")
+                or item.get("name")
+                or item.get("canonical")
+            )
+            aliases_raw = item.get("aliases")
+            aliases: list[Any]
+            if isinstance(aliases_raw, list):
+                aliases = aliases_raw
+            elif aliases_raw is None:
+                aliases = []
+            else:
+                aliases = [aliases_raw]
+            for k in ("zh", "zh_hant", "zh_tw", "english", "en"):
+                if k in item:
+                    aliases.append(item.get(k))
+            return label, [_clean_alias_text(v) for v in aliases if _clean_alias_text(v)]
+        label = _clean_alias_text(item)
+        return label, []
+
+    for item in parsed:
+        label, aliases_raw = _parse_item(item)
+        all_terms: list[str] = []
+        seen_terms: set[str] = set()
+
+        if label:
+            seen_terms.add(label.casefold())
+            all_terms.append(label)
+
+        for a in aliases_raw:
+            low = a.casefold()
+            if low in seen_terms:
+                continue
+            seen_terms.add(low)
+            all_terms.append(a)
+            if len(all_terms) >= max_aliases_per_entity:
+                break
+
+        if not all_terms:
+            continue
+
+        canonical = all_terms[0]
+        canonical_key = canonical.casefold()
+        aliases = all_terms[1:]
+
+        existing_idx = by_label.get(canonical_key)
+        if existing_idx is None:
+            if len(out) >= max_entities:
+                break
+            out.append({"label": canonical, "aliases": aliases})
+            by_label[canonical_key] = len(out) - 1
+            continue
+
+        existing = out[existing_idx]
+        existing_aliases = existing.get("aliases")
+        if not isinstance(existing_aliases, list):
+            existing_aliases = []
+        existing_seen = {
+            str(existing.get("label", "")).casefold(),
+            *[str(v).casefold() for v in existing_aliases if isinstance(v, str)],
+        }
+        for a in aliases:
+            low = a.casefold()
+            if low in existing_seen:
+                continue
+            existing_seen.add(low)
+            existing_aliases.append(a)
+            if len(existing_aliases) >= max_aliases_per_entity:
+                break
+        existing["aliases"] = existing_aliases
+
+    return out
+
+
+def _entity_alias_surface_forms(event: dict[str, Any], *, max_terms: int = 32) -> list[str]:
+    """Return flattened alias surface forms from an event object."""
+    aliases_obj = event.get("entity_aliases")
+    if aliases_obj is None:
+        aliases_obj = event.get("entity_aliases_json")
+
+    aliases = _normalise_entity_aliases(aliases_obj)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in aliases:
+        label = _clean_alias_text(item.get("label"))
+        if label:
+            low = label.casefold()
+            if low not in seen:
+                seen.add(low)
+                out.append(label)
+                if len(out) >= max_terms:
+                    break
+        raw_aliases = item.get("aliases")
+        if not isinstance(raw_aliases, list):
+            continue
+        for v in raw_aliases:
+            alias = _clean_alias_text(v)
+            if not alias:
+                continue
+            low = alias.casefold()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(alias)
+            if len(out) >= max_terms:
+                break
+        if len(out) >= max_terms:
+            break
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Retrieve-then-decide helpers
 # ---------------------------------------------------------------------------
@@ -128,8 +278,14 @@ def _tokenize_event(event: dict[str, Any], *, drop_high_df: set[str] | None = No
     drop_high_df = drop_high_df or set()
     summary = str(event.get("summary_en") or "").strip()
     title = str(event.get("title") or "").strip()
-    tokens = _si_tokenize_text(summary or title, title if summary else None)
-    anchors = _si_anchor_terms(summary or title, title if summary else None)
+    alias_terms = _entity_alias_surface_forms(event)
+    alias_text = " ".join(alias_terms).strip()
+    primary_text = summary or title
+    if alias_text:
+        primary_text = f"{primary_text} {alias_text}".strip() if primary_text else alias_text
+
+    tokens = _si_tokenize_text(primary_text, title if summary else None)
+    anchors = _si_anchor_terms(primary_text, title if summary else None)
     key = choose_key_tokens(tokens, drop_high_df=drop_high_df)
     return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
 
@@ -444,6 +600,7 @@ Return STRICT JSON:
 {{"action":"new_event",
   "confidence":<0.0-1.0>,
   "summary_en":"<one-sentence English summary>",
+  "entity_aliases":[{{"label":"<entity>","aliases":["<alias 1>","<alias 2>"]}}],
   "category":"<category>","jurisdiction":"<jurisdiction>",
   "link_flags":[],
   "match_basis":[]}}
@@ -491,6 +648,7 @@ B) NEW DEVELOPMENT of existing event (significant escalation, verdict, arrest, r
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
+      "entity_aliases":[{{"label":"<entity>","aliases":["<alias 1>","<alias 2>"]}}],
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":["<entity|number|location|time|other>"]}}
@@ -500,6 +658,7 @@ C) NEW EVENT (completely new story, none of the candidates match)
    → {{"action":"new_event",
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
+      "entity_aliases":[{{"label":"<entity>","aliases":["<alias 1>","<alias 2>"]}}],
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":[]}}
@@ -514,6 +673,7 @@ Rules:
 - Match across languages (Chinese headline about same event = same event)
 - Only use ASSIGN if a matching event exists in the candidates above
 - Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty)
+- For NEW_EVENT and DEVELOPMENT, include entity_aliases with bilingual aliases when available (e.g. Chinese + English names)
 - link_flags may include: "roundup", "opinion", "live_updates", "multi_topic"
 - If you are NOT at least 70% sure for ASSIGN or DEVELOPMENT, choose NEW EVENT instead
 - If the link is a roundup/briefing, opinion, live updates, or clearly multi-topic, set link_flags accordingly and choose NEW EVENT
@@ -591,6 +751,7 @@ B) NEW DEVELOPMENT of existing event (significant escalation, result, reversal)
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
+      "entity_aliases":[{{"label":"<entity>","aliases":["<alias 1>","<alias 2>"]}}],
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":["<entity|number|location|time|other>"]}}
@@ -599,6 +760,7 @@ C) NEW EVENT (completely new story)
    → {{"action":"new_event",
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
+      "entity_aliases":[{{"label":"<entity>","aliases":["<alias 1>","<alias 2>"]}}],
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":[]}}
@@ -614,6 +776,7 @@ Rules:
 - Only use ASSIGN if a matching event exists in the list above
 - Do NOT assign to events with status=posted unless it's truly the same event
 - Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty)
+- For NEW_EVENT and DEVELOPMENT, include entity_aliases with bilingual aliases when available (e.g. Chinese + English names)
 - link_flags may include: "roundup", "opinion", "live_updates", "multi_topic"
 - If you are NOT at least 70% sure for ASSIGN or DEVELOPMENT, choose NEW EVENT instead
 - If the link is a roundup/briefing, opinion, live updates, or clearly multi-topic, set link_flags accordingly and choose NEW EVENT
@@ -699,6 +862,7 @@ def parse_clustering_response(
 
     match_basis = _parse_str_list(response.get("match_basis"))
     link_flags = _parse_link_flags(response.get("link_flags"))
+    entity_aliases = _normalise_entity_aliases(response.get("entity_aliases"))
 
     raw_category = str(response.get("category") or "").strip() or None
     category = _normalise_category(raw_category)
@@ -732,6 +896,7 @@ def parse_clustering_response(
             "confidence": confidence,
             "match_basis": match_basis,
             "link_flags": link_flags,
+            "entity_aliases": entity_aliases,
             "summary_en": summary_en,
             "category": category,
             "jurisdiction": jurisdiction,
@@ -758,6 +923,7 @@ def parse_clustering_response(
             "confidence": confidence,
             "match_basis": match_basis,
             "link_flags": link_flags,
+            "entity_aliases": entity_aliases,
         }
 
     elif action in ("new_event", "new"):
@@ -772,6 +938,7 @@ def parse_clustering_response(
             "confidence": confidence,
             "match_basis": match_basis,
             "link_flags": link_flags,
+            "entity_aliases": entity_aliases,
         }
 
     else:
@@ -807,6 +974,7 @@ def parse_clustering_response(
             "confidence": confidence,
             "match_basis": match_basis,
             "link_flags": link_flags,
+            "entity_aliases": entity_aliases,
             "enforcement": {
                 "original_action": str(validated.get("action") or ""),
                 "reasons": override_reasons,
@@ -1003,6 +1171,7 @@ def cluster_link(
             primary_url=link_url,
             parent_event_id=parent_id,
             development=enforced.get("development"),
+            entity_aliases=enforced.get("entity_aliases"),
             model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
@@ -1025,6 +1194,7 @@ def cluster_link(
             jurisdiction=enforced.get("jurisdiction"),
             title=link_title,
             primary_url=link_url,
+            entity_aliases=enforced.get("entity_aliases"),
             model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
