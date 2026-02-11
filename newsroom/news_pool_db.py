@@ -13,7 +13,7 @@ from .lang_hint import detect_link_lang_hint, normalise_lang_hint
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _RESERVATION_SECONDS = 600  # 10 minutes
 
@@ -308,6 +308,10 @@ class NewsPoolDB:
             self._migrate_to_v7(cur)
             schema = 7
 
+        if schema == 7:
+            self._migrate_to_v8(cur)
+            schema = 8
+
         if schema == SCHEMA_VERSION:
             self._ensure_auxiliary_tables(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
@@ -415,7 +419,7 @@ class NewsPoolDB:
         self._ensure_links_skip_cluster_columns(cur)
         self._ensure_links_lang_hint_column(cur)
         self._ensure_events_entity_aliases_column(cur)
-        self._create_event_features_table(cur)
+        self._ensure_event_features_canonical_shape(cur)
         self._backfill_event_features_rows(cur)
 
     def _create_clustering_decisions_tables(self, cur: sqlite3.Cursor) -> None:
@@ -540,14 +544,16 @@ class NewsPoolDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_category ON events(category, status);")
 
     def _create_event_features_table(self, cur: sqlite3.Cursor) -> None:
-        """Create per-event feature rows (one row per event)."""
+        """Create per-event feature rows using the canonical issue #17 shape."""
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS event_features (
               event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
-              features_json TEXT NOT NULL DEFAULT '{}',
-              model TEXT,
-              created_at_ts INTEGER NOT NULL,
+              canonical_summary_en TEXT,
+              entities_json TEXT NOT NULL DEFAULT '[]',
+              key_numbers_json TEXT NOT NULL DEFAULT '[]',
+              flags_json TEXT NOT NULL DEFAULT '[]',
+              time_hints TEXT,
               updated_at_ts INTEGER NOT NULL
             );
             """
@@ -557,20 +563,171 @@ class NewsPoolDB:
             "ON event_features(updated_at_ts);"
         )
 
+    def _ensure_event_features_canonical_shape(self, cur: sqlite3.Cursor) -> None:
+        """Ensure event_features has all required canonical columns."""
+        self._create_event_features_table(cur)
+
+        required_columns: list[tuple[str, str]] = [
+            ("canonical_summary_en", "TEXT"),
+            ("entities_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("key_numbers_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("flags_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("time_hints", "TEXT"),
+            ("updated_at_ts", "INTEGER"),
+        ]
+        for column, sql_type in required_columns:
+            if not self._column_exists(cur, "event_features", column):
+                cur.execute(f"ALTER TABLE event_features ADD COLUMN {column} {sql_type};")
+
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_event_features_updated_at_ts "
+            "ON event_features(updated_at_ts);"
+        )
+
+    @staticmethod
+    def _json_list_text(raw: Any, *, default: str = "[]") -> str:
+        """Convert candidate value into a compact JSON list string."""
+        obj: Any = raw
+        if isinstance(obj, str):
+            s = obj.strip()
+            if not s:
+                return default
+            try:
+                obj = json.loads(s)
+            except Exception:
+                return default
+        if not isinstance(obj, list):
+            return default
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _normalise_time_hints(raw: Any) -> str | None:
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            s = raw.strip()
+            return s or None
+        if isinstance(raw, (list, dict)):
+            return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        return None
+
     def _backfill_event_features_rows(self, cur: sqlite3.Cursor, *, now_ts: int | None = None) -> None:
         """Ensure every event has a matching row in event_features."""
         now = _utc_now_ts() if now_ts is None else int(now_ts)
+        has_legacy_payload = self._column_exists(cur, "event_features", "features_json")
+
         cur.execute(
             """
-            INSERT INTO event_features(event_id, features_json, created_at_ts, updated_at_ts)
-            SELECT e.id, '{}', COALESCE(e.created_at_ts, ?), ?
+            INSERT INTO event_features(
+              event_id, canonical_summary_en, entities_json, key_numbers_json, flags_json, time_hints, updated_at_ts
+            )
+            SELECT
+              e.id,
+              COALESCE(e.summary_en, ''),
+              '[]',
+              '[]',
+              '[]',
+              NULL,
+              COALESCE(e.updated_at_ts, ?)
             FROM events AS e
             LEFT JOIN event_features AS ef
               ON ef.event_id = e.id
             WHERE ef.event_id IS NULL
             """,
-            (now, now),
+            (now,),
         )
+
+        cur.execute(
+            """
+            UPDATE event_features
+            SET
+              canonical_summary_en = COALESCE(
+                NULLIF(TRIM(canonical_summary_en), ''),
+                (SELECT COALESCE(summary_en, '') FROM events WHERE events.id = event_features.event_id),
+                ''
+              ),
+              entities_json = CASE
+                WHEN entities_json IS NULL OR TRIM(entities_json) = '' THEN '[]'
+                ELSE entities_json
+              END,
+              key_numbers_json = CASE
+                WHEN key_numbers_json IS NULL OR TRIM(key_numbers_json) = '' THEN '[]'
+                ELSE key_numbers_json
+              END,
+              flags_json = CASE
+                WHEN flags_json IS NULL OR TRIM(flags_json) = '' THEN '[]'
+                ELSE flags_json
+              END,
+              updated_at_ts = COALESCE(
+                updated_at_ts,
+                (SELECT updated_at_ts FROM events WHERE events.id = event_features.event_id),
+                ?
+              )
+            """,
+            (now,),
+        )
+
+        if has_legacy_payload:
+            rows = cur.execute(
+                """
+                SELECT event_id, features_json, canonical_summary_en, entities_json,
+                       key_numbers_json, flags_json, time_hints
+                FROM event_features
+                """
+            ).fetchall()
+            for row in rows:
+                payload_raw = row["features_json"]
+                if not isinstance(payload_raw, str) or not payload_raw.strip():
+                    continue
+                try:
+                    payload = json.loads(payload_raw)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+
+                canonical_summary = row["canonical_summary_en"]
+                candidate = payload.get("canonical_summary_en") or payload.get("summary_en")
+                if isinstance(candidate, str) and candidate.strip():
+                    canonical_summary = candidate.strip()
+                elif not isinstance(canonical_summary, str) or not canonical_summary.strip():
+                    canonical_summary = row["canonical_summary_en"]
+
+                entities_json = row["entities_json"]
+                if not isinstance(entities_json, str) or entities_json.strip() in {"", "[]"}:
+                    entities_json = self._json_list_text(payload.get("entities_json") or payload.get("entities"))
+
+                key_numbers_json = row["key_numbers_json"]
+                if not isinstance(key_numbers_json, str) or key_numbers_json.strip() in {"", "[]"}:
+                    key_numbers_json = self._json_list_text(payload.get("key_numbers_json") or payload.get("key_numbers"))
+
+                flags_json = row["flags_json"]
+                if not isinstance(flags_json, str) or flags_json.strip() in {"", "[]"}:
+                    flags_json = self._json_list_text(payload.get("flags_json") or payload.get("flags"))
+
+                time_hints = row["time_hints"]
+                if not isinstance(time_hints, str) or not time_hints.strip():
+                    time_hints = self._normalise_time_hints(payload.get("time_hints"))
+
+                cur.execute(
+                    """
+                    UPDATE event_features
+                    SET canonical_summary_en = ?,
+                        entities_json = ?,
+                        key_numbers_json = ?,
+                        flags_json = ?,
+                        time_hints = ?
+                    WHERE event_id = ?
+                    """,
+                    (
+                        canonical_summary,
+                        entities_json,
+                        key_numbers_json,
+                        flags_json,
+                        time_hints,
+                        row["event_id"],
+                    ),
+                )
 
     def insert_clustering_decision(
         self,
@@ -743,8 +900,13 @@ class NewsPoolDB:
             cur.execute("ALTER TABLE events ADD COLUMN reserved_until_ts INTEGER;")
 
     def _migrate_to_v7(self, cur: sqlite3.Cursor) -> None:
-        """Migrate from schema v6 to v7: add event_features table and backfill rows."""
-        self._create_event_features_table(cur)
+        """Migrate from schema v6 to v7: add event_features table."""
+        self._ensure_event_features_canonical_shape(cur)
+        self._backfill_event_features_rows(cur)
+
+    def _migrate_to_v8(self, cur: sqlite3.Cursor) -> None:
+        """Migrate from schema v7 to v8: enforce canonical event_features columns."""
+        self._ensure_event_features_canonical_shape(cur)
         self._backfill_event_features_rows(cur)
 
     @staticmethod
@@ -1066,11 +1228,13 @@ class NewsPoolDB:
         if event_id:
             cur.execute(
                 """
-                INSERT INTO event_features(event_id, features_json, created_at_ts, updated_at_ts)
-                VALUES (?, '{}', ?, ?)
+                INSERT INTO event_features(
+                  event_id, canonical_summary_en, entities_json, key_numbers_json, flags_json, time_hints, updated_at_ts
+                )
+                VALUES (?, ?, '[]', '[]', '[]', NULL, ?)
                 ON CONFLICT(event_id) DO NOTHING
                 """,
-                (event_id, now, now),
+                (event_id, summary_en, now),
             )
 
         # If this is a development, bump parent's expires_at_ts.
@@ -1095,21 +1259,36 @@ class NewsPoolDB:
     def ensure_event_features_row(self, *, event_id: int, now_ts: int | None = None) -> None:
         """Create an empty event_features row if missing (idempotent)."""
         now = _utc_now_ts() if now_ts is None else int(now_ts)
+        ev_row = self._conn.execute(
+            "SELECT summary_en, updated_at_ts FROM events WHERE id = ?",
+            (int(event_id),),
+        ).fetchone()
+        summary_en = str(ev_row["summary_en"]) if ev_row and ev_row["summary_en"] is not None else ""
+        updated_at_ts = int(ev_row["updated_at_ts"]) if ev_row and ev_row["updated_at_ts"] is not None else now
         self._conn.execute(
             """
-            INSERT INTO event_features(event_id, features_json, created_at_ts, updated_at_ts)
-            VALUES (?, '{}', ?, ?)
+            INSERT INTO event_features(
+              event_id, canonical_summary_en, entities_json, key_numbers_json, flags_json, time_hints, updated_at_ts
+            )
+            VALUES (?, ?, '[]', '[]', '[]', NULL, ?)
             ON CONFLICT(event_id) DO NOTHING
             """,
-            (int(event_id), now, now),
+            (int(event_id), summary_en, updated_at_ts),
         )
 
     def get_event_features(self, *, event_id: int) -> dict[str, Any] | None:
-        """Get the event_features row and parsed features payload for an event."""
+        """Get the event_features row using canonical issue #17 fields."""
         cur = self._conn.cursor()
         row = cur.execute(
             """
-            SELECT event_id, features_json, model, created_at_ts, updated_at_ts
+            SELECT
+              event_id,
+              canonical_summary_en,
+              entities_json,
+              key_numbers_json,
+              flags_json,
+              time_hints,
+              updated_at_ts
             FROM event_features
             WHERE event_id = ?
             """,
@@ -1118,12 +1297,19 @@ class NewsPoolDB:
         if not row:
             return None
         out = dict(row)
-        payload = out.get("features_json")
-        try:
-            parsed = json.loads(payload) if isinstance(payload, str) and payload else {}
-        except Exception:
-            parsed = {}
-        out["features"] = parsed if isinstance(parsed, dict) else {}
+
+        def _parse_json_list(raw: Any) -> list[Any]:
+            if not isinstance(raw, str):
+                return []
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return []
+            return parsed if isinstance(parsed, list) else []
+
+        out["entities"] = _parse_json_list(out.get("entities_json"))
+        out["key_numbers"] = _parse_json_list(out.get("key_numbers_json"))
+        out["flags"] = _parse_json_list(out.get("flags_json"))
         return out
 
     def get_all_fresh_events(
