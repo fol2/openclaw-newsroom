@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from .lang_hint import detect_link_lang_hint, normalise_lang_hint
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 6
@@ -104,6 +106,7 @@ class NewsPoolDB:
             self._create_all_tables_v5(cur)
             self._create_clustering_decisions_tables(cur)
             self._ensure_links_skip_cluster_columns(cur)
+            self._ensure_links_lang_hint_column(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -111,6 +114,7 @@ class NewsPoolDB:
             # Auxiliary tables should exist regardless of schema_version.
             self._create_clustering_decisions_tables(cur)
             self._ensure_links_skip_cluster_columns(cur)
+            self._ensure_links_lang_hint_column(cur)
             return
 
         if schema <= 4:
@@ -121,6 +125,7 @@ class NewsPoolDB:
             self._migrate_to_v6(cur)
             self._create_clustering_decisions_tables(cur)
             self._ensure_links_skip_cluster_columns(cur)
+            self._ensure_links_lang_hint_column(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
             return
 
@@ -138,6 +143,7 @@ class NewsPoolDB:
               domain TEXT,
               title TEXT,
               description TEXT,
+              lang_hint TEXT,
               age TEXT,
               page_age TEXT,
               first_seen_ts INTEGER NOT NULL,
@@ -276,6 +282,11 @@ class NewsPoolDB:
             "CREATE INDEX IF NOT EXISTS idx_links_skip_clustered_at_ts ON links(skip_clustered_at_ts) "
             "WHERE skip_clustered_at_ts IS NOT NULL;"
         )
+
+    def _ensure_links_lang_hint_column(self, cur: sqlite3.Cursor) -> None:
+        """Ensure links has persisted language hints for clustering prompts."""
+        if not self._column_exists(cur, "links", "lang_hint"):
+            cur.execute("ALTER TABLE links ADD COLUMN lang_hint TEXT;")
 
     def _create_events_table_v5(self, cur: sqlite3.Cursor) -> None:
         """Create the new event-centric events table (v5+v6 columns)."""
@@ -547,7 +558,16 @@ class NewsPoolDB:
         cur = self._conn.cursor()
         for it in links:
             published_at_ts = _parse_page_age_ts(it.page_age)
-            row = cur.execute("SELECT id FROM links WHERE norm_url = ?", (it.norm_url,)).fetchone()
+            row = cur.execute(
+                "SELECT id, lang_hint FROM links WHERE norm_url = ?",
+                (it.norm_url,),
+            ).fetchone()
+            existing_hint = row["lang_hint"] if row else None
+            lang_hint = detect_link_lang_hint(
+                title=it.title,
+                description=it.description,
+                existing_hint=existing_hint,
+            )
             if row:
                 cur.execute(
                     """
@@ -557,6 +577,7 @@ class NewsPoolDB:
                       domain=?,
                       title=?,
                       description=?,
+                      lang_hint=?,
                       age=?,
                       page_age=?,
                       last_seen_ts=?,
@@ -572,6 +593,7 @@ class NewsPoolDB:
                         it.domain,
                         it.title,
                         it.description,
+                        lang_hint,
                         it.age,
                         it.page_age,
                         now_ts,
@@ -587,11 +609,11 @@ class NewsPoolDB:
                 cur.execute(
                     """
                     INSERT INTO links(
-                      url, norm_url, domain, title, description, age, page_age,
+                      url, norm_url, domain, title, description, lang_hint, age, page_age,
                       first_seen_ts, last_seen_ts, seen_count, last_query, last_offset, last_fetched_at_ts,
                       published_at_ts
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                     """,
                     (
                         it.url,
@@ -599,6 +621,7 @@ class NewsPoolDB:
                         it.domain,
                         it.title,
                         it.description,
+                        lang_hint,
                         it.age,
                         it.page_age,
                         now_ts,
@@ -649,7 +672,7 @@ class NewsPoolDB:
         rows = cur.execute(
             """
             SELECT
-              id, url, norm_url, domain, title, description, age, page_age,
+              id, url, norm_url, domain, title, description, lang_hint, age, page_age,
               first_seen_ts, last_seen_ts, seen_count, event_id, published_at_ts
             FROM links
             WHERE last_seen_ts >= ?
@@ -667,7 +690,7 @@ class NewsPoolDB:
         cur = self._conn.cursor()
         rows = cur.execute(
             """
-            SELECT id, url, norm_url, domain, title, description, page_age,
+            SELECT id, url, norm_url, domain, title, description, lang_hint, page_age,
                    first_seen_ts, last_seen_ts, published_at_ts
             FROM links
             WHERE event_id IS NULL
@@ -1154,12 +1177,13 @@ class NewsPoolDB:
 
             # supporting_urls + domains from linked URLs.
             rows = cur.execute(
-                "SELECT url, domain FROM links WHERE event_id = ? ORDER BY published_at_ts DESC",
+                "SELECT url, domain, lang_hint FROM links WHERE event_id = ? ORDER BY published_at_ts DESC",
                 (eid,),
             ).fetchall()
             primary = c.get("primary_url") or ""
             supporting: list[str] = []
             domains: set[str] = set()
+            hint_counts: dict[str, int] = {}
             for r in rows:
                 u = r["url"]
                 d = r["domain"]
@@ -1167,8 +1191,18 @@ class NewsPoolDB:
                     domains.add(d)
                 if u and u != primary:
                     supporting.append(u)
+                hint = normalise_lang_hint(r["lang_hint"])
+                if hint:
+                    hint_counts[hint] = hint_counts.get(hint, 0) + 1
             c["supporting_urls"] = supporting[:4]
             c["domains"] = sorted(domains)
+            if hint_counts:
+                c["lang_hint"] = sorted(
+                    hint_counts.items(),
+                    key=lambda kv: (-kv[1], {"mixed": 0, "zh": 1, "en": 2}.get(kv[0], 3)),
+                )[0][0]
+            else:
+                c["lang_hint"] = "mixed"
 
             # age_minutes from best_published_ts.
             bpt = c.get("best_published_ts")

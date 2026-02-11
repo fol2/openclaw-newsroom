@@ -29,11 +29,12 @@ from newsroom.news_pool_db import NewsPoolDB, PoolLink
 
 class TestBuildClusteringPrompt(unittest.TestCase):
     def test_builds_prompt_with_no_events(self) -> None:
-        link = {"title": "Tesla Q4 earnings beat", "description": "Revenue up 20%"}
+        link = {"title": "Tesla Q4 earnings beat", "description": "Revenue up 20%", "lang_hint": "en"}
         prompt = build_clustering_prompt(link, [])
         self.assertIn("Tesla Q4 earnings beat", prompt)
         self.assertIn("(no fresh events)", prompt)
         self.assertIn("action", prompt)
+        self.assertIn("Language hint: en", prompt)
 
     def test_builds_prompt_with_events(self) -> None:
         link = {"title": "FCA probes Mandelson", "description": "Investigation opened"}
@@ -1100,11 +1101,12 @@ class TestRetrieveCandidates(unittest.TestCase):
 
 class TestBuildFocusedClusteringPrompt(unittest.TestCase):
     def test_no_candidates_prompt(self) -> None:
-        link = {"title": "New volcano erupts", "description": ""}
+        link = {"title": "New volcano erupts", "description": "", "lang_hint": "en"}
         prompt = build_focused_clustering_prompt(link, [])
         self.assertIn("NEW EVENT", prompt)
         self.assertIn("new_event", prompt)
         self.assertNotIn("ASSIGN", prompt)
+        self.assertIn("Language hint: en", prompt)
 
     def test_with_candidates_shows_scores(self) -> None:
         ev = {"id": 42, "summary_en": "Volcano erupted", "category": "Global News",
@@ -1129,6 +1131,13 @@ class TestBuildFocusedClusteringPrompt(unittest.TestCase):
         prompt = build_focused_clustering_prompt({"title": "Test"}, candidates)
         self.assertIn("DEVELOPMENT", prompt)
         self.assertIn("new phase", prompt)
+
+    def test_prompt_derives_language_hint_when_missing(self) -> None:
+        prompt = build_focused_clustering_prompt(
+            {"title": "香港議會通過新法案", "description": "涉及公共開支及社會福利"},
+            [],
+        )
+        self.assertIn("Language hint: zh", prompt)
 
 
 class TestMergeIncludesPosted(unittest.TestCase):

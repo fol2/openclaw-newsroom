@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from newsroom.lang_hint import detect_link_lang_hint, normalise_lang_hint
 from newsroom.story_index import (
     anchor_terms as _si_anchor_terms,
     choose_key_tokens,
@@ -143,6 +144,17 @@ def _tokenize_link(link: dict[str, Any], *, drop_high_df: set[str] | None = None
     anchors = _si_anchor_terms(title, desc)
     key = choose_key_tokens(tokens, drop_high_df=drop_high_df)
     return EventTokens(key_tokens=frozenset(key), anchor_tokens=frozenset(anchors))
+
+
+def _link_lang_hint(link: dict[str, Any]) -> str:
+    """Return persisted link lang hint when available, else derive from text."""
+    persisted = normalise_lang_hint(link.get("lang_hint"))
+    if persisted:
+        return persisted
+    return detect_link_lang_hint(
+        title=str(link.get("title") or ""),
+        description=str(link.get("description") or ""),
+    )
 
 
 _SKIP_CLUSTER_REGEX_RULES: list[tuple[str, list[str]]] = [
@@ -425,10 +437,12 @@ def build_focused_clustering_prompt(
     """
     title = str(link.get("title") or "").strip() or "(no title)"
     desc = str(link.get("description") or "").strip()
+    lang_hint = _link_lang_hint(link)
 
     link_section = f'Title: "{title}"'
     if desc:
         link_section += f'\nDescription: "{desc[:300]}"'
+    link_section += f"\nLanguage hint: {lang_hint}"
 
     categories_str = ", ".join(f'"{c}"' for c in CATEGORY_LIST)
 
@@ -528,10 +542,12 @@ def build_clustering_prompt(
     """Build a one-link-per-prompt clustering prompt for Gemini."""
     title = str(link.get("title") or "").strip() or "(no title)"
     desc = str(link.get("description") or "").strip()
+    lang_hint = _link_lang_hint(link)
 
     link_section = f'Title: "{title}"'
     if desc:
         link_section += f'\nDescription: "{desc[:300]}"'
+    link_section += f"\nLanguage hint: {lang_hint}"
 
     # Build event list with parent-child structure.
     events_section_lines: list[str] = []

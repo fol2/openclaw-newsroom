@@ -17,6 +17,7 @@ sys.path.insert(0, str(OPENCLAW_HOME))
 
 from newsroom.brave_news import normalize_url  # noqa: E402
 from newsroom.job_store import atomic_write_json  # noqa: E402
+from newsroom.lang_hint import normalise_lang_hint  # noqa: E402
 from newsroom.prompt_policy import prompt_id_for_category  # noqa: E402
 
 
@@ -108,6 +109,11 @@ def _concrete_anchor_from_candidate(c: dict[str, Any]) -> str:
         if words:
             return ("Key terms: " + ", ".join(words[:8]))[:220]
     return "See linked sources for details."
+
+
+def _story_lang_hint_from_candidate(c: dict[str, Any]) -> str:
+    hint = normalise_lang_hint(c.get("lang_hint"))
+    return hint or "mixed"
 
 
 def _candidate_by_index(inputs_obj: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -300,6 +306,7 @@ def main(argv: list[str]) -> int:
                 "content_type": "news_deep_dive",
                 "category": category,
                 "title": title,
+                "lang_hint": _story_lang_hint_from_candidate(c),
                 "primary_url": primary_url,
                 "supporting_urls": supporting_urls,
                 "concrete_anchor": _concrete_anchor_from_candidate(c),
@@ -326,6 +333,7 @@ def main(argv: list[str]) -> int:
                     "story_id": "$.story.story_id",
                     "category": "$.story.category",
                     "title": "$.story.title",
+                    "lang_hint": "$.story.lang_hint",
                     "primary_url": "$.story.primary_url",
                     "supporting_urls": "$.story.supporting_urls",
                     "concrete_anchor": "$.story.concrete_anchor",
