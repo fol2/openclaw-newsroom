@@ -35,6 +35,7 @@ dev = [
 
 [project.scripts]
 build-clustering-eval-dataset = "scripts._cli:build_clustering_eval_dataset"
+eval-clustering-metrics = "scripts._cli:eval_clustering_metrics"
 gdelt-pool-update = "scripts._cli:gdelt_pool_update"
 news-pool-status = "scripts._cli:news_pool_status"
 news-pool-update = "scripts._cli:news_pool_update"

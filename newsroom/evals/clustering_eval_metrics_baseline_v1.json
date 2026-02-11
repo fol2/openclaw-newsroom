@@ -1,0 +1,24 @@
+{
+  "dataset": {
+    "path": "newsroom/evals/clustering_eval_dataset_v1.jsonl",
+    "rows": 240,
+    "sha256": "9e23774d645c42c68ae58c1f7fb29c4bd8b6b4db54c8b443acf4ded785d9439b"
+  },
+  "generated_at": "2026-02-11T11:39:36+00:00",
+  "low_score_threshold": 0.22,
+  "metrics": {
+    "duplicate_rate_fragmentation": 0.0,
+    "fragmentation_score": 0.0,
+    "misassignment_rate": 0.1016949152542373,
+    "parse_error_rate": 0.0,
+    "snowball_sink_metric": 0.11864406779661017
+  },
+  "regression_thresholds": {
+    "duplicate_rate_fragmentation": 0.01,
+    "fragmentation_score": 0.01,
+    "misassignment_rate": 0.02,
+    "parse_error_rate": 0.0,
+    "snowball_sink_metric": 0.03
+  },
+  "schema_version": "clustering_eval_metrics_baseline_v1"
+}

@@ -62,6 +62,13 @@ def build_clustering_eval_dataset() -> None:
 def replay_clustering_eval_dataset() -> None:
     from scripts.replay_clustering_eval_dataset import main
     raise SystemExit(main(sys.argv[1:]))
+
+
+def eval_clustering_metrics() -> None:
+    from scripts.eval_clustering_metrics import main
+    raise SystemExit(main(sys.argv[1:]))
+
+
 def rss_pool_update() -> None:
     from scripts.rss_pool_update import main
     raise SystemExit(main(sys.argv[1:]))
