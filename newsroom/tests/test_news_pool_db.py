@@ -1005,6 +1005,287 @@ class TestHourlySelection(unittest.TestCase):
                 self.assertIn("Sports", categories)
 
 
+class TestSourceQualityRanking(unittest.TestCase):
+    @staticmethod
+    def _add_link_to_event(db: NewsPoolDB, *, event_id: int, url: str, page_age: str) -> None:
+        domain = url.split("/", 3)[2]
+        link = PoolLink(
+            url=url,
+            norm_url=url,
+            domain=domain,
+            title="Source",
+            description="Source description",
+            age=None,
+            page_age=page_age,
+            query="test",
+            offset=1,
+            fetched_at_ts=int(time.time()),
+        )
+        db.upsert_links([link])
+        row = db._conn.execute("SELECT id FROM links WHERE norm_url = ?", (url,)).fetchone()
+        assert row is not None
+        db.assign_link_to_event(link_id=int(row["id"]), event_id=event_id)
+
+    def test_daily_ranking_prefers_trusted_diverse_sources_over_link_count(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                low_quality_id = db.create_event(
+                    summary_en="High-volume but low-trust coverage",
+                    category="Global News",
+                    jurisdiction="US",
+                    title="Low trust event",
+                    primary_url="https://x.com/story-low",
+                )
+                trusted_id = db.create_event(
+                    summary_en="Lower-volume but trusted multi-domain coverage",
+                    category="Global News",
+                    jurisdiction="US",
+                    title="Trusted event",
+                    primary_url="https://reuters.com/story-trusted",
+                )
+
+                for i, dom in enumerate(["x.com", "tiktok.com", "youtube.com", "reddit.com", "medium.com", "substack.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=low_quality_id,
+                        url=f"https://{dom}/story-{i}",
+                        page_age=f"2026-02-07T10:0{i}:00",
+                    )
+                for i, dom in enumerate(["reuters.com", "bbc.co.uk", "ft.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=trusted_id,
+                        url=f"https://{dom}/story-{i}",
+                        page_age=f"2026-02-07T10:1{i}:00",
+                    )
+
+                candidates = db.get_daily_candidates(limit=2, now_ts=int(time.time()))
+                self.assertEqual([c["id"] for c in candidates], [trusted_id, low_quality_id])
+
+                trusted = candidates[0]
+                low_quality = candidates[1]
+                self.assertGreater(trusted["trusted_domain_count"], low_quality["trusted_domain_count"])
+                self.assertGreater(trusted["weighted_score"], low_quality["weighted_score"])
+                self.assertGreater(low_quality["link_count"], trusted["link_count"])
+
+    def test_hourly_ranking_prefers_source_quality_when_recency_equal(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                root_id = db.create_event(summary_en="Root event", category="Politics", jurisdiction="UK")
+                low_quality_id = db.create_event(
+                    summary_en="Low-trust development",
+                    category="Politics",
+                    jurisdiction="UK",
+                    parent_event_id=root_id,
+                    development="New low-trust development",
+                    primary_url="https://x.com/dev-low",
+                )
+                trusted_id = db.create_event(
+                    summary_en="Trusted development",
+                    category="Politics",
+                    jurisdiction="UK",
+                    parent_event_id=root_id,
+                    development="New trusted development",
+                    primary_url="https://reuters.com/dev-trusted",
+                )
+
+                # Keep recency equal so source-quality score drives ordering.
+                ts = int(time.time())
+                db._conn.execute(
+                    "UPDATE events SET created_at_ts = ?, updated_at_ts = ? WHERE id IN (?, ?)",
+                    (ts, ts, low_quality_id, trusted_id),
+                )
+
+                for i, dom in enumerate(["x.com", "tiktok.com", "youtube.com", "reddit.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=low_quality_id,
+                        url=f"https://{dom}/dev-{i}",
+                        page_age=f"2026-02-07T09:0{i}:00",
+                    )
+                for i, dom in enumerate(["reuters.com", "bbc.co.uk", "apnews.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=trusted_id,
+                        url=f"https://{dom}/dev-{i}",
+                        page_age=f"2026-02-07T09:1{i}:00",
+                    )
+
+                candidates = db.get_hourly_candidates(limit=2, now_ts=ts)
+                self.assertEqual(candidates[0]["id"], trusted_id)
+                self.assertEqual(candidates[1]["id"], low_quality_id)
+
+    def test_candidate_metrics_include_domain_diversity_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Diversity metrics event",
+                    category="Global News",
+                    jurisdiction="US",
+                    title="Metrics event",
+                    primary_url="https://reuters.com/metrics-primary",
+                )
+                for i, dom in enumerate(["reuters.com", "bbc.co.uk", "x.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=eid,
+                        url=f"https://{dom}/metrics-{i}",
+                        page_age=f"2026-02-07T08:1{i}:00",
+                    )
+
+                candidates = db.get_daily_candidates(limit=1, now_ts=int(time.time()))
+                self.assertEqual(len(candidates), 1)
+                c = candidates[0]
+                self.assertEqual(c["unique_domain_count"], 3)
+                self.assertEqual(c["trusted_domain_count"], 2)
+                self.assertAlmostEqual(float(c["low_tier_ratio"]), 1.0 / 3.0, places=3)
+                self.assertIn("weighted_score", c)
+                self.assertEqual(c.get("domain_tier_counts"), {"tier_1": 2, "tier_3": 1})
+                self.assertIn("roundup_heavy", c)
+                self.assertIn("retrieval_penalty_score", c)
+                self.assertIn("selection_penalty_score", c)
+
+    def test_weighted_link_score_sums_across_links_not_unique_domains(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Repeated trusted links should count repeatedly",
+                    category="Global News",
+                    jurisdiction="US",
+                    title="Repeated links",
+                    primary_url="https://reuters.com/weighted-primary",
+                )
+                # 3x Reuters + 1x X.
+                for i, dom in enumerate(["reuters.com", "reuters.com", "reuters.com", "x.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=eid,
+                        url=f"https://{dom}/weighted-{i}",
+                        page_age=f"2026-02-07T07:1{i}:00",
+                    )
+
+                c = db.get_daily_candidates(limit=1, now_ts=int(time.time()))[0]
+                self.assertEqual(c["unique_domain_count"], 2)
+                # tier_1=3.0, tier_3=0.4 => 3*3.0 + 0.4 = 9.4 (link-level sum)
+                self.assertAlmostEqual(float(c["weighted_link_score"]), 9.4, places=3)
+
+    def test_daily_ranking_order_trusted_then_unique_then_weighted_then_recency(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                now = int(time.time())
+
+                # same trusted and unique as event_a, but more recent
+                event_new = db.create_event(
+                    summary_en="Event new",
+                    category="AI",
+                    jurisdiction="US",
+                    primary_url="https://reuters.com/new-primary",
+                )
+                # same trusted and unique as event_new, lower weighted score
+                event_lower_weight = db.create_event(
+                    summary_en="Event lower weight",
+                    category="Politics",
+                    jurisdiction="UK",
+                    primary_url="https://reuters.com/lw-primary",
+                )
+                # same trusted band as event_lower_trusted, but lower unique-domain count
+                event_lower_unique = db.create_event(
+                    summary_en="Event lower unique",
+                    category="Sports",
+                    jurisdiction="US",
+                    primary_url="https://reuters.com/lu-primary",
+                )
+                # lower trusted-domain count despite high unique domains
+                event_lower_trusted = db.create_event(
+                    summary_en="Event lower trusted",
+                    category="Entertainment",
+                    jurisdiction="US",
+                    primary_url="https://reuters.com/lt-primary",
+                )
+                event_old = db.create_event(
+                    summary_en="Event old",
+                    category="UK News",
+                    jurisdiction="UK",
+                    primary_url="https://reuters.com/old-primary",
+                )
+
+                # event_new: trusted=2 unique=2 weighted=6.0
+                for i, dom in enumerate(["reuters.com", "bbc.co.uk"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=event_new,
+                        url=f"https://{dom}/new-{i}",
+                        page_age=f"2026-02-07T12:1{i}:00",
+                    )
+                # event_old: trusted=2 unique=2 weighted=6.0, but older than event_new
+                for i, dom in enumerate(["reuters.com", "bbc.co.uk"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=event_old,
+                        url=f"https://{dom}/old-{i}",
+                        page_age=f"2026-02-06T12:1{i}:00",
+                    )
+                # event_lower_weight: trusted=2 unique=2 weighted=5.0 (tier1+tier2)
+                for i, dom in enumerate(["reuters.com", "theguardian.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=event_lower_weight,
+                        url=f"https://{dom}/lw-{i}",
+                        page_age=f"2026-02-07T11:1{i}:00",
+                    )
+                # event_lower_unique: trusted=1 unique=1
+                for i in range(3):
+                    self._add_link_to_event(
+                        db,
+                        event_id=event_lower_unique,
+                        url=f"https://reuters.com/lu-{i}",
+                        page_age=f"2026-02-07T10:1{i}:00",
+                    )
+                # event_lower_trusted: trusted=1 unique=4
+                for i, dom in enumerate(["reuters.com", "x.com", "reddit.com", "tiktok.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=event_lower_trusted,
+                        url=f"https://{dom}/lt-{i}",
+                        page_age=f"2026-02-07T09:1{i}:00",
+                    )
+
+                candidates = db.get_daily_candidates(limit=5, now_ts=now)
+                self.assertEqual(
+                    [c["id"] for c in candidates],
+                    [event_new, event_old, event_lower_weight, event_lower_trusted, event_lower_unique],
+                )
+
+    def test_roundup_heavy_boolean_and_penalty_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Roundup-heavy event",
+                    category="Global News",
+                    jurisdiction="US",
+                    primary_url="https://x.com/roundup-primary",
+                )
+                for i, dom in enumerate(["x.com", "reddit.com", "tiktok.com", "reuters.com"]):
+                    self._add_link_to_event(
+                        db,
+                        event_id=eid,
+                        url=f"https://{dom}/roundup-{i}",
+                        page_age=f"2026-02-07T06:1{i}:00",
+                    )
+
+                c = db.get_daily_candidates(limit=1, now_ts=int(time.time()))[0]
+                self.assertTrue(bool(c.get("roundup_heavy")))
+                self.assertGreater(float(c.get("roundup_heavy_ratio", 0.0)), 0.5)
+                self.assertGreater(float(c.get("retrieval_penalty_score", 0.0)), 0.0)
+                self.assertGreater(float(c.get("selection_penalty_score", 0.0)), 0.0)
+
+
 class TestPoolRunsLedger(unittest.TestCase):
     def test_pool_runs_ledger_records_requests(self) -> None:
         with tempfile.TemporaryDirectory() as td:
