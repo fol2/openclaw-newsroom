@@ -83,6 +83,7 @@ def _seed_sample_data(conn: sqlite3.Connection, *, now_ts: int) -> None:
         [
             (1, "https://bbc.co.uk/story-1", "Budget vote passed", "bbc.co.uk", 100),
             (2, "https://reuters.com/story-2", "Model release", "reuters.com", 102),
+            (3, "https://nypost.com/story-3", "Budget rumours", "nypost.com", 100),
         ],
     )
 
@@ -155,6 +156,41 @@ def _seed_sample_data(conn: sqlite3.Connection, *, now_ts: int) -> None:
         ],
     )
 
+    conn.execute(
+        """
+        INSERT INTO clustering_decisions(
+          id, link_id, prompt_sha256, model_name,
+          llm_started_at_ts, llm_finished_at_ts, llm_response_json,
+          validated_action, validated_action_json,
+          enforced_action, enforced_action_json,
+          error_type, error_message, created_at_ts
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            3,
+            3,
+            "sha-3",
+            "gemini-flash",
+            now_ts - 55,
+            now_ts - 54,
+            json.dumps({"action": "assign"}),
+            "assign",
+            json.dumps({"action": "assign", "event_id": 100}),
+            "assign",
+            json.dumps({"action": "assign", "event_id": 100}),
+            None,
+            None,
+            now_ts - 50,
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO clustering_decision_candidates(decision_id, rank, event_id, score) VALUES(?, ?, ?, ?)",
+        [
+            (3, 1, 101, 0.52),
+            (3, 2, 100, 0.41),
+        ],
+    )
+
 
 class TestNewsroomClusteringDecisionsCLI(unittest.TestCase):
     def test_group_by_link_json_includes_similarity_hints(self) -> None:
@@ -175,7 +211,7 @@ class TestNewsroomClusteringDecisionsCLI(unittest.TestCase):
             self.assertEqual(rc, 0)
             payload = json.loads(buf.getvalue())
             self.assertTrue(payload["ok"])
-            self.assertEqual(payload["summary"]["decision_count"], 2)
+            self.assertEqual(payload["summary"]["decision_count"], 3)
             self.assertEqual(payload["group_by"], "link")
 
             decision_1 = next(d for d in payload["decisions"] if d["decision_id"] == 1)
@@ -189,6 +225,10 @@ class TestNewsroomClusteringDecisionsCLI(unittest.TestCase):
             self.assertEqual(link_group_1["decision_count"], 1)
             self.assertEqual(link_group_1["actions"].get("assign"), 1)
             self.assertEqual(link_group_1["hints"].get("assigned_non_top_candidate"), 1)
+
+            decision_3 = next(d for d in payload["decisions"] if d["decision_id"] == 3)
+            self.assertIn("wrong_domain_type_mismatch", decision_3["hints"])
+            self.assertEqual(decision_3["domain_signals"]["domain_type"], "tabloid")
 
     def test_filters_by_event_domain_category_and_time(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -230,6 +270,41 @@ class TestNewsroomClusteringDecisionsCLI(unittest.TestCase):
             group_event_ids = {int(g["event_id"]) for g in payload["groups"]}
             self.assertIn(100, group_event_ids)
 
+            event_links = payload.get("event_link_listing") or {}
+            self.assertEqual(event_links.get("event_id"), 100)
+            self.assertEqual(event_links.get("link_count"), 1)
+            first_link = event_links.get("links")[0]
+            self.assertEqual(first_link["link_id"], 1)
+            self.assertAlmostEqual(float(first_link["event_similarity"]), 0.72, places=3)
+            self.assertEqual(first_link["decision_context"]["decision_id"], 1)
+
+    def test_event_id_lists_assigned_links_sorted_by_similarity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                _create_inspector_schema(conn)
+                _seed_sample_data(conn, now_ts=int(time.time()))
+                conn.commit()
+            finally:
+                conn.close()
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main(["--db", str(db_path), "--json", "--group-by", "event", "--event-id", "100"])
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            event_links = payload.get("event_link_listing") or {}
+            self.assertEqual(event_links.get("event_id"), 100)
+            self.assertEqual(event_links.get("link_count"), 2)
+
+            links = event_links.get("links") or []
+            self.assertEqual([int(item["link_id"]) for item in links], [1, 3])
+            self.assertGreater(float(links[0]["event_similarity"]), float(links[1]["event_similarity"]))
+            self.assertEqual(links[0]["decision_context"]["action"], "assign")
+            self.assertIn("wrong_domain_type_mismatch", links[1]["decision_context"]["hints"])
+
     def test_human_readable_event_view(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
@@ -250,6 +325,14 @@ class TestNewsroomClusteringDecisionsCLI(unittest.TestCase):
             self.assertIn("Decision Log Inspector", text)
             self.assertIn("By event:", text)
             self.assertIn("event#100", text)
+
+            buf2 = io.StringIO()
+            with redirect_stdout(buf2):
+                rc2 = cli.main(["--db", str(db_path), "--group-by", "event", "--event-id", "100", "--limit", "5"])
+            self.assertEqual(rc2, 0)
+            text2 = buf2.getvalue()
+            self.assertIn("Assigned links for event#100", text2)
+            self.assertIn("event_similarity=", text2)
 
     def test_graceful_fallback_when_decision_logs_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
