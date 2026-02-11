@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from .lang_hint import detect_link_lang_hint, normalise_lang_hint
 
@@ -18,6 +20,116 @@ SCHEMA_VERSION = 8
 _RESERVATION_SECONDS = 600  # 10 minutes
 
 _DEFAULT_TTL_SECONDS = 48 * 3600  # 48 hours
+
+# Domain trust tiers for source-quality aware candidate ranking.
+#
+# - tier_1: globally trusted wire/services and established broadsheets.
+# - tier_2: generally reliable mainstream outlets.
+# - tier_3: low-trust/user-generated platforms (penalised in ranking).
+_DOMAIN_TRUST_TIER_SUFFIXES: dict[str, frozenset[str]] = {
+    "tier_1": frozenset(
+        {
+            "apnews.com",
+            "bbc.co.uk",
+            "bbc.com",
+            "bloomberg.com",
+            "economist.com",
+            "ft.com",
+            "nytimes.com",
+            "reuters.com",
+            "wsj.com",
+        }
+    ),
+    "tier_2": frozenset(
+        {
+            "abc.net.au",
+            "aljazeera.com",
+            "cnn.com",
+            "cnbc.com",
+            "forbes.com",
+            "independent.co.uk",
+            "news.sky.com",
+            "npr.org",
+            "telegraph.co.uk",
+            "theguardian.com",
+            "washingtonpost.com",
+        }
+    ),
+    "tier_3": frozenset(
+        {
+            "blogspot.com",
+            "instagram.com",
+            "medium.com",
+            "reddit.com",
+            "substack.com",
+            "tiktok.com",
+            "twitter.com",
+            "x.com",
+            "youtube.com",
+        }
+    ),
+}
+
+_DOMAIN_TIER_WEIGHTS: dict[str, float] = {
+    "tier_1": 3.0,
+    "tier_2": 2.0,
+    "tier_3": 0.4,
+    "unknown": 1.0,
+}
+
+_TRUSTED_DOMAIN_TIERS = frozenset({"tier_1", "tier_2"})
+_LOW_TIER_DOMAIN_TIERS = frozenset({"tier_3"})
+
+_SOURCE_QUALITY_RANK_WEIGHTS: dict[str, float] = {
+    "domain_tier_score": 1.2,
+    "trusted_domain_count": 2.2,
+    "unique_domain_count": 1.0,
+    "low_tier_ratio_penalty": 4.0,
+    # Kept intentionally lower so coverage quality outranks raw cluster size.
+    "link_count": 0.35,
+    "freshness": 0.2,
+}
+
+
+def _normalise_domain(domain: str | None) -> str | None:
+    if not isinstance(domain, str):
+        return None
+    d = domain.strip().lower()
+    if not d:
+        return None
+    if "://" in d:
+        parsed = urlparse(d)
+        d = parsed.netloc.strip().lower() or parsed.path.strip().lower()
+    d = d.split("@")[-1]
+    d = d.split(":")[0]
+    while d.startswith("www."):
+        d = d[4:]
+    return d or None
+
+
+def _domain_from_url(url: str | None) -> str | None:
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    return _normalise_domain(parsed.netloc)
+
+
+def _domain_in_suffix_set(domain: str, *, suffixes: frozenset[str]) -> bool:
+    return any(domain == suffix or domain.endswith(f".{suffix}") for suffix in suffixes)
+
+
+def _domain_tier(domain: str | None) -> str:
+    d = _normalise_domain(domain)
+    if not d:
+        return "unknown"
+    for tier in ("tier_1", "tier_2", "tier_3"):
+        suffixes = _DOMAIN_TRUST_TIER_SUFFIXES.get(tier, frozenset())
+        if suffixes and _domain_in_suffix_set(d, suffixes=suffixes):
+            return tier
+    return "unknown"
 
 
 def _utc_now_ts() -> int:
@@ -1716,12 +1828,140 @@ class NewsPoolDB:
         logger.info("Pruned %d expired events (max_age_hours=%d)", n, max_age_hours)
         return n
 
+    def _event_domains_map(self, *, event_ids: Iterable[int]) -> dict[int, set[str]]:
+        ids = [int(eid) for eid in event_ids]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            f"""
+            SELECT event_id, domain, url
+            FROM links
+            WHERE event_id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+
+        by_event: dict[int, set[str]] = {eid: set() for eid in ids}
+        for r in rows:
+            eid_raw = r["event_id"]
+            if eid_raw is None:
+                continue
+            eid = int(eid_raw)
+            d = _normalise_domain(r["domain"]) or _domain_from_url(r["url"])
+            if d:
+                by_event.setdefault(eid, set()).add(d)
+        return by_event
+
+    @staticmethod
+    def _compute_source_quality_metrics(
+        *,
+        domains: set[str],
+        link_count: int,
+        best_published_ts: int | None,
+        now_ts: int,
+    ) -> dict[str, Any]:
+        domain_tier_counts: dict[str, int] = {}
+        trusted_domain_count = 0
+        low_tier_count = 0
+        domain_tier_score = 0.0
+
+        for domain in sorted(domains):
+            tier = _domain_tier(domain)
+            domain_tier_counts[tier] = domain_tier_counts.get(tier, 0) + 1
+            domain_tier_score += float(_DOMAIN_TIER_WEIGHTS.get(tier, _DOMAIN_TIER_WEIGHTS["unknown"]))
+            if tier in _TRUSTED_DOMAIN_TIERS:
+                trusted_domain_count += 1
+            if tier in _LOW_TIER_DOMAIN_TIERS:
+                low_tier_count += 1
+
+        unique_domain_count = len(domains)
+        low_tier_ratio = (float(low_tier_count) / float(unique_domain_count)) if unique_domain_count > 0 else 0.0
+
+        if isinstance(best_published_ts, (int, float)):
+            age_hours = max(0.0, (float(now_ts) - float(best_published_ts)) / 3600.0)
+            freshness_score = max(0.0, 1.0 - (age_hours / 48.0))
+        else:
+            freshness_score = 0.0
+
+        score = (
+            _SOURCE_QUALITY_RANK_WEIGHTS["domain_tier_score"] * domain_tier_score
+            + _SOURCE_QUALITY_RANK_WEIGHTS["trusted_domain_count"] * float(trusted_domain_count)
+            + _SOURCE_QUALITY_RANK_WEIGHTS["unique_domain_count"] * float(unique_domain_count)
+            - _SOURCE_QUALITY_RANK_WEIGHTS["low_tier_ratio_penalty"] * low_tier_ratio
+            + _SOURCE_QUALITY_RANK_WEIGHTS["link_count"] * math.log1p(max(0, int(link_count)))
+            + _SOURCE_QUALITY_RANK_WEIGHTS["freshness"] * freshness_score
+        )
+
+        return {
+            "trusted_domain_count": trusted_domain_count,
+            "unique_domain_count": unique_domain_count,
+            "low_tier_ratio": round(low_tier_ratio, 6),
+            "domain_tier_score": round(domain_tier_score, 6),
+            "domain_tier_counts": domain_tier_counts,
+            "weighted_score": round(score, 6),
+        }
+
+    def _annotate_source_quality_metrics(self, *, candidates: list[dict[str, Any]], now_ts: int) -> None:
+        if not candidates:
+            return
+        event_ids = [int(c["id"]) for c in candidates if c.get("id") is not None]
+        domains_by_event = self._event_domains_map(event_ids=event_ids)
+
+        for c in candidates:
+            eid = int(c.get("id") or 0)
+            domains = set(domains_by_event.get(eid, set()))
+            primary_domain = _domain_from_url(c.get("primary_url"))
+            if primary_domain:
+                domains.add(primary_domain)
+
+            metrics = self._compute_source_quality_metrics(
+                domains=domains,
+                link_count=int(c.get("link_count") or 0),
+                best_published_ts=c.get("best_published_ts"),
+                now_ts=now_ts,
+            )
+            c["domains"] = sorted(domains)
+            c.update(metrics)
+
+    def _rank_daily_candidates(self, *, candidates: list[dict[str, Any]], now_ts: int) -> list[dict[str, Any]]:
+        self._annotate_source_quality_metrics(candidates=candidates, now_ts=now_ts)
+        return sorted(
+            candidates,
+            key=lambda c: (
+                -float(c.get("weighted_score") or 0.0),
+                -int(c.get("trusted_domain_count") or 0),
+                -int(c.get("unique_domain_count") or 0),
+                -int(c.get("best_published_ts") or 0),
+                -int(c.get("link_count") or 0),
+                -int(c.get("id") or 0),
+            ),
+        )
+
+    def _rank_hourly_candidates(self, *, candidates: list[dict[str, Any]], now_ts: int) -> list[dict[str, Any]]:
+        self._annotate_source_quality_metrics(candidates=candidates, now_ts=now_ts)
+        return sorted(
+            candidates,
+            key=lambda c: (
+                0 if c.get("parent_event_id") is not None else 1,
+                -int(c.get("created_at_ts") or 0),
+                -float(c.get("weighted_score") or 0.0),
+                -int(c.get("trusted_domain_count") or 0),
+                -int(c.get("unique_domain_count") or 0),
+                -int(c.get("link_count") or 0),
+                -int(c.get("best_published_ts") or 0),
+                -int(c.get("id") or 0),
+            ),
+        )
+
     def get_daily_candidates(self, *, limit: int = 15, now_ts: int | None = None) -> list[dict[str, Any]]:
         """Select events for daily posting with category balance and HK guarantee.
 
         Rules:
         - Only fresh, unposted events (status IN ('new', 'active'), expires_at_ts > now)
-        - Ranked by link_count DESC, best_published_ts DESC
+        - Ranked by source-quality weighted score (trusted + diverse domains first)
+        - Raw link_count is a weaker tie-breaker (no longer the primary sort key)
         - Finance categories capped at 2
         - No single category > 3
         - Reserve 1-2 slots for jurisdiction='HK'
@@ -1744,11 +1984,12 @@ class NewsPoolDB:
                 WHERE status IN ('new', 'active')
                   AND expires_at_ts > ?
                   AND (reserved_until_ts IS NULL OR reserved_until_ts < ?)
-                ORDER BY link_count DESC, best_published_ts DESC
+                ORDER BY id DESC
                 """,
                 (now, now),
             ).fetchall()
             candidates = [dict(r) for r in rows]
+            candidates = self._rank_daily_candidates(candidates=candidates, now_ts=now)
             selected = self._apply_daily_selection(candidates, limit=limit)
 
             if selected:
@@ -1789,13 +2030,10 @@ class NewsPoolDB:
 
         # First pass: collect HK events (reserve up to 2 slots).
         hk_events: list[dict[str, Any]] = []
-        non_hk_events: list[dict[str, Any]] = []
         for c in candidates:
             jur = (c.get("jurisdiction") or "").upper()
             if jur == "HK":
                 hk_events.append(c)
-            else:
-                non_hk_events.append(c)
 
         # Guarantee 1-2 HK slots.
         hk_guaranteed = 0
@@ -1841,7 +2079,8 @@ class NewsPoolDB:
         Priority:
         1. Developments first (parent_event_id IS NOT NULL)
         2. Freshness (created_at_ts DESC)
-        3. link_count DESC
+        3. Source-quality weighted score (trusted + diverse domains first)
+        4. link_count DESC
         Category diversity: 2nd+ picks differ from 1st pick's category.
         Selected events are reserved for 10 minutes to prevent concurrent planners
         from picking the same events.
@@ -1862,14 +2101,12 @@ class NewsPoolDB:
                 WHERE status IN ('new', 'active')
                   AND expires_at_ts > ?
                   AND (reserved_until_ts IS NULL OR reserved_until_ts < ?)
-                ORDER BY
-                  (CASE WHEN parent_event_id IS NOT NULL THEN 0 ELSE 1 END) ASC,
-                  created_at_ts DESC,
-                  link_count DESC
+                ORDER BY id DESC
                 """,
                 (now, now),
             ).fetchall()
             candidates = [dict(r) for r in rows]
+            candidates = self._rank_hourly_candidates(candidates=candidates, now_ts=now)
 
             if not candidates:
                 cur.execute("COMMIT")
@@ -1937,14 +2174,28 @@ class NewsPoolDB:
                 u = r["url"]
                 d = r["domain"]
                 if d:
-                    domains.add(d)
+                    nd = _normalise_domain(d)
+                    if nd:
+                        domains.add(nd)
                 if u and u != primary:
                     supporting.append(u)
                 hint = normalise_lang_hint(r["lang_hint"])
                 if hint:
                     hint_counts[hint] = hint_counts.get(hint, 0) + 1
+            primary_domain = _domain_from_url(primary)
+            if primary_domain:
+                domains.add(primary_domain)
+
             c["supporting_urls"] = supporting[:4]
             c["domains"] = sorted(domains)
+            c.update(
+                self._compute_source_quality_metrics(
+                    domains=domains,
+                    link_count=int(c.get("link_count") or 0),
+                    best_published_ts=c.get("best_published_ts"),
+                    now_ts=now_ts,
+                )
+            )
             if hint_counts:
                 c["lang_hint"] = sorted(
                     hint_counts.items(),
