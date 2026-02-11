@@ -196,6 +196,19 @@ def _entity_aliases_from_json(raw: Any) -> list[dict[str, Any]]:
     return _normalise_entity_aliases(raw)
 
 
+def _json_list_from_text(raw: Any) -> list[Any]:
+    if not isinstance(raw, str):
+        return []
+    s = raw.strip()
+    if not s:
+        return []
+    try:
+        parsed = json.loads(s)
+    except Exception:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def _entity_alias_terms(raw: Any, *, max_terms: int = 12) -> list[str]:
     aliases = _normalise_entity_aliases(raw)
     out: list[str] = []
@@ -1507,19 +1520,9 @@ class NewsPoolDB:
         if not row:
             return None
         out = dict(row)
-
-        def _parse_json_list(raw: Any) -> list[Any]:
-            if not isinstance(raw, str):
-                return []
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                return []
-            return parsed if isinstance(parsed, list) else []
-
-        out["entities"] = _parse_json_list(out.get("entities_json"))
-        out["key_numbers"] = _parse_json_list(out.get("key_numbers_json"))
-        out["flags"] = _parse_json_list(out.get("flags_json"))
+        out["entities"] = _json_list_from_text(out.get("entities_json"))
+        out["key_numbers"] = _json_list_from_text(out.get("key_numbers_json"))
+        out["flags"] = _json_list_from_text(out.get("flags_json"))
         return out
 
     def get_all_fresh_events(
@@ -1551,22 +1554,31 @@ class NewsPoolDB:
         # Active/unposted root events: unexpired + recently updated/published.
         unposted_rows = cur.execute(
             """
-            SELECT id, parent_event_id, category, jurisdiction, summary_en,
-                   development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json,
-                   posted_at_ts, thread_id, run_id
-            FROM events
-            WHERE parent_event_id IS NULL
-              AND status IN ('new', 'active')
-              AND expires_at_ts > ?
+            SELECT
+              e.id, e.parent_event_id, e.category, e.jurisdiction, e.summary_en,
+              e.development, e.title, e.primary_url, e.link_count, e.best_published_ts,
+              e.status, e.created_at_ts, e.updated_at_ts, e.expires_at_ts, e.entity_aliases_json,
+              e.posted_at_ts, e.thread_id, e.run_id,
+              ef.canonical_summary_en AS feature_summary_en,
+              ef.entities_json AS feature_entities_json,
+              ef.key_numbers_json AS feature_key_numbers_json,
+              ef.flags_json AS feature_flags_json,
+              ef.time_hints AS feature_time_hints,
+              ef.updated_at_ts AS feature_updated_at_ts
+            FROM events AS e
+            LEFT JOIN event_features AS ef
+              ON ef.event_id = e.id
+            WHERE e.parent_event_id IS NULL
+              AND e.status IN ('new', 'active')
+              AND e.expires_at_ts > ?
               AND (
-                    COALESCE(updated_at_ts, 0) >= ?
-                 OR COALESCE(best_published_ts, 0) >= ?
-                 OR COALESCE(created_at_ts, 0) >= ?
+                    COALESCE(e.updated_at_ts, 0) >= ?
+                 OR COALESCE(e.best_published_ts, 0) >= ?
+                 OR COALESCE(e.created_at_ts, 0) >= ?
               )
-            ORDER BY COALESCE(updated_at_ts, 0) DESC,
-                     COALESCE(best_published_ts, 0) DESC,
-                     id DESC
+            ORDER BY COALESCE(e.updated_at_ts, 0) DESC,
+                     COALESCE(e.best_published_ts, 0) DESC,
+                     e.id DESC
             LIMIT ?
             """,
             (now, unposted_cutoff, unposted_cutoff, unposted_cutoff, max_root_events),
@@ -1575,16 +1587,25 @@ class NewsPoolDB:
         # Recent posted root events: include only for short-window dedupe/assignment.
         posted_rows = cur.execute(
             """
-            SELECT id, parent_event_id, category, jurisdiction, summary_en,
-                   development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json,
-                   posted_at_ts, thread_id, run_id
-            FROM events
-            WHERE parent_event_id IS NULL
-              AND status = 'posted'
-              AND COALESCE(posted_at_ts, 0) >= ?
-            ORDER BY COALESCE(posted_at_ts, 0) DESC,
-                     id DESC
+            SELECT
+              e.id, e.parent_event_id, e.category, e.jurisdiction, e.summary_en,
+              e.development, e.title, e.primary_url, e.link_count, e.best_published_ts,
+              e.status, e.created_at_ts, e.updated_at_ts, e.expires_at_ts, e.entity_aliases_json,
+              e.posted_at_ts, e.thread_id, e.run_id,
+              ef.canonical_summary_en AS feature_summary_en,
+              ef.entities_json AS feature_entities_json,
+              ef.key_numbers_json AS feature_key_numbers_json,
+              ef.flags_json AS feature_flags_json,
+              ef.time_hints AS feature_time_hints,
+              ef.updated_at_ts AS feature_updated_at_ts
+            FROM events AS e
+            LEFT JOIN event_features AS ef
+              ON ef.event_id = e.id
+            WHERE e.parent_event_id IS NULL
+              AND e.status = 'posted'
+              AND COALESCE(e.posted_at_ts, 0) >= ?
+            ORDER BY COALESCE(e.posted_at_ts, 0) DESC,
+                     e.id DESC
             """,
             (posted_cutoff,),
         ).fetchall()
@@ -1594,6 +1615,9 @@ class NewsPoolDB:
         for r in rows:
             item = dict(r)
             item["entity_aliases"] = _entity_aliases_from_json(item.get("entity_aliases_json"))
+            item["feature_entities"] = _json_list_from_text(item.get("feature_entities_json"))
+            item["feature_key_numbers"] = _json_list_from_text(item.get("feature_key_numbers_json"))
+            item["feature_flags"] = _json_list_from_text(item.get("feature_flags_json"))
             out.append(item)
         return out
 
@@ -1620,12 +1644,21 @@ class NewsPoolDB:
         cur = self._conn.cursor()
         rows = cur.execute(
             """
-            SELECT id, parent_event_id, category, jurisdiction, summary_en,
-                   development, title, primary_url, link_count, best_published_ts,
-                   status, created_at_ts, updated_at_ts, expires_at_ts, entity_aliases_json
-            FROM events
-            WHERE expires_at_ts > ?
-            ORDER BY created_at_ts DESC
+            SELECT
+              e.id, e.parent_event_id, e.category, e.jurisdiction, e.summary_en,
+              e.development, e.title, e.primary_url, e.link_count, e.best_published_ts,
+              e.status, e.created_at_ts, e.updated_at_ts, e.expires_at_ts, e.entity_aliases_json,
+              ef.canonical_summary_en AS feature_summary_en,
+              ef.entities_json AS feature_entities_json,
+              ef.key_numbers_json AS feature_key_numbers_json,
+              ef.flags_json AS feature_flags_json,
+              ef.time_hints AS feature_time_hints,
+              ef.updated_at_ts AS feature_updated_at_ts
+            FROM events AS e
+            LEFT JOIN event_features AS ef
+              ON ef.event_id = e.id
+            WHERE e.expires_at_ts > ?
+            ORDER BY e.created_at_ts DESC
             """,
             (now,),
         ).fetchall()
@@ -1633,6 +1666,9 @@ class NewsPoolDB:
         for r in rows:
             item = dict(r)
             item["entity_aliases"] = _entity_aliases_from_json(item.get("entity_aliases_json"))
+            item["feature_entities"] = _json_list_from_text(item.get("feature_entities_json"))
+            item["feature_key_numbers"] = _json_list_from_text(item.get("feature_key_numbers_json"))
+            item["feature_flags"] = _json_list_from_text(item.get("feature_flags_json"))
             out.append(item)
         return out
 
