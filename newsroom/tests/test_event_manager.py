@@ -154,6 +154,28 @@ class TestParseClusteringResponse(unittest.TestCase):
         )
         self.assertEqual(result["enforced"]["action"], "new_event")
 
+    def test_parse_new_event_single_object_entity_aliases(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": {
+                "label": "Elon Musk",
+                "aliases": ["馬斯克"],
+            },
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result["validated"]["entity_aliases"],
+            [{"label": "Elon Musk", "aliases": ["馬斯克"]}],
+        )
+
     def test_parse_normalises_category_aliases(self) -> None:
         response = {
             "action": "new_event",
