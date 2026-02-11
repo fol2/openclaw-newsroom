@@ -45,6 +45,8 @@ CATEGORY_LIST = [
 _ASSIGNMENT_MIN_CONFIDENCE = 0.70
 _LINK_FLAGS_ALLOWED = {"roundup", "opinion", "live_updates", "multi_topic"}
 _LINK_FLAGS_FORCE_NEW_EVENT = {"roundup", "multi_topic"}
+_TRANSLATION_FALLBACK_WEAK_SCORE = 0.30
+_TRANSLATION_INPUT_MAX_CHARS = 500
 
 _CANONICAL_CATEGORY_BY_LOWER = {c.lower(): c for c in CATEGORY_LIST}
 _CATEGORY_ALIASES = {
@@ -86,6 +88,7 @@ class EventTokens:
     anchor_tokens: frozenset[str]
 
 _TOKEN_CACHE_DF_SIG_KEY = "__nr_drop_high_df_sig__"
+_CJK_LANG_HINT_PREFIXES = ("cjk", "zh", "ja", "ko", "cn", "hk")
 
 
 def _drop_high_df_signature(drop_high_df: set[str]) -> str:
@@ -155,6 +158,119 @@ def _link_lang_hint(link: dict[str, Any]) -> str:
         title=str(link.get("title") or ""),
         description=str(link.get("description") or ""),
     )
+
+
+def _is_cjk_lang_hint(hint: str) -> bool:
+    low = (hint or "").strip().lower()
+    if not low:
+        return False
+    return any(low == p or low.startswith(f"{p}-") for p in _CJK_LANG_HINT_PREFIXES)
+
+
+def _retrieval_is_empty_or_weak(candidates: list[tuple[dict[str, Any], float]]) -> bool:
+    if not candidates:
+        return True
+    try:
+        best_score = float(candidates[0][1])
+    except Exception:
+        return True
+    return best_score < _TRANSLATION_FALLBACK_WEAK_SCORE
+
+
+def _clip_text(value: Any, *, limit: int = _TRANSLATION_INPUT_MAX_CHARS) -> str:
+    text = str(value or "").strip()
+    return text[:limit] if len(text) > limit else text
+
+
+def _build_retrieval_translation_prompt(*, title: str, desc: str) -> str:
+    """Build a minimal-cost translation prompt for retrieval fallback."""
+    title_json = json.dumps(_clip_text(title), ensure_ascii=False)
+    desc_json = json.dumps(_clip_text(desc), ensure_ascii=False)
+    return f"""Translate the following news text into English for retrieval matching.
+
+Return STRICT JSON only:
+{{"title_en":"<English title>", "desc_en":"<English description>"}}
+
+Rules:
+- Preserve proper nouns, organisations, places, and all numbers.
+- Do not add or invent facts.
+- Keep it concise and literal.
+- If a field is empty, return an empty string.
+
+Input:
+title={title_json}
+description={desc_json}"""
+
+
+def _parse_translation_payload(payload: Any) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
+        return (None, None)
+
+    def _pick(*keys: str) -> str | None:
+        for k in keys:
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
+    title_en = _pick("title_en", "headline_en", "title")
+    desc_en = _pick("desc_en", "description_en", "snippet_en", "description")
+    return (title_en, desc_en)
+
+
+def _load_translation_cache(db: Any, *, norm_url: str | None) -> tuple[str | None, str | None]:
+    if not norm_url:
+        return (None, None)
+    getter = getattr(db, "get_retrieval_translation_cache", None)
+    if not callable(getter):
+        return (None, None)
+    try:
+        row = getter(norm_url=str(norm_url))
+    except Exception:
+        logger.debug("translation cache read failed: norm_url=%s", norm_url, exc_info=True)
+        return (None, None)
+    return _parse_translation_payload(row)
+
+
+def _save_translation_cache(
+    db: Any,
+    *,
+    norm_url: str | None,
+    title_en: str | None,
+    desc_en: str | None,
+    model: str | None,
+) -> None:
+    if not norm_url or (not title_en and not desc_en):
+        return
+    upsert = getattr(db, "upsert_retrieval_translation_cache", None)
+    if not callable(upsert):
+        return
+    try:
+        upsert(
+            norm_url=str(norm_url),
+            title_en=title_en,
+            desc_en=desc_en,
+            model=model,
+        )
+    except Exception:
+        logger.debug("translation cache write failed: norm_url=%s", norm_url, exc_info=True)
+
+
+def _link_with_translation(
+    link: dict[str, Any],
+    *,
+    title_en: str | None,
+    desc_en: str | None,
+) -> dict[str, Any] | None:
+    if not title_en and not desc_en:
+        return None
+    translated = dict(link)
+    if title_en:
+        translated["title"] = title_en
+    if desc_en:
+        translated["description"] = desc_en
+    translated["lang_hint"] = "en"
+    return translated
 
 
 _SKIP_CLUSTER_REGEX_RULES: list[tuple[str, list[str]]] = [
@@ -877,6 +993,62 @@ def cluster_link(
         drop_high_df=drop_high_df,
         drop_high_df_sig=drop_high_df_sig,
     )
+    lang_hint = _link_lang_hint(link)
+    is_cjk_link = _is_cjk_lang_hint(lang_hint)
+
+    # Bounded translation fallback:
+    # only when the link is CJK and deterministic retrieval is empty/weak.
+    if events and is_cjk_link and _retrieval_is_empty_or_weak(candidates):
+        norm_url = str(link.get("norm_url") or "").strip() or None
+        title_en, desc_en = _load_translation_cache(db, norm_url=norm_url)
+        translated_link = _link_with_translation(link, title_en=title_en, desc_en=desc_en)
+
+        if translated_link is None:
+            title_src = str(link.get("title") or "").strip()
+            desc_src = str(link.get("description") or "").strip()
+            if title_src or desc_src:
+                translation_prompt = _build_retrieval_translation_prompt(title=title_src, desc=desc_src)
+                try:
+                    translated_obj = gemini.generate_json(translation_prompt)
+                except Exception as e:
+                    logger.debug(
+                        "translation fallback failed for link %s: %s",
+                        link.get("norm_url", "?"),
+                        e,
+                    )
+                    translated_obj = None
+
+                title_en, desc_en = _parse_translation_payload(translated_obj)
+                translated_link = _link_with_translation(link, title_en=title_en, desc_en=desc_en)
+                if translated_link is not None:
+                    model_name = getattr(gemini, "last_model_name", None)
+                    model_label = model_name.strip() if isinstance(model_name, str) and model_name.strip() else None
+                    _save_translation_cache(
+                        db,
+                        norm_url=norm_url,
+                        title_en=title_en,
+                        desc_en=desc_en,
+                        model=model_label,
+                    )
+
+        if translated_link is not None:
+            translated_candidates = retrieve_candidates(
+                translated_link,
+                events,
+                top_k=5,
+                token_cache=token_cache,
+                drop_high_df=drop_high_df,
+                drop_high_df_sig=drop_high_df_sig,
+            )
+            if translated_candidates:
+                if not candidates:
+                    candidates = translated_candidates
+                else:
+                    try:
+                        if float(translated_candidates[0][1]) > float(candidates[0][1]):
+                            candidates = translated_candidates
+                    except Exception:
+                        candidates = translated_candidates
 
     # Stage 2: Focused LLM prompt.
     prompt = build_focused_clustering_prompt(link, candidates)

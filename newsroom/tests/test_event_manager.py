@@ -266,6 +266,10 @@ class TestParseClusteringResponse(unittest.TestCase):
 
 
 class TestClusterLink(unittest.TestCase):
+    @staticmethod
+    def _is_translation_prompt(prompt: str) -> bool:
+        return "Translate the following news text into English for retrieval matching." in prompt
+
     def test_cluster_link_assign(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
@@ -303,6 +307,191 @@ class TestClusterLink(unittest.TestCase):
                 ev = db.get_event(eid)
                 assert ev is not None
                 self.assertEqual(ev["link_count"], 1)
+
+    def test_cluster_link_cjk_translation_fallback_assigns_and_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://example.com/cjk-fallback-1",
+                    norm_url="https://example.com/cjk-fallback-1",
+                    domain="example.com",
+                    title="黎智英被判囚二十年",
+                    description="香港法院今日宣判",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                links[0]["lang_hint"] = "cjk"
+
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years in prison",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                )
+
+                counts = {"translation": 0, "cluster": 0}
+
+                def side_effect(prompt: str) -> dict[str, Any] | None:
+                    if self._is_translation_prompt(prompt):
+                        counts["translation"] += 1
+                        return {
+                            "title_en": "Jimmy Lai sentenced to 20 years",
+                            "desc_en": "Hong Kong court sentencing case",
+                        }
+                    counts["cluster"] += 1
+                    self.assertIn(f"[id={eid}]", prompt)
+                    return {
+                        "action": "assign",
+                        "event_id": eid,
+                        "confidence": 0.9,
+                        "summary_en": "Jimmy Lai sentenced to 20 years in prison",
+                        "category": "Hong Kong News",
+                        "jurisdiction": "HK",
+                        "link_flags": [],
+                        "match_basis": ["entity", "number"],
+                    }
+
+                gemini = MagicMock()
+                gemini.generate_json.side_effect = side_effect
+                gemini.last_model_name = "gemini-3-flash-preview"
+
+                events = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=events, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "assign")
+                self.assertEqual(counts["translation"], 1)
+                self.assertEqual(counts["cluster"], 1)
+
+                cached = db.get_retrieval_translation_cache(norm_url="https://example.com/cjk-fallback-1")
+                self.assertIsNotNone(cached)
+                assert cached is not None
+                self.assertEqual(cached["title_en"], "Jimmy Lai sentenced to 20 years")
+                self.assertEqual(cached["model"], "gemini-3-flash-preview")
+
+    def test_cluster_link_cjk_translation_fallback_uses_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://example.com/cjk-fallback-2",
+                    norm_url="https://example.com/cjk-fallback-2",
+                    domain="example.com",
+                    title="黎智英被判囚二十年",
+                    description="香港法院今日宣判",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                base_link = dict(links[0])
+                base_link["lang_hint"] = "cjk"
+
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years in prison",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                )
+
+                counts = {"translation": 0, "cluster": 0}
+
+                def side_effect(prompt: str) -> dict[str, Any] | None:
+                    if self._is_translation_prompt(prompt):
+                        counts["translation"] += 1
+                        return {
+                            "title_en": "Jimmy Lai sentenced to 20 years",
+                            "desc_en": "Hong Kong court sentencing case",
+                        }
+                    counts["cluster"] += 1
+                    return {
+                        "action": "assign",
+                        "event_id": eid,
+                        "confidence": 0.9,
+                        "summary_en": "Jimmy Lai sentenced to 20 years in prison",
+                        "category": "Hong Kong News",
+                        "jurisdiction": "HK",
+                        "link_flags": [],
+                        "match_basis": ["entity", "number"],
+                    }
+
+                gemini = MagicMock()
+                gemini.generate_json.side_effect = side_effect
+
+                events = db.get_fresh_events()
+                first = cluster_link(link=dict(base_link), all_events=events, gemini=gemini, db=db)
+                self.assertIsNotNone(first)
+                second = cluster_link(link=dict(base_link), all_events=events, gemini=gemini, db=db)
+                self.assertIsNotNone(second)
+                assert second is not None
+                self.assertEqual(second["action"], "assign")
+
+                # Translation prompt should run only once; second run should hit cache.
+                self.assertEqual(counts["translation"], 1)
+                self.assertEqual(counts["cluster"], 2)
+
+    def test_cluster_link_english_does_not_trigger_translation_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=Path(db_path)) as db:
+                link = PoolLink(
+                    url="https://example.com/english-no-fallback",
+                    norm_url="https://example.com/english-no-fallback",
+                    domain="example.com",
+                    title="Jimmy Lai sentenced to 20 years in prison",
+                    description="Hong Kong court sentencing case",
+                    age=None,
+                    page_age="2026-02-07T10:00:00",
+                    query="test",
+                    offset=1,
+                    fetched_at_ts=int(time.time()),
+                )
+                db.upsert_links([link])
+                links = db.get_unassigned_links()
+                self.assertEqual(len(links), 1)
+                links[0]["lang_hint"] = "en"
+
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentenced to 20 years in prison",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                )
+
+                gemini = MagicMock()
+
+                def side_effect(prompt: str) -> dict[str, Any] | None:
+                    if self._is_translation_prompt(prompt):
+                        raise AssertionError("English link should not trigger translation fallback")
+                    return {
+                        "action": "assign",
+                        "event_id": eid,
+                        "confidence": 0.9,
+                        "summary_en": "Jimmy Lai sentenced to 20 years in prison",
+                        "category": "Hong Kong News",
+                        "jurisdiction": "HK",
+                        "link_flags": [],
+                        "match_basis": ["entity", "number"],
+                    }
+
+                gemini.generate_json.side_effect = side_effect
+
+                events = db.get_fresh_events()
+                result = cluster_link(link=links[0], all_events=events, gemini=gemini, db=db)
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result["action"], "assign")
+
+                cached = db.get_retrieval_translation_cache(norm_url="https://example.com/english-no-fallback")
+                self.assertIsNone(cached)
 
     def test_cluster_link_gate_skips_roundup_links(self) -> None:
         with tempfile.TemporaryDirectory() as td:

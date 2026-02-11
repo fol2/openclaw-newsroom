@@ -658,6 +658,58 @@ class TestArticleCache(unittest.TestCase):
                 self.assertEqual(row["quality_score"], 80)
 
 
+class TestRetrievalTranslationCache(unittest.TestCase):
+    def test_retrieval_translation_cache_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                norm = "https://example.com/cjk-1"
+                db.upsert_retrieval_translation_cache(
+                    norm_url=norm,
+                    title_en="Jimmy Lai sentenced to 20 years",
+                    desc_en="Hong Kong court sentencing case",
+                    model="gemini-3-flash-preview",
+                    translated_at_ts=123,
+                )
+
+                row = db.get_retrieval_translation_cache(norm_url=norm)
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["norm_url"], norm)
+                self.assertEqual(row["title_en"], "Jimmy Lai sentenced to 20 years")
+                self.assertEqual(row["desc_en"], "Hong Kong court sentencing case")
+                self.assertEqual(row["model"], "gemini-3-flash-preview")
+                self.assertEqual(int(row["translated_at_ts"]), 123)
+
+    def test_retrieval_translation_cache_upsert_overwrites(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                norm = "https://example.com/cjk-2"
+                db.upsert_retrieval_translation_cache(
+                    norm_url=norm,
+                    title_en="Old title",
+                    desc_en="Old description",
+                    model="old-model",
+                    translated_at_ts=111,
+                )
+                db.upsert_retrieval_translation_cache(
+                    norm_url=norm,
+                    title_en="New title",
+                    desc_en="New description",
+                    model="new-model",
+                    translated_at_ts=222,
+                )
+
+                row = db.get_retrieval_translation_cache(norm_url=norm)
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row["title_en"], "New title")
+                self.assertEqual(row["desc_en"], "New description")
+                self.assertEqual(row["model"], "new-model")
+                self.assertEqual(int(row["translated_at_ts"]), 222)
+
+
 class TestCandidateEnrichment(unittest.TestCase):
     """Test that candidates include backward-compat fields for newsroom_write_run_job.py."""
 

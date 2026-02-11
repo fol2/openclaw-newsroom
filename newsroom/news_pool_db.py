@@ -105,6 +105,7 @@ class NewsPoolDB:
             # Fresh database — create all tables directly.
             self._create_all_tables_v5(cur)
             self._create_clustering_decisions_tables(cur)
+            self._create_retrieval_translation_cache_table(cur)
             self._ensure_links_skip_cluster_columns(cur)
             self._ensure_links_lang_hint_column(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
@@ -113,6 +114,7 @@ class NewsPoolDB:
         if schema == SCHEMA_VERSION:
             # Auxiliary tables should exist regardless of schema_version.
             self._create_clustering_decisions_tables(cur)
+            self._create_retrieval_translation_cache_table(cur)
             self._ensure_links_skip_cluster_columns(cur)
             self._ensure_links_lang_hint_column(cur)
             return
@@ -124,6 +126,7 @@ class NewsPoolDB:
         if schema == 5:
             self._migrate_to_v6(cur)
             self._create_clustering_decisions_tables(cur)
+            self._create_retrieval_translation_cache_table(cur)
             self._ensure_links_skip_cluster_columns(cur)
             self._ensure_links_lang_hint_column(cur)
             self.set_meta("schema_version", str(SCHEMA_VERSION))
@@ -265,6 +268,24 @@ class NewsPoolDB:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_clustering_decision_candidates_event_id ON clustering_decision_candidates(event_id);"
+        )
+
+    def _create_retrieval_translation_cache_table(self, cur: sqlite3.Cursor) -> None:
+        """Create retrieval translation cache table (auxiliary, schema-version agnostic)."""
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS retrieval_translation_cache (
+              norm_url TEXT PRIMARY KEY,
+              title_en TEXT,
+              desc_en TEXT,
+              model TEXT,
+              translated_at_ts INTEGER NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_retrieval_translation_cache_ts "
+            "ON retrieval_translation_cache(translated_at_ts);"
         )
 
     def _ensure_links_skip_cluster_columns(self, cur: sqlite3.Cursor) -> None:
@@ -1400,6 +1421,51 @@ class NewsPoolDB:
                 int(text_chars),
                 int(quality_score),
                 str(error) if error else None,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Retrieval translation cache
+    # ------------------------------------------------------------------
+
+    def get_retrieval_translation_cache(self, *, norm_url: str) -> dict[str, Any] | None:
+        cur = self._conn.cursor()
+        row = cur.execute(
+            """
+            SELECT norm_url, title_en, desc_en, model, translated_at_ts
+            FROM retrieval_translation_cache
+            WHERE norm_url = ?
+            """,
+            (str(norm_url),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_retrieval_translation_cache(
+        self,
+        *,
+        norm_url: str,
+        title_en: str | None,
+        desc_en: str | None,
+        model: str | None,
+        translated_at_ts: int | None = None,
+    ) -> None:
+        now = _utc_now_ts() if translated_at_ts is None else int(translated_at_ts)
+        self._conn.execute(
+            """
+            INSERT INTO retrieval_translation_cache(norm_url, title_en, desc_en, model, translated_at_ts)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(norm_url) DO UPDATE SET
+              title_en=excluded.title_en,
+              desc_en=excluded.desc_en,
+              model=excluded.model,
+              translated_at_ts=excluded.translated_at_ts
+            """,
+            (
+                str(norm_url),
+                str(title_en) if title_en else None,
+                str(desc_en) if desc_en else None,
+                str(model) if model else None,
+                now,
             ),
         )
 
