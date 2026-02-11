@@ -445,6 +445,70 @@ class TestNewsPoolDBEvents(unittest.TestCase):
                 self.assertIsNone(features.get("time_hints"))
                 self.assertIsInstance(features.get("updated_at_ts"), int)
 
+    def test_create_event_populates_event_features_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentencing case",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                    entity_aliases=[{"label": "Jimmy Lai", "aliases": ["黎智英"]}],
+                    event_features={
+                        "canonical_summary_en": "Hong Kong court sentences Jimmy Lai",
+                        "entities": ["Jimmy Lai", "Hong Kong Court"],
+                        "numbers": ["20 years", "2026-02-07"],
+                        "flags": ["breaking", "court"],
+                        "time_hints": "next 2h",
+                    },
+                )
+                features = db.get_event_features(event_id=eid)
+                self.assertIsNotNone(features)
+                assert features is not None
+                self.assertEqual(features.get("canonical_summary_en"), "Hong Kong court sentences Jimmy Lai")
+                self.assertEqual(features.get("entities"), ["Jimmy Lai", "Hong Kong Court"])
+                self.assertEqual(features.get("key_numbers"), ["20 years", "2026-02-07"])
+                self.assertEqual(features.get("flags"), ["breaking", "court"])
+                self.assertEqual(features.get("time_hints"), "next 2h")
+
+    def test_upsert_event_features_safe_merge_is_non_destructive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Jimmy Lai sentencing case",
+                    category="Hong Kong News",
+                    jurisdiction="HK",
+                    event_features={
+                        "canonical_summary_en": "Initial canonical summary",
+                        "entities": ["Jimmy Lai"],
+                        "numbers": ["20 years"],
+                        "flags": ["breaking"],
+                        "time_hints": "next 2h",
+                    },
+                )
+
+                db.upsert_event_features(
+                    event_id=eid,
+                    payload={
+                        "canonical_summary_en": "Overwrite attempt",
+                        "entities": ["Hong Kong Court"],
+                        "numbers": ["2026-02-07"],
+                        "flags": ["court"],
+                        "time_hints": "overwrite attempt",
+                    },
+                    safe_merge=True,
+                )
+
+                features = db.get_event_features(event_id=eid)
+                self.assertIsNotNone(features)
+                assert features is not None
+                self.assertEqual(features.get("canonical_summary_en"), "Initial canonical summary")
+                self.assertEqual(features.get("time_hints"), "next 2h")
+                self.assertEqual(features.get("entities"), ["Jimmy Lai", "Hong Kong Court"])
+                self.assertEqual(features.get("key_numbers"), ["20 years", "2026-02-07"])
+                self.assertEqual(features.get("flags"), ["breaking", "court"])
+
     def test_ensure_event_features_row_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"

@@ -611,6 +611,217 @@ class NewsPoolDB:
             return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
         return None
 
+    @staticmethod
+    def _json_list(raw: Any) -> list[Any]:
+        obj: Any = raw
+        if isinstance(obj, str):
+            s = obj.strip()
+            if not s:
+                return []
+            try:
+                obj = json.loads(s)
+            except Exception:
+                return []
+        if not isinstance(obj, list):
+            return []
+        return list(obj)
+
+    @staticmethod
+    def _normalise_feature_terms(raw: Any, *, max_items: int = 20, max_item_len: int = 140) -> list[str]:
+        obj: Any = raw
+        if isinstance(obj, str):
+            s = obj.strip()
+            if not s:
+                return []
+            try:
+                obj = json.loads(s)
+            except Exception:
+                obj = [s]
+        if isinstance(obj, dict):
+            obj = obj.get("items", obj)
+        if isinstance(obj, dict):
+            obj = [obj]
+        if not isinstance(obj, list):
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in obj:
+            candidate: Any = item
+            if isinstance(item, dict):
+                candidate = item.get("label") or item.get("name") or item.get("value") or item.get("text")
+            text = _clean_alias_text(candidate, max_len=max_item_len)
+            if not text:
+                continue
+            key = text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _merge_feature_lists(existing: list[Any], incoming: list[str], *, max_items: int = 24) -> list[Any]:
+        def _item_key(item: Any) -> str:
+            if isinstance(item, (str, int, float)):
+                txt = _clean_alias_text(item, max_len=200)
+                if txt:
+                    return f"t:{txt.casefold()}"
+            try:
+                return "j:" + json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                return f"r:{repr(item)}"
+
+        merged: list[Any] = list(existing)
+        seen: set[str] = {_item_key(x) for x in merged}
+        for term in incoming:
+            key = _item_key(term)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(term)
+            if len(merged) >= max_items:
+                break
+        return merged
+
+    @classmethod
+    def _normalise_event_features_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_summary: str | None = None,
+        fallback_entities: list[str] | None = None,
+    ) -> dict[str, Any]:
+        obj = payload if isinstance(payload, dict) else {}
+        summary_raw = (
+            obj.get("canonical_summary_en")
+            or obj.get("summary_en")
+            or fallback_summary
+            or ""
+        )
+        canonical_summary = _clean_alias_text(summary_raw, max_len=500) or ""
+
+        entities_raw = obj.get("entities")
+        if entities_raw is None:
+            entities_raw = obj.get("entity_terms")
+        entities = cls._normalise_feature_terms(entities_raw)
+        if not entities and fallback_entities:
+            entities = cls._normalise_feature_terms(fallback_entities)
+
+        key_numbers_raw = obj.get("key_numbers")
+        if key_numbers_raw is None:
+            key_numbers_raw = obj.get("numbers")
+        key_numbers = cls._normalise_feature_terms(key_numbers_raw)
+
+        flags = cls._normalise_feature_terms(obj.get("flags"), max_items=12, max_item_len=80)
+        time_hints = cls._normalise_time_hints(obj.get("time_hints"))
+
+        return {
+            "canonical_summary_en": canonical_summary,
+            "entities": entities,
+            "key_numbers": key_numbers,
+            "flags": flags,
+            "time_hints": time_hints,
+        }
+
+    def upsert_event_features(
+        self,
+        *,
+        event_id: int,
+        payload: dict[str, Any] | None = None,
+        now_ts: int | None = None,
+        safe_merge: bool = True,
+        fallback_summary: str | None = None,
+        fallback_entity_aliases: Any | None = None,
+    ) -> None:
+        """Upsert canonical event_features with safe list-union merge semantics.
+
+        safe_merge=True keeps existing summary/time_hints unless they are empty.
+        """
+        now = _utc_now_ts() if now_ts is None else int(now_ts)
+        eid = int(event_id)
+        self.ensure_event_features_row(event_id=eid, now_ts=now)
+
+        row = self._conn.execute(
+            """
+            SELECT canonical_summary_en, entities_json, key_numbers_json, flags_json, time_hints
+            FROM event_features
+            WHERE event_id = ?
+            """,
+            (eid,),
+        ).fetchone()
+        if row is None:
+            return
+
+        event_row = self._conn.execute("SELECT summary_en FROM events WHERE id = ?", (eid,)).fetchone()
+        event_summary = (
+            _clean_alias_text(event_row["summary_en"], max_len=500)
+            if event_row is not None and event_row["summary_en"] is not None
+            else ""
+        )
+        alias_terms = _entity_alias_terms(fallback_entity_aliases) if fallback_entity_aliases is not None else []
+        norm = self._normalise_event_features_payload(
+            payload,
+            fallback_summary=fallback_summary or event_summary,
+            fallback_entities=alias_terms,
+        )
+
+        existing_summary = _clean_alias_text(row["canonical_summary_en"], max_len=500) or ""
+        incoming_summary = _clean_alias_text(norm.get("canonical_summary_en"), max_len=500) or ""
+        if safe_merge:
+            merged_summary = existing_summary or incoming_summary or event_summary
+        else:
+            merged_summary = incoming_summary or existing_summary or event_summary
+
+        existing_entities = self._json_list(row["entities_json"])
+        existing_key_numbers = self._json_list(row["key_numbers_json"])
+        existing_flags = self._json_list(row["flags_json"])
+
+        merged_entities = self._merge_feature_lists(existing_entities, list(norm.get("entities") or []))
+        merged_key_numbers = self._merge_feature_lists(existing_key_numbers, list(norm.get("key_numbers") or []))
+        merged_flags = self._merge_feature_lists(existing_flags, list(norm.get("flags") or []), max_items=16)
+
+        existing_time_hints = self._normalise_time_hints(row["time_hints"])
+        incoming_time_hints = self._normalise_time_hints(norm.get("time_hints"))
+        if safe_merge:
+            merged_time_hints = existing_time_hints or incoming_time_hints
+        else:
+            merged_time_hints = incoming_time_hints if incoming_time_hints is not None else existing_time_hints
+
+        changed = (
+            merged_summary != existing_summary
+            or merged_entities != existing_entities
+            or merged_key_numbers != existing_key_numbers
+            or merged_flags != existing_flags
+            or merged_time_hints != existing_time_hints
+        )
+        if not changed:
+            return
+
+        self._conn.execute(
+            """
+            UPDATE event_features
+            SET canonical_summary_en = ?,
+                entities_json = ?,
+                key_numbers_json = ?,
+                flags_json = ?,
+                time_hints = ?,
+                updated_at_ts = ?
+            WHERE event_id = ?
+            """,
+            (
+                merged_summary,
+                json.dumps(merged_entities, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(merged_key_numbers, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(merged_flags, ensure_ascii=False, separators=(",", ":")),
+                merged_time_hints,
+                now,
+                eid,
+            ),
+        )
+
     def _backfill_event_features_rows(self, cur: sqlite3.Cursor, *, now_ts: int | None = None) -> None:
         """Ensure every event has a matching row in event_features."""
         now = _utc_now_ts() if now_ts is None else int(now_ts)
@@ -1193,6 +1404,7 @@ class NewsPoolDB:
         parent_event_id: int | None = None,
         development: str | None = None,
         entity_aliases: Any | None = None,
+        event_features: dict[str, Any] | None = None,
         model: str | None = None,
     ) -> int:
         """Insert a new event. Returns the event id."""
@@ -1226,15 +1438,13 @@ class NewsPoolDB:
         event_id = cur.lastrowid or 0
 
         if event_id:
-            cur.execute(
-                """
-                INSERT INTO event_features(
-                  event_id, canonical_summary_en, entities_json, key_numbers_json, flags_json, time_hints, updated_at_ts
-                )
-                VALUES (?, ?, '[]', '[]', '[]', NULL, ?)
-                ON CONFLICT(event_id) DO NOTHING
-                """,
-                (event_id, summary_en, now),
+            self.upsert_event_features(
+                event_id=int(event_id),
+                payload=event_features,
+                now_ts=now,
+                safe_merge=False,
+                fallback_summary=summary_en,
+                fallback_entity_aliases=entity_aliases,
             )
 
         # If this is a development, bump parent's expires_at_ts.

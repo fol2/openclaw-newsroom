@@ -220,6 +220,139 @@ def _normalise_entity_aliases(raw: Any, *, max_entities: int = 12, max_aliases_p
     return out
 
 
+def _normalise_feature_terms(raw: Any, *, max_items: int = 20, max_item_len: int = 140) -> list[str]:
+    obj: Any = raw
+    if isinstance(obj, str):
+        s = obj.strip()
+        if not s:
+            return []
+        try:
+            obj = json.loads(s)
+        except Exception:
+            obj = [s]
+    if isinstance(obj, dict):
+        obj = obj.get("items", obj)
+    if isinstance(obj, dict):
+        obj = [obj]
+    if not isinstance(obj, list):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in obj:
+        candidate: Any = item
+        if isinstance(item, dict):
+            candidate = item.get("label") or item.get("name") or item.get("value") or item.get("text")
+        text = _clean_alias_text(candidate, max_len=max_item_len)
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _normalise_feature_flags(raw: Any, *, max_items: int = 12) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in _normalise_feature_terms(raw, max_items=max_items, max_item_len=80):
+        norm = " ".join(term.strip().split())
+        if not norm:
+            continue
+        low = norm.casefold()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(low)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _normalise_time_hints(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        return s or None
+    if isinstance(raw, (list, dict)):
+        return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+    return None
+
+
+def _entity_terms_from_aliases(entity_aliases: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in entity_aliases:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_alias_text(item.get("label"), max_len=120)
+        if label:
+            low = label.casefold()
+            if low not in seen:
+                seen.add(low)
+                out.append(label)
+        aliases = item.get("aliases")
+        if not isinstance(aliases, list):
+            continue
+        for alias_raw in aliases:
+            alias = _clean_alias_text(alias_raw, max_len=120)
+            if not alias:
+                continue
+            low = alias.casefold()
+            if low in seen:
+                continue
+            seen.add(low)
+            out.append(alias)
+            if len(out) >= 20:
+                break
+        if len(out) >= 20:
+            break
+    return out
+
+
+def _parse_event_features_payload(
+    raw: Any,
+    *,
+    summary_en: str,
+    entity_aliases: list[dict[str, Any]],
+    link_flags: list[str],
+    action: str,
+) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {}
+
+    canonical_summary = _clean_alias_text(
+        payload.get("canonical_summary_en") or payload.get("summary_en") or summary_en,
+        max_len=500,
+    ) or summary_en
+    entities = _normalise_feature_terms(payload.get("entities") or payload.get("entity_terms"))
+    if not entities:
+        entities = _entity_terms_from_aliases(entity_aliases)
+    numbers = _normalise_feature_terms(payload.get("numbers") or payload.get("key_numbers"), max_items=12, max_item_len=120)
+    flags = _normalise_feature_flags(payload.get("flags"), max_items=12)
+
+    if action == "development" and "developing" not in flags and len(flags) < 12:
+        flags.append("developing")
+    for lf in link_flags:
+        if lf in flags:
+            continue
+        if len(flags) >= 12:
+            break
+        flags.append(lf)
+
+    return {
+        "canonical_summary_en": canonical_summary,
+        "entities": entities,
+        "numbers": numbers,
+        "flags": flags,
+        "time_hints": _normalise_time_hints(payload.get("time_hints")),
+    }
+
+
 def _entity_alias_surface_forms(event: dict[str, Any], *, max_terms: int = 32) -> list[str]:
     """Return flattened alias surface forms from an event object."""
     aliases_obj = event.get("entity_aliases")
@@ -760,6 +893,11 @@ Return STRICT JSON:
   "confidence":<0.0-1.0>,
   "summary_en":"<one-sentence English summary>",
   "entity_aliases":[{{"label":"<entity>","type":"<person|org|location>","aliases":["<alias 1>","<alias 2>"]}}],
+  "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                     "entities":["<entity 1>","<entity 2>"],
+                     "numbers":["<number/date/amount>"],
+                     "flags":["<breaking|developing|other short tag>"],
+                     "time_hints":"<optional short hint>"}},
   "category":"<category>","jurisdiction":"<jurisdiction>",
   "link_flags":[],
   "match_basis":[]}}
@@ -797,6 +935,11 @@ A) ASSIGN to existing event (same incident, different source, no new material)
    → {{"action":"assign","event_id":<id>,
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
+      "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                         "entities":["<entity 1>","<entity 2>"],
+                         "numbers":["<number/date/amount>"],
+                         "flags":["<breaking|developing|other short tag>"],
+                         "time_hints":"<optional short hint>"}},
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":["<entity|number|location|time|other>"]}}
@@ -808,6 +951,11 @@ B) NEW DEVELOPMENT of existing event (significant escalation, verdict, arrest, r
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
       "entity_aliases":[{{"label":"<entity>","type":"<person|org|location>","aliases":["<alias 1>","<alias 2>"]}}],
+      "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                         "entities":["<entity 1>","<entity 2>"],
+                         "numbers":["<number/date/amount>"],
+                         "flags":["<breaking|developing|other short tag>"],
+                         "time_hints":"<optional short hint>"}},
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":["<entity|number|location|time|other>"]}}
@@ -818,6 +966,11 @@ C) NEW EVENT (completely new story, none of the candidates match)
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "entity_aliases":[{{"label":"<entity>","type":"<person|org|location>","aliases":["<alias 1>","<alias 2>"]}}],
+      "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                         "entities":["<entity 1>","<entity 2>"],
+                         "numbers":["<number/date/amount>"],
+                         "flags":["<breaking|developing|other short tag>"],
+                         "time_hints":"<optional short hint>"}},
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":[]}}
@@ -831,7 +984,8 @@ Rules:
 - Completely unrelated story → C
 - Match across languages (Chinese headline about same event = same event)
 - Only use ASSIGN if a matching event exists in the candidates above
-- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty)
+- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty), and event_features
+- event_features must include: canonical_summary_en, entities (list), numbers (list), flags (list), time_hints (string or null)
 - For NEW_EVENT and DEVELOPMENT, include entity_aliases with bilingual aliases when available (e.g. Chinese + English names)
 - For each entity_aliases item, include type as person/org/location when known
 - link_flags may include: "roundup", "opinion", "live_updates", "multi_topic"
@@ -904,6 +1058,11 @@ A) ASSIGN to existing event (same incident, different source, no new material)
    → {{"action":"assign","event_id":<id>,
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
+      "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                         "entities":["<entity 1>","<entity 2>"],
+                         "numbers":["<number/date/amount>"],
+                         "flags":["<breaking|developing|other short tag>"],
+                         "time_hints":"<optional short hint>"}},
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":["<entity|number|location|time|other>"]}}
@@ -914,6 +1073,11 @@ B) NEW DEVELOPMENT of existing event (significant escalation, result, reversal)
       "summary_en":"<one-sentence English summary>",
       "development":"<short label>",
       "entity_aliases":[{{"label":"<entity>","type":"<person|org|location>","aliases":["<alias 1>","<alias 2>"]}}],
+      "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                         "entities":["<entity 1>","<entity 2>"],
+                         "numbers":["<number/date/amount>"],
+                         "flags":["<breaking|developing|other short tag>"],
+                         "time_hints":"<optional short hint>"}},
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":["<entity|number|location|time|other>"]}}
@@ -923,6 +1087,11 @@ C) NEW EVENT (completely new story)
       "confidence":<0.0-1.0>,
       "summary_en":"<one-sentence English summary>",
       "entity_aliases":[{{"label":"<entity>","type":"<person|org|location>","aliases":["<alias 1>","<alias 2>"]}}],
+      "event_features":{{"canonical_summary_en":"<canonical one-sentence English summary>",
+                         "entities":["<entity 1>","<entity 2>"],
+                         "numbers":["<number/date/amount>"],
+                         "flags":["<breaking|developing|other short tag>"],
+                         "time_hints":"<optional short hint>"}},
       "category":"<category>","jurisdiction":"<jurisdiction>",
       "link_flags":[],
       "match_basis":[]}}
@@ -937,7 +1106,8 @@ Rules:
 - Match across languages (Chinese headline about same event = same event)
 - Only use ASSIGN if a matching event exists in the list above
 - Do NOT assign to events with status=posted unless it's truly the same event
-- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty)
+- Always include: confidence (0.0-1.0), summary_en, category, jurisdiction, link_flags (list), match_basis (list; can be empty), and event_features
+- event_features must include: canonical_summary_en, entities (list), numbers (list), flags (list), time_hints (string or null)
 - For NEW_EVENT and DEVELOPMENT, include entity_aliases with bilingual aliases when available (e.g. Chinese + English names)
 - For each entity_aliases item, include type as person/org/location when known
 - link_flags may include: "roundup", "opinion", "live_updates", "multi_topic"
@@ -1053,6 +1223,13 @@ def parse_clustering_response(
         if event_id not in valid_ids:
             logger.warning("assign: event_id %d not in candidate set", event_id)
             return None
+        event_features = _parse_event_features_payload(
+            response.get("event_features"),
+            summary_en=summary_en,
+            entity_aliases=entity_aliases,
+            link_flags=link_flags,
+            action="assign",
+        )
         validated = {
             "action": "assign",
             "event_id": event_id,
@@ -1060,6 +1237,7 @@ def parse_clustering_response(
             "match_basis": match_basis,
             "link_flags": link_flags,
             "entity_aliases": entity_aliases,
+            "event_features": event_features,
             "summary_en": summary_en,
             "category": category,
             "jurisdiction": jurisdiction,
@@ -1076,6 +1254,13 @@ def parse_clustering_response(
         if not summary_en:
             logger.warning("development: empty summary_en")
             return None
+        event_features = _parse_event_features_payload(
+            response.get("event_features"),
+            summary_en=summary_en,
+            entity_aliases=entity_aliases,
+            link_flags=link_flags,
+            action="development",
+        )
         validated = {
             "action": "development",
             "parent_event_id": parent_id,
@@ -1087,12 +1272,20 @@ def parse_clustering_response(
             "match_basis": match_basis,
             "link_flags": link_flags,
             "entity_aliases": entity_aliases,
+            "event_features": event_features,
         }
 
     elif action in ("new_event", "new"):
         if not summary_en:
             logger.warning("new_event: empty summary_en")
             return None
+        event_features = _parse_event_features_payload(
+            response.get("event_features"),
+            summary_en=summary_en,
+            entity_aliases=entity_aliases,
+            link_flags=link_flags,
+            action="new_event",
+        )
         validated = {
             "action": "new_event",
             "summary_en": summary_en,
@@ -1102,6 +1295,7 @@ def parse_clustering_response(
             "match_basis": match_basis,
             "link_flags": link_flags,
             "entity_aliases": entity_aliases,
+            "event_features": event_features,
         }
 
     else:
@@ -1138,6 +1332,7 @@ def parse_clustering_response(
             "match_basis": match_basis,
             "link_flags": link_flags,
             "entity_aliases": entity_aliases,
+            "event_features": validated.get("event_features"),
             "enforcement": {
                 "original_action": str(validated.get("action") or ""),
                 "reasons": override_reasons,
@@ -1368,6 +1563,15 @@ def cluster_link(
                 assigned_to_posted = True
                 break
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
+        upsert_features_fn = getattr(db, "upsert_event_features", None)
+        if callable(upsert_features_fn):
+            upsert_features_fn(
+                event_id=int(event_id),
+                payload=enforced.get("event_features") if isinstance(enforced.get("event_features"), dict) else None,
+                safe_merge=True,
+                fallback_summary=enforced.get("summary_en"),
+                fallback_entity_aliases=enforced.get("entity_aliases"),
+            )
         enforced["assigned_to_posted"] = assigned_to_posted
         logger.info("Assigned link %d to event %d%s", link_id, event_id, " (posted)" if assigned_to_posted else "")
         _log_decision(
@@ -1391,6 +1595,7 @@ def cluster_link(
             parent_event_id=parent_id,
             development=enforced.get("development"),
             entity_aliases=enforced.get("entity_aliases"),
+            event_features=enforced.get("event_features") if isinstance(enforced.get("event_features"), dict) else None,
             model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
@@ -1414,6 +1619,7 @@ def cluster_link(
             title=link_title,
             primary_url=link_url,
             entity_aliases=enforced.get("entity_aliases"),
+            event_features=enforced.get("event_features") if isinstance(enforced.get("event_features"), dict) else None,
             model=model_name,
         )
         db.assign_link_to_event(link_id=link_id, event_id=event_id)
