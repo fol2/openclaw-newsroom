@@ -2117,6 +2117,73 @@ class NewsPoolDB:
             ),
         )
 
+    @staticmethod
+    def _select_primary_url(
+        *,
+        existing_primary_url: str | None,
+        url_candidates: list[dict[str, Any]],
+    ) -> str:
+        """Choose the best available primary URL via trust -> cache quality -> recency fallback."""
+        existing = str(existing_primary_url or "").strip()
+
+        def _pick_most_recent(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+            return max(
+                candidates,
+                key=lambda item: (
+                    int(item.get("recency_ts") or 0),
+                    int(item.get("quality_score") or -1),
+                    str(item.get("url") or ""),
+                ),
+            )
+
+        if not url_candidates:
+            return existing
+
+        trusted = [
+            item
+            for item in url_candidates
+            if _domain_tier(item.get("domain")) in _TRUSTED_DOMAIN_TIERS
+        ]
+        if trusted:
+            chosen = str(_pick_most_recent(trusted).get("url") or "").strip()
+            if chosen:
+                return chosen
+
+        quality_candidates = [item for item in url_candidates if isinstance(item.get("quality_score"), int)]
+        if quality_candidates:
+            chosen = str(
+                max(
+                    quality_candidates,
+                    key=lambda item: (
+                        int(item.get("quality_score") or 0),
+                        int(item.get("recency_ts") or 0),
+                        str(item.get("url") or ""),
+                    ),
+                ).get("url")
+                or ""
+            ).strip()
+            if chosen:
+                return chosen
+
+        domain_counts: dict[str, int] = {}
+        for item in url_candidates:
+            dom = _normalise_domain(item.get("domain"))
+            if dom:
+                domain_counts[dom] = domain_counts.get(dom, 0) + 1
+
+        unique_domain_candidates: list[dict[str, Any]] = []
+        for item in url_candidates:
+            dom = _normalise_domain(item.get("domain"))
+            if dom and domain_counts.get(dom, 0) == 1:
+                unique_domain_candidates.append(item)
+        if unique_domain_candidates:
+            chosen = str(_pick_most_recent(unique_domain_candidates).get("url") or "").strip()
+            if chosen:
+                return chosen
+
+        chosen = str(_pick_most_recent(url_candidates).get("url") or "").strip()
+        return chosen or existing
+
     def get_daily_candidates(self, *, limit: int = 15, now_ts: int | None = None) -> list[dict[str, Any]]:
         """Select events for daily posting with category balance and HK guarantee.
 
@@ -2326,27 +2393,66 @@ class NewsPoolDB:
 
             # supporting_urls + domains from linked URLs.
             rows = cur.execute(
-                "SELECT url, domain, lang_hint FROM links WHERE event_id = ? ORDER BY published_at_ts DESC",
+                """
+                SELECT
+                  l.url, l.norm_url, l.domain, l.lang_hint,
+                  l.published_at_ts, l.last_seen_ts, l.first_seen_ts,
+                  ac.quality_score AS cache_quality_score
+                FROM links AS l
+                LEFT JOIN article_cache AS ac
+                  ON ac.norm_url = l.norm_url
+                WHERE l.event_id = ?
+                ORDER BY COALESCE(l.published_at_ts, l.last_seen_ts, l.first_seen_ts, 0) DESC, l.id DESC
+                """,
                 (eid,),
             ).fetchall()
-            primary = c.get("primary_url") or ""
-            supporting: list[str] = []
+            existing_primary = str(c.get("primary_url") or "").strip()
+            ordered_urls: list[str] = []
+            primary_candidates: list[dict[str, Any]] = []
             domains: set[str] = set()
             link_domains: list[str] = []
             hint_counts: dict[str, int] = {}
             for r in rows:
-                u = r["url"]
-                d = r["domain"]
-                if d:
-                    nd = _normalise_domain(d)
-                    if nd:
-                        domains.add(nd)
-                        link_domains.append(nd)
-                if u and u != primary:
-                    supporting.append(u)
+                u_raw = r["url"]
+                u = str(u_raw).strip() if isinstance(u_raw, str) else ""
+                if not u:
+                    continue
+                ordered_urls.append(u)
+
+                nd = _normalise_domain(r["domain"]) or _domain_from_url(u)
+                if nd:
+                    domains.add(nd)
+                    link_domains.append(nd)
+
+                recency_ts = 0
+                for key in ("published_at_ts", "last_seen_ts", "first_seen_ts"):
+                    ts_raw = r[key]
+                    if isinstance(ts_raw, (int, float)):
+                        recency_ts = int(ts_raw)
+                        break
+
+                q_raw = r["cache_quality_score"]
+                quality_score: int | None = None
+                if isinstance(q_raw, (int, float)):
+                    quality_score = int(q_raw)
+
+                primary_candidates.append(
+                    {
+                        "url": u,
+                        "domain": nd,
+                        "recency_ts": recency_ts,
+                        "quality_score": quality_score,
+                    }
+                )
+
                 hint = normalise_lang_hint(r["lang_hint"])
                 if hint:
                     hint_counts[hint] = hint_counts.get(hint, 0) + 1
+            primary = self._select_primary_url(
+                existing_primary_url=existing_primary,
+                url_candidates=primary_candidates,
+            )
+            supporting = [u for u in ordered_urls if u != primary]
             primary_domain = _domain_from_url(primary)
             if primary_domain:
                 domains.add(primary_domain)
@@ -2354,6 +2460,7 @@ class NewsPoolDB:
                     # Fallback for events that only have a primary URL.
                     link_domains.append(primary_domain)
 
+            c["primary_url"] = primary
             c["supporting_urls"] = supporting[:4]
             c["domains"] = sorted(domains)
             c.update(

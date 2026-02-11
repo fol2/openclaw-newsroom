@@ -255,6 +255,57 @@ class TestWriteRunJobScript(unittest.TestCase):
             self.assertEqual(s1["story"]["lang_hint"], "en")
             self.assertEqual(s2["story"]["lang_hint"], "mixed")
 
+    def test_write_run_job_preserves_upgraded_candidate_primary_url(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            jobs_root = tmp / "jobs"
+            jobs_root.mkdir(parents=True, exist_ok=True)
+
+            upgraded_primary = "https://reuters.com/upgraded-primary"
+            old_primary = "https://x.com/original-primary"
+            candidates = [
+                {
+                    "i": 1,
+                    "event_id": 77,
+                    "event_key": "event:77",
+                    "semantic_event_key": "event:77",
+                    "anchor_key": "event:77",
+                    "suggested_category": "Global News",
+                    "title": "Primary upgraded in inputs",
+                    "description": "Candidate already has upgraded primary_url.",
+                    "lang_hint": "en",
+                    "primary_url": upgraded_primary,
+                    "supporting_urls": [old_primary, "https://bbc.co.uk/support"],
+                    "domains": ["reuters.com", "x.com", "bbc.co.uk"],
+                    "suggest_flags": [],
+                }
+            ]
+            inputs_obj = {"ok": True, "candidates": candidates, "candidate_count": 1}
+            inputs_path = tmp / "inputs.json"
+            inputs_path.write_text(json.dumps(inputs_obj) + "\n", encoding="utf-8")
+
+            cmd = [
+                sys.executable,
+                str(root / "scripts" / "newsroom_write_run_job.py"),
+                "--jobs-root", str(jobs_root),
+                "--inputs-json-path", str(inputs_path),
+                "--channel-id", "1467628391082496041",
+                "--run-time-uk", "2026-02-08 08:00",
+                "--trigger", "cron_daily",
+                "--expected-stories", "1",
+                "--pick", "1",
+            ]
+
+            out = subprocess.check_output(cmd, text=True)
+            summary = json.loads(out)
+            run_dir = Path(summary["run_dir"])
+            story = json.loads((run_dir / "story_01.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(story["story"]["primary_url"], upgraded_primary)
+            self.assertNotIn(upgraded_primary, story["story"]["supporting_urls"])
+            self.assertIn(old_primary, story["story"]["supporting_urls"])
+
 
 if __name__ == "__main__":
     unittest.main()
