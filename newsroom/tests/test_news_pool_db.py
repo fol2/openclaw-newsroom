@@ -1451,8 +1451,10 @@ class TestCandidateEnrichment(unittest.TestCase):
                 self.assertIsInstance(c["age_minutes"], int)
                 self.assertEqual(c["lang_hint"], "en")
 
-                # supporting_urls: should have the non-primary URL.
-                self.assertIn("https://bbc.co.uk/tesla-q4", c["supporting_urls"])
+                # primary_url should be upgraded to the most recent trusted source.
+                self.assertEqual(c["primary_url"], "https://bbc.co.uk/tesla-q4")
+                # supporting_urls should retain the other source.
+                self.assertIn("https://reuters.com/tesla-q4", c["supporting_urls"])
                 # domains.
                 self.assertIn("reuters.com", c["domains"])
                 self.assertIn("bbc.co.uk", c["domains"])
@@ -1518,6 +1520,155 @@ class TestCandidateEnrichment(unittest.TestCase):
                 )
                 self.assertIn("Jimmy Lai", c.get("cluster_terms", []))
                 self.assertIn("黎智英", c.get("anchor_terms", []))
+
+
+class TestCandidatePrimaryUrlSelection(unittest.TestCase):
+    """Test primary_url upgrade policy used during candidate enrichment."""
+
+    @staticmethod
+    def _add_link_to_event(db: NewsPoolDB, *, event_id: int, url: str, page_age: str) -> None:
+        domain = url.split("/", 3)[2]
+        link = PoolLink(
+            url=url,
+            norm_url=url,
+            domain=domain,
+            title="Source",
+            description="Source description",
+            age=None,
+            page_age=page_age,
+            query="test",
+            offset=1,
+            fetched_at_ts=int(time.time()),
+        )
+        db.upsert_links([link])
+        row = db._conn.execute("SELECT id FROM links WHERE norm_url = ?", (url,)).fetchone()
+        assert row is not None
+        db.assign_link_to_event(link_id=int(row["id"]), event_id=event_id)
+
+    def test_primary_url_prefers_most_recent_trusted_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Trusted source update",
+                    category="Global News",
+                    jurisdiction="US",
+                    primary_url="https://x.com/original-post",
+                )
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url="https://x.com/original-post",
+                    page_age="2026-02-07T10:00:00",
+                )
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url="https://reuters.com/update-1",
+                    page_age="2026-02-07T11:00:00",
+                )
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url="https://bbc.co.uk/update-2",
+                    page_age="2026-02-07T12:00:00",
+                )
+
+                c = db.get_daily_candidates(limit=1, now_ts=int(time.time()))[0]
+                self.assertEqual(c["primary_url"], "https://bbc.co.uk/update-2")
+                self.assertNotIn(c["primary_url"], c["supporting_urls"])
+                self.assertIn("https://x.com/original-post", c["supporting_urls"])
+
+    def test_primary_url_falls_back_to_best_article_cache_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Low-trust coverage",
+                    category="Global News",
+                    jurisdiction="US",
+                    primary_url="https://x.com/first-mention",
+                )
+                low_quality_recent = "https://example-low.com/recent"
+                high_quality_older = "https://another-low.net/deep-report"
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url=low_quality_recent,
+                    page_age="2026-02-07T12:00:00",
+                )
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url=high_quality_older,
+                    page_age="2026-02-07T11:00:00",
+                )
+
+                db.upsert_article_cache(
+                    norm_url=low_quality_recent,
+                    url=low_quality_recent,
+                    final_url=low_quality_recent,
+                    domain="example-low.com",
+                    http_status=200,
+                    extracted_title="Quick take",
+                    extracted_text="Brief summary text",
+                    extractor="trafilatura",
+                    fetched_at_ts=int(time.time()),
+                    quality_score=15,
+                    error=None,
+                )
+                db.upsert_article_cache(
+                    norm_url=high_quality_older,
+                    url=high_quality_older,
+                    final_url=high_quality_older,
+                    domain="another-low.net",
+                    http_status=200,
+                    extracted_title="Detailed report",
+                    extracted_text="Detailed text with substantial evidence",
+                    extractor="trafilatura",
+                    fetched_at_ts=int(time.time()),
+                    quality_score=92,
+                    error=None,
+                )
+
+                c = db.get_daily_candidates(limit=1, now_ts=int(time.time()))[0]
+                self.assertEqual(c["primary_url"], high_quality_older)
+                self.assertIn(low_quality_recent, c["supporting_urls"])
+
+    def test_primary_url_falls_back_to_most_recent_unique_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                eid = db.create_event(
+                    summary_en="Fallback chain event",
+                    category="Global News",
+                    jurisdiction="US",
+                    primary_url="https://x.com/seed",
+                )
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url="https://dup-source.com/newest",
+                    page_age="2026-02-07T13:00:00",
+                )
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url="https://dup-source.com/older",
+                    page_age="2026-02-07T12:00:00",
+                )
+                unique_url = "https://unique-source.net/update"
+                self._add_link_to_event(
+                    db,
+                    event_id=eid,
+                    url=unique_url,
+                    page_age="2026-02-07T11:00:00",
+                )
+
+                c = db.get_daily_candidates(limit=1, now_ts=int(time.time()))[0]
+                self.assertEqual(c["primary_url"], unique_url)
+                self.assertNotIn(unique_url, c["supporting_urls"])
+                self.assertIn("https://dup-source.com/newest", c["supporting_urls"])
 
 
 class TestMergeEventsInto(unittest.TestCase):
