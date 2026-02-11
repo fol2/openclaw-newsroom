@@ -15,6 +15,7 @@ It is designed to answer:
 
 - `newsroom/evals/clustering_eval_dataset_v1.jsonl`
 - `newsroom/evals/clustering_eval_dataset_v1.meta.json`
+- `newsroom/evals/clustering_eval_metrics_baseline_v1.json`
 
 Each JSONL line is one labelled sample with this schema version:
 
@@ -104,6 +105,54 @@ uv run python scripts/replay_clustering_eval_dataset.py \
 
 This checks that labels remain self-consistent with parser outputs and provides
 machine-readable replay statistics.
+
+## Automated Metrics and Regression Gate
+
+The repository also ships `scripts/eval_clustering_metrics.py`, which computes
+the v1 regression metrics directly from the eval dataset replay payload:
+
+- `duplicate_rate_fragmentation`
+- `misassignment_rate`
+- `fragmentation_score`
+- `snowball_sink_metric`
+- `parse_error_rate` (safety guard)
+
+Run locally with the committed baseline gate:
+
+```bash
+uv run python scripts/eval_clustering_metrics.py \
+  --dataset newsroom/evals/clustering_eval_dataset_v1.jsonl \
+  --baseline newsroom/evals/clustering_eval_metrics_baseline_v1.json \
+  --fail-on-regression
+```
+
+The CI workflow runs the same command. Any metric regression larger than the
+configured threshold in the baseline file fails the job.
+
+## Baseline Refresh Workflow
+
+When intentionally improving/changing clustering behaviour, regenerate and
+commit an updated baseline:
+
+```bash
+uv run python scripts/eval_clustering_metrics.py \
+  --dataset newsroom/evals/clustering_eval_dataset_v1.jsonl \
+  --baseline-out newsroom/evals/clustering_eval_metrics_baseline_v1.json \
+  --write-baseline \
+  --overwrite
+```
+
+If needed, override threshold slack at generation time:
+
+```bash
+uv run python scripts/eval_clustering_metrics.py \
+  --dataset newsroom/evals/clustering_eval_dataset_v1.jsonl \
+  --baseline-out newsroom/evals/clustering_eval_metrics_baseline_v1.json \
+  --write-baseline \
+  --overwrite \
+  --threshold misassignment_rate=0.015 \
+  --threshold snowball_sink_metric=0.02
+```
 
 ## Notes
 

@@ -101,6 +101,7 @@ uv run python scripts/newsroom_runner.py --dry-run
 | `news_pool_restore_jsonl.py` | Restores a JSONL dump into a fresh SQLite DB (refuses to overwrite without `--overwrite`). |
 | `build_clustering_eval_dataset.py` | Builds a reproducible labelled clustering evaluation dataset from `clustering_decisions`. |
 | `replay_clustering_eval_dataset.py` | Replays dataset rows through parser logic and reports label consistency metrics. |
+| `eval_clustering_metrics.py` | Computes clustering quality metrics and enforces baseline regression thresholds for CI/local checks. |
 
 All scripts live in the `scripts/` directory and are invoked as standalone Python scripts.
 
@@ -132,6 +133,15 @@ the last 168 hours, plus any events referenced by those links (and their parents
 
 ```bash
 uv run python -m pytest newsroom/tests/ -v
+```
+
+Run the clustering eval regression gate locally:
+
+```bash
+uv run python scripts/eval_clustering_metrics.py \
+  --dataset newsroom/evals/clustering_eval_dataset_v1.jsonl \
+  --baseline newsroom/evals/clustering_eval_metrics_baseline_v1.json \
+  --fail-on-regression
 ```
 
 ## Key Modules
