@@ -136,6 +136,9 @@ class TestParseClusteringResponse(unittest.TestCase):
             "action": "new_event",
             "confidence": 0.95,
             "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": [
+                {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
+            ],
             "category": "US Stocks",
             "jurisdiction": "US",
             "link_flags": [],
@@ -146,7 +149,97 @@ class TestParseClusteringResponse(unittest.TestCase):
         assert result is not None
         self.assertEqual(result["validated"]["action"], "new_event")
         self.assertEqual(result["validated"]["summary_en"], "Tesla Q4 earnings beat expectations")
+        self.assertEqual(
+            result["validated"]["entity_aliases"],
+            [{"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]}],
+        )
         self.assertEqual(result["enforced"]["action"], "new_event")
+
+    def test_parse_new_event_single_object_entity_aliases(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": {
+                "label": "Elon Musk",
+                "type": "person",
+                "aliases": ["馬斯克"],
+            },
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result["validated"]["entity_aliases"],
+            [{"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]}],
+        )
+
+    def test_parse_entity_alias_types_persist_to_db(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": [
+                {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
+                {"label": "Tesla", "type": "organisation", "aliases": ["特斯拉"]},
+                {"label": "Austin", "type": "location", "aliases": ["奧斯汀"]},
+            ],
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
+        }
+        parsed = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "news_pool.sqlite3"
+            with NewsPoolDB(path=db_path) as db:
+                event_id = db.create_event(
+                    summary_en=parsed["validated"]["summary_en"],
+                    category=parsed["validated"]["category"],
+                    jurisdiction=parsed["validated"]["jurisdiction"] or "US",
+                    entity_aliases=parsed["validated"]["entity_aliases"],
+                )
+                ev = db.get_event(event_id)
+                self.assertIsNotNone(ev)
+                assert ev is not None
+                self.assertEqual(
+                    ev.get("entity_aliases"),
+                    [
+                        {"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]},
+                        {"label": "Tesla", "type": "org", "aliases": ["特斯拉"]},
+                        {"label": "Austin", "type": "location", "aliases": ["奧斯汀"]},
+                    ],
+                )
+
+    def test_parse_entity_aliases_preserves_type_on_single_object(self) -> None:
+        response = {
+            "action": "new_event",
+            "confidence": 0.95,
+            "summary_en": "Tesla Q4 earnings beat expectations",
+            "entity_aliases": {
+                "label": "Elon Musk",
+                "type": "person",
+                "aliases": ["馬斯克"],
+            },
+            "category": "US Stocks",
+            "jurisdiction": "US",
+            "link_flags": [],
+            "match_basis": ["entity", "number"],
+        }
+        result = parse_clustering_response(response, {}, [])
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(
+            result["validated"]["entity_aliases"],
+            [{"label": "Elon Musk", "type": "person", "aliases": ["馬斯克"]}],
+        )
 
     def test_parse_normalises_category_aliases(self) -> None:
         response = {
@@ -726,6 +819,9 @@ class TestClusterLink(unittest.TestCase):
                     "action": "new_event",
                     "confidence": 0.9,
                     "summary_en": "Scientists discover new species",
+                    "entity_aliases": [
+                        {"label": "Ocean Institute", "aliases": ["海洋研究所"]},
+                    ],
                     "category": "Global News",
                     "jurisdiction": "GLOBAL",
                     "link_flags": [],
@@ -742,6 +838,10 @@ class TestClusterLink(unittest.TestCase):
                 self.assertIsNotNone(ev)
                 assert ev is not None
                 self.assertEqual(ev["summary_en"], "Scientists discover new species")
+                self.assertEqual(
+                    ev.get("entity_aliases"),
+                    [{"label": "Ocean Institute", "aliases": ["海洋研究所"]}],
+                )
 
     def test_cluster_link_normalises_category_before_db_write(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1253,6 +1353,31 @@ class TestRetrieveCandidates(unittest.TestCase):
         candidates = retrieve_candidates(link, events, min_score=0.05)
         found_ids = {ev["id"] for ev, _ in candidates}
         self.assertIn(3, found_ids)  # Posted event should be found.
+
+    def test_retrieval_uses_entity_aliases(self) -> None:
+        events = [
+            {
+                "id": 1,
+                "summary_en": "Court confirms sentencing in high-profile case",
+                "title": "Sentencing update",
+                "category": "Hong Kong News",
+                "status": "active",
+                "entity_aliases": [
+                    {"label": "Jimmy Lai", "aliases": ["黎智英"]},
+                ],
+            },
+            {
+                "id": 2,
+                "summary_en": "New football transfer update",
+                "title": "Sports transfer",
+                "category": "Sports",
+                "status": "active",
+            },
+        ]
+        link = {"title": "黎智英被判囚 20 年", "description": "香港法院判刑"}
+        candidates = retrieve_candidates(link, events, min_score=0.05)
+        self.assertTrue(len(candidates) > 0)
+        self.assertEqual(candidates[0][0]["id"], 1)
 
     def test_respects_top_k(self) -> None:
         events = self._make_events()
