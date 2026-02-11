@@ -30,6 +30,7 @@ class TestWriteRunJobScript(unittest.TestCase):
                         "suggested_category": "AI" if i % 2 == 0 else "Global News",
                         "title": f"Example Title {i}",
                         "description": f"Example description {i}.",
+                        "lang_hint": "en" if i % 2 == 0 else "zh",
                         "primary_url": f"https://example.com/{i}",
                         "supporting_urls": [f"https://example.org/{i}a", f"https://example.net/{i}b"],
                         "age_minutes": 30 * i,
@@ -90,6 +91,8 @@ class TestWriteRunJobScript(unittest.TestCase):
                 self.assertEqual(story["run"]["trigger"], "cron_daily")
                 self.assertEqual(story["destination"]["title_channel_id"], "1467628391082496041")
                 self.assertEqual(story["monitor"]["timeout_seconds"], 1234)
+                self.assertIn(story["story"]["lang_hint"], {"en", "zh"})
+                self.assertEqual(story["spawn"]["input_mapping"]["lang_hint"], "$.story.lang_hint")
 
 
     def test_write_run_job_timeout_seconds_has_sane_minimum(self) -> None:
@@ -111,6 +114,7 @@ class TestWriteRunJobScript(unittest.TestCase):
                     "suggested_category": "Global News",
                     "title": "Example Title 1",
                     "description": "Example description 1.",
+                    "lang_hint": "en",
                     "primary_url": "https://example.com/1",
                     "supporting_urls": ["https://example.org/1a"],
                     "age_minutes": 30,
@@ -152,6 +156,7 @@ class TestWriteRunJobScript(unittest.TestCase):
             story = json.loads(story_files[0].read_text(encoding="utf-8"))
             jsonschema.validate(instance=story, schema=story_schema)
             self.assertEqual(story["monitor"]["timeout_seconds"], 60)
+            self.assertEqual(story["story"]["lang_hint"], "en")
 
 
     def test_write_run_job_v5_top_level_candidates(self) -> None:
@@ -177,6 +182,7 @@ class TestWriteRunJobScript(unittest.TestCase):
                     "category": "Politics",
                     "title": "PM crisis deepens",
                     "description": "UK PM faces renewed pressure",
+                    "lang_hint": "en",
                     "summary_en": "UK PM faces renewed pressure",
                     "primary_url": "https://bbc.co.uk/pm-crisis",
                     "supporting_urls": ["https://guardian.com/pm-crisis"],
@@ -199,6 +205,7 @@ class TestWriteRunJobScript(unittest.TestCase):
                     "category": "AI",
                     "title": "New AI model released",
                     "description": "Company releases AI model",
+                    "lang_hint": "mixed",
                     "summary_en": "Company releases AI model",
                     "primary_url": "https://techcrunch.com/ai-model",
                     "supporting_urls": [],
@@ -245,6 +252,8 @@ class TestWriteRunJobScript(unittest.TestCase):
             # Verify category and title.
             self.assertEqual(s1["story"]["category"], "Politics")
             self.assertEqual(s2["story"]["category"], "AI")
+            self.assertEqual(s1["story"]["lang_hint"], "en")
+            self.assertEqual(s2["story"]["lang_hint"], "mixed")
 
 
 if __name__ == "__main__":

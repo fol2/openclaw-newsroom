@@ -55,6 +55,7 @@ class TestNewsPoolDBV5Fresh(unittest.TestCase):
                 self.assertEqual(len(links), 1)
                 self.assertIsNone(links[0]["event_id"])
                 self.assertIsNotNone(links[0]["published_at_ts"])
+                self.assertEqual(links[0]["lang_hint"], "en")
 
 
 class TestLinkSkipCluster(unittest.TestCase):
@@ -714,6 +715,7 @@ class TestCandidateEnrichment(unittest.TestCase):
                 self.assertEqual(c["event_id"], eid)
                 self.assertEqual(c["cluster_size"], 2)
                 self.assertIsInstance(c["age_minutes"], int)
+                self.assertEqual(c["lang_hint"], "en")
 
                 # supporting_urls: should have the non-primary URL.
                 self.assertIn("https://bbc.co.uk/tesla-q4", c["supporting_urls"])
@@ -737,6 +739,8 @@ class TestCandidateEnrichment(unittest.TestCase):
                 self.assertIn("event_id", c)
                 self.assertIn("supporting_urls", c)
                 self.assertIn("domains", c)
+                self.assertIn("lang_hint", c)
+                self.assertEqual(c["lang_hint"], "mixed")
 
 
 class TestMergeEventsInto(unittest.TestCase):
