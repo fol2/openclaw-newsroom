@@ -1204,10 +1204,24 @@ def _execute_merge_group(
     if len(group_events) < 2:
         return
 
-    winner = max(
-        group_events,
-        key=lambda e: (e.get("link_count", 0), -(e.get("created_at_ts", 0))),
-    )
+    posted_events = [e for e in group_events if e.get("status") == "posted"]
+    if len(posted_events) > 1:
+        # Safety: do not merge posted events together, as that would delete an audit trail
+        # (thread_id/run_id are keyed to the posted event row).
+        logger.info(
+            "Skipping merge group with multiple posted events: %s",
+            [int(e.get("id") or 0) for e in posted_events],
+        )
+        return
+
+    if len(posted_events) == 1:
+        # Prefer preserving the posted event row for audit safety.
+        winner = posted_events[0]
+    else:
+        winner = max(
+            group_events,
+            key=lambda e: (e.get("link_count", 0), -(e.get("created_at_ts", 0))),
+        )
     loser_ids = [e["id"] for e in group_events if e["id"] != winner["id"]]
 
     # Handle posted status transfer.
@@ -1300,6 +1314,13 @@ def merge_events(
     merged_ids: set[int] = set()
 
     for aid, bid, _score in cross_pairs:
+        if consecutive_failures >= max_consecutive_failures:
+            logger.warning(
+                "Merge early exit: %d consecutive LLM failures, skipping remaining cross-category pairs",
+                consecutive_failures,
+            )
+            break
+
         if aid in merged_ids or bid in merged_ids:
             continue
         ev_a = ev_lookup_all.get(aid)
@@ -1332,6 +1353,7 @@ def merge_events(
             )
         except (json.JSONDecodeError, ValueError):
             stats["errors"] += 1
+            consecutive_failures += 1
             continue
 
         valid_ids = {aid, bid}

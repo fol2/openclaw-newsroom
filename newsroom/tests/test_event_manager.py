@@ -1133,7 +1133,7 @@ class TestBuildFocusedClusteringPrompt(unittest.TestCase):
 
 class TestMergeIncludesPosted(unittest.TestCase):
     def test_posted_status_transfer(self) -> None:
-        """If loser is posted and winner is not, posted status should transfer."""
+        """Merges should preserve posted event rows (thread_id/run_id audit trail)."""
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "news_pool.sqlite3"
             with NewsPoolDB(path=Path(db_path)) as db:
@@ -1168,9 +1168,15 @@ class TestMergeIncludesPosted(unittest.TestCase):
                 stats = merge_events(db=db, gemini=gemini, delay_seconds=0)
                 self.assertGreaterEqual(stats["groups_merged"], 1)
 
-                winner = db.get_event(eid1)
+                # Posted event should be preserved as the merge winner.
+                winner = db.get_event(eid2)
                 assert winner is not None
                 self.assertEqual(winner["status"], "posted")
+                self.assertEqual(winner["thread_id"], "t123")
+                self.assertEqual(winner["run_id"], "r123")
+
+                loser = db.get_event(eid1)
+                self.assertIsNone(loser)
 
     def test_cross_category_merge(self) -> None:
         """Events in different categories with strong retrieval similarity should be detected."""

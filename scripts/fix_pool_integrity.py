@@ -401,6 +401,8 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--db",
+        "--db-path",
+        dest="db",
         default=str(OPENCLAW_HOME / "data" / "newsroom" / "news_pool.sqlite3"),
         help="SQLite db path (default: %(default)s).",
     )
