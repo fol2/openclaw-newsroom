@@ -43,6 +43,10 @@ CATEGORY_LIST = [
 ]
 
 _ASSIGNMENT_MIN_CONFIDENCE = 0.70
+_POSTED_ASSIGN_MIN_CONFIDENCE = 0.92
+_POSTED_ASSIGN_MIN_SCORE = 0.40
+_POSTED_ASSIGN_MIN_MATCH_SIGNALS = 2
+_POSTED_ASSIGN_STRONG_MATCH_BASIS = {"entity", "number", "location", "time"}
 _LINK_FLAGS_ALLOWED = {"roundup", "opinion", "live_updates", "multi_topic"}
 _LINK_FLAGS_FORCE_NEW_EVENT = {"roundup", "multi_topic"}
 _TRANSLATION_FALLBACK_WEAK_SCORE = 0.30
@@ -1882,6 +1886,14 @@ def cluster_link(
 
     # Validate against candidate events (not full list), then enforce policy.
     candidate_events = [ev for ev, _score in candidates]
+    candidate_scores: dict[int, float] = {}
+    for ev, score in candidates:
+        try:
+            eid = int(ev.get("id") or 0)
+            if eid > 0:
+                candidate_scores[eid] = float(score)
+        except Exception:
+            continue
     parsed = parse_clustering_response(response, link, candidate_events)
     if not parsed:
         _log_decision(
@@ -1920,26 +1932,100 @@ def cluster_link(
             if ev["id"] == event_id and ev.get("status") == "posted":
                 assigned_to_posted = True
                 break
-        db.assign_link_to_event(link_id=link_id, event_id=event_id)
-        upsert_features_fn = getattr(db, "upsert_event_features", None)
-        if callable(upsert_features_fn):
-            upsert_features_fn(
-                event_id=int(event_id),
-                payload=enforced.get("event_features") if isinstance(enforced.get("event_features"), dict) else None,
-                safe_merge=True,
-                fallback_summary=enforced.get("summary_en"),
-                fallback_entity_aliases=enforced.get("entity_aliases"),
+
+        if assigned_to_posted:
+            confidence = 0.0
+            try:
+                confidence = float(enforced.get("confidence") or 0.0)
+            except Exception:
+                confidence = 0.0
+            retrieval_score = float(candidate_scores.get(int(event_id), 0.0))
+            match_basis_raw = enforced.get("match_basis")
+            match_basis_list = match_basis_raw if isinstance(match_basis_raw, list) else []
+            match_basis_terms = {
+                str(item).strip().lower()
+                for item in match_basis_list
+                if isinstance(item, (str, int, float)) and str(item).strip()
+            }
+            strong_match_count = len(match_basis_terms & _POSTED_ASSIGN_STRONG_MATCH_BASIS)
+
+            posted_override_reasons: list[str] = []
+            if confidence < _POSTED_ASSIGN_MIN_CONFIDENCE:
+                posted_override_reasons.append(f"confidence:{confidence:.2f}")
+            if retrieval_score < _POSTED_ASSIGN_MIN_SCORE:
+                posted_override_reasons.append(f"retrieval_score:{retrieval_score:.2f}")
+            if strong_match_count < _POSTED_ASSIGN_MIN_MATCH_SIGNALS:
+                posted_override_reasons.append(f"match_signals:{strong_match_count}")
+
+            if posted_override_reasons:
+                dev_label = str(enforced.get("development") or "").strip()
+                if not dev_label and link_title:
+                    dev_label = link_title[:120]
+                if not dev_label:
+                    dev_label = None
+
+                enforcement = enforced.get("enforcement")
+                enforcement_obj = dict(enforcement) if isinstance(enforcement, dict) else {}
+                old_reasons = enforcement_obj.get("reasons")
+                reasons = list(old_reasons) if isinstance(old_reasons, list) else []
+                reasons.extend([f"posted_freeze:{r}" for r in posted_override_reasons])
+                enforcement_obj["original_action"] = str(enforcement_obj.get("original_action") or "assign")
+                enforcement_obj["reasons"] = reasons
+
+                enforced = {
+                    "action": "development",
+                    "parent_event_id": int(event_id),
+                    "summary_en": str(enforced.get("summary_en") or "").strip(),
+                    "development": dev_label,
+                    "category": enforced.get("category"),
+                    "jurisdiction": enforced.get("jurisdiction"),
+                    "confidence": confidence,
+                    "match_basis": list(match_basis_list),
+                    "link_flags": enforced.get("link_flags") if isinstance(enforced.get("link_flags"), list) else [],
+                    "entity_aliases": (
+                        enforced.get("entity_aliases")
+                        if isinstance(enforced.get("entity_aliases"), list)
+                        else []
+                    ),
+                    "event_features": (
+                        enforced.get("event_features")
+                        if isinstance(enforced.get("event_features"), dict)
+                        else None
+                    ),
+                    "routed_from_posted_assign": True,
+                    "enforcement": enforcement_obj,
+                }
+                action = "development"
+                assigned_to_posted = False
+                logger.info(
+                    "Posted-event freeze override: assign->development for event %d (confidence=%.2f score=%.2f signals=%d)",
+                    int(event_id),
+                    confidence,
+                    retrieval_score,
+                    strong_match_count,
+                )
+
+        if action == "assign":
+            db.assign_link_to_event(link_id=link_id, event_id=event_id)
+            upsert_features_fn = getattr(db, "upsert_event_features", None)
+            if callable(upsert_features_fn):
+                upsert_features_fn(
+                    event_id=int(event_id),
+                    payload=enforced.get("event_features") if isinstance(enforced.get("event_features"), dict) else None,
+                    safe_merge=True,
+                    fallback_summary=enforced.get("summary_en"),
+                    fallback_entity_aliases=enforced.get("entity_aliases"),
+                )
+            enforced["assigned_to_posted"] = assigned_to_posted
+            logger.info("Assigned link %d to event %d%s", link_id, event_id, " (posted)" if assigned_to_posted else "")
+            _log_decision(
+                llm_response=response,
+                validated_action=validated_action_obj,
+                enforced_action=dict(enforced),
+                llm_started_at_ts=llm_started_at_ts,
+                llm_finished_at_ts=llm_finished_at_ts,
             )
-        enforced["assigned_to_posted"] = assigned_to_posted
-        logger.info("Assigned link %d to event %d%s", link_id, event_id, " (posted)" if assigned_to_posted else "")
-        _log_decision(
-            llm_response=response,
-            validated_action=validated_action_obj,
-            enforced_action=dict(enforced),
-            llm_started_at_ts=llm_started_at_ts,
-            llm_finished_at_ts=llm_finished_at_ts,
-        )
-        return enforced
+            return enforced
 
     if action == "development":
         parent_id = enforced["parent_event_id"]

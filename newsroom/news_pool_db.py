@@ -19,6 +19,7 @@ SCHEMA_VERSION = 8
 _RESERVATION_SECONDS = 600  # 10 minutes
 
 _DEFAULT_TTL_SECONDS = 48 * 3600  # 48 hours
+_HARD_MAX_EVENT_TTL_SECONDS = 7 * 24 * 3600  # 7 days hard cap (non-extendable)
 
 
 @dataclass(frozen=True)
@@ -1530,11 +1531,17 @@ class NewsPoolDB:
                   link_count = link_count + 1,
                   best_published_ts = MAX(COALESCE(best_published_ts, 0), COALESCE(?, 0)),
                   updated_at_ts = ?,
-                  expires_at_ts = MAX(COALESCE(expires_at_ts, 0), ?),
+                  expires_at_ts = CASE
+                    WHEN status = 'posted' THEN expires_at_ts
+                    ELSE MIN(
+                      MAX(COALESCE(expires_at_ts, 0), ?),
+                      COALESCE(created_at_ts, ?) + ?
+                    )
+                  END,
                   status = CASE WHEN status = 'new' THEN 'active' ELSE status END
                 WHERE id = ?
                 """,
-                (link_pub_ts, now, expires, event_id),
+                (link_pub_ts, now, expires, now, _HARD_MAX_EVENT_TTL_SECONDS, event_id),
             )
 
     # ------------------------------------------------------------------
@@ -1598,8 +1605,17 @@ class NewsPoolDB:
         # If this is a development, bump parent's expires_at_ts.
         if parent_event_id is not None:
             cur.execute(
-                "UPDATE events SET expires_at_ts = MAX(COALESCE(expires_at_ts, 0), ?), updated_at_ts = ? WHERE id = ?",
-                (expires, now, parent_event_id),
+                """
+                UPDATE events SET
+                  expires_at_ts = MIN(
+                    MAX(COALESCE(expires_at_ts, 0), ?),
+                    COALESCE(created_at_ts, ?) + ?
+                  ),
+                  updated_at_ts = ?
+                WHERE id = ?
+                  AND status IN ('new', 'active')
+                """,
+                (expires, now, _HARD_MAX_EVENT_TTL_SECONDS, now, parent_event_id),
             )
 
         return event_id
@@ -1672,8 +1688,10 @@ class NewsPoolDB:
 
         Notes:
         - Root events only (parent_event_id IS NULL).
-        - Unposted events are included only if they are unexpired (expires_at_ts > now).
-        - Posted events are included only within a short recent window for dedupe.
+        - Unposted events are included only if they are unexpired (expires_at_ts > now)
+          and within the hard max TTL window.
+        - Posted events are included only within a short recent window for dedupe
+          and only while still hard-eligible.
         - Ordering prefers updated_at_ts / best_published_ts over created_at_ts.
 
         Args:
@@ -1684,6 +1702,7 @@ class NewsPoolDB:
         now = now_ts if now_ts is not None else _utc_now_ts()
         unposted_cutoff = now - max_age_hours * 3600
         posted_cutoff = now - posted_recent_hours * 3600
+        hard_unexpired_cutoff = now
         cur = self._conn.cursor()
 
         # Active/unposted root events: unexpired + recently updated/published.
@@ -1706,6 +1725,7 @@ class NewsPoolDB:
             WHERE e.parent_event_id IS NULL
               AND e.status IN ('new', 'active')
               AND e.expires_at_ts > ?
+              AND (COALESCE(e.created_at_ts, 0) + ?) > ?
               AND (
                     COALESCE(e.updated_at_ts, 0) >= ?
                  OR COALESCE(e.best_published_ts, 0) >= ?
@@ -1716,7 +1736,15 @@ class NewsPoolDB:
                      e.id DESC
             LIMIT ?
             """,
-            (now, unposted_cutoff, unposted_cutoff, unposted_cutoff, max_root_events),
+            (
+                now,
+                _HARD_MAX_EVENT_TTL_SECONDS,
+                hard_unexpired_cutoff,
+                unposted_cutoff,
+                unposted_cutoff,
+                unposted_cutoff,
+                max_root_events,
+            ),
         ).fetchall()
 
         # Recent posted root events: include only for short-window dedupe/assignment.
@@ -1739,10 +1767,11 @@ class NewsPoolDB:
             WHERE e.parent_event_id IS NULL
               AND e.status = 'posted'
               AND COALESCE(e.posted_at_ts, 0) >= ?
+              AND (COALESCE(e.created_at_ts, 0) + ?) > ?
             ORDER BY COALESCE(e.posted_at_ts, 0) DESC,
                      e.id DESC
             """,
-            (posted_cutoff,),
+            (posted_cutoff, _HARD_MAX_EVENT_TTL_SECONDS, hard_unexpired_cutoff),
         ).fetchall()
 
         rows = list(unposted_rows) + list(posted_rows)
@@ -1774,7 +1803,7 @@ class NewsPoolDB:
         return current
 
     def get_fresh_events(self, *, now_ts: int | None = None) -> list[dict[str, Any]]:
-        """Return events where expires_at_ts > now (for clustering prompt)."""
+        """Return events that are both soft-unexpired and hard-eligible."""
         now = now_ts if now_ts is not None else _utc_now_ts()
         cur = self._conn.cursor()
         rows = cur.execute(
@@ -1793,9 +1822,10 @@ class NewsPoolDB:
             LEFT JOIN event_features AS ef
               ON ef.event_id = e.id
             WHERE e.expires_at_ts > ?
+              AND (COALESCE(e.created_at_ts, 0) + ?) > ?
             ORDER BY e.created_at_ts DESC
             """,
-            (now,),
+            (now, _HARD_MAX_EVENT_TTL_SECONDS, now),
         ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -1823,10 +1853,10 @@ class NewsPoolDB:
             """
             SELECT id FROM events
             WHERE status != 'posted'
-              AND expires_at_ts < ?
+              AND MIN(COALESCE(expires_at_ts, 0), COALESCE(created_at_ts, 0) + ?) < ?
               AND created_at_ts < ?
             """,
-            (now, age_cutoff),
+            (_HARD_MAX_EVENT_TTL_SECONDS, now, age_cutoff),
         ).fetchall()
 
         if not rows:
@@ -1849,6 +1879,79 @@ class NewsPoolDB:
 
         n = len(ids)
         logger.info("Pruned %d expired events (max_age_hours=%d)", n, max_age_hours)
+        return n
+
+    def prune_stale_unposted_events(
+        self,
+        *,
+        stale_after_hours: int = 96,
+        low_link_max: int = 1,
+        low_quality_summary_chars: int = 80,
+        now_ts: int | None = None,
+    ) -> int:
+        """Delete stale, expired unposted events that are low-link or low-quality.
+
+        Safety constraints:
+        - Never deletes posted events (audit trail).
+        - Only deletes events that are already expired and stale.
+        - Only deletes leaf events (no children), to avoid breaking parent links.
+        """
+        now = now_ts if now_ts is not None else _utc_now_ts()
+        stale_cutoff = now - max(1, int(stale_after_hours)) * 3600
+        low_link_threshold = max(0, int(low_link_max))
+        summary_chars_threshold = max(1, int(low_quality_summary_chars))
+        cur = self._conn.cursor()
+
+        rows = cur.execute(
+            """
+            SELECT e.id
+            FROM events AS e
+            WHERE e.status != 'posted'
+              AND COALESCE(e.expires_at_ts, 0) < ?
+              AND COALESCE(e.updated_at_ts, e.created_at_ts, 0) < ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM events AS child
+                WHERE child.parent_event_id = e.id
+              )
+              AND (
+                COALESCE(e.link_count, 0) <= ?
+                OR e.primary_url IS NULL
+                OR TRIM(e.primary_url) = ''
+                OR (
+                  (e.title IS NULL OR TRIM(e.title) = '')
+                  AND LENGTH(TRIM(COALESCE(e.summary_en, ''))) < ?
+                )
+              )
+            """,
+            (now, stale_cutoff, low_link_threshold, summary_chars_threshold),
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        ids = [int(r["id"]) for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+
+        # Nullify event_id on orphaned links.
+        cur.execute(
+            f"UPDATE links SET event_id = NULL WHERE event_id IN ({placeholders})",
+            ids,
+        )
+
+        cur.execute(
+            f"DELETE FROM events WHERE id IN ({placeholders})",
+            ids,
+        )
+
+        n = len(ids)
+        logger.info(
+            "Pruned %d stale unposted events (stale_after_hours=%d, low_link_max=%d, low_quality_summary_chars=%d)",
+            n,
+            int(stale_after_hours),
+            int(low_link_max),
+            int(low_quality_summary_chars),
+        )
         return n
 
     def _event_link_domains_map(self, *, event_ids: Iterable[int]) -> dict[int, list[str]]:
@@ -2042,10 +2145,11 @@ class NewsPoolDB:
                 FROM events
                 WHERE status IN ('new', 'active')
                   AND expires_at_ts > ?
+                  AND (COALESCE(created_at_ts, 0) + ?) > ?
                   AND (reserved_until_ts IS NULL OR reserved_until_ts < ?)
                 ORDER BY id DESC
                 """,
-                (now, now),
+                (now, _HARD_MAX_EVENT_TTL_SECONDS, now, now),
             ).fetchall()
             candidates = [dict(r) for r in rows]
             candidates = self._rank_daily_candidates(candidates=candidates, now_ts=now)
@@ -2158,10 +2262,11 @@ class NewsPoolDB:
                 FROM events
                 WHERE status IN ('new', 'active')
                   AND expires_at_ts > ?
+                  AND (COALESCE(created_at_ts, 0) + ?) > ?
                   AND (reserved_until_ts IS NULL OR reserved_until_ts < ?)
                 ORDER BY id DESC
                 """,
-                (now, now),
+                (now, _HARD_MAX_EVENT_TTL_SECONDS, now, now),
             ).fetchall()
             candidates = [dict(r) for r in rows]
             candidates = self._rank_hourly_candidates(candidates=candidates, now_ts=now)
@@ -2372,7 +2477,10 @@ class NewsPoolDB:
                 UPDATE events SET
                   link_count = ?,
                   best_published_ts = ?,
-                  expires_at_ts = ?,
+                  expires_at_ts = MIN(
+                    ?,
+                    COALESCE(created_at_ts, ?) + ?
+                  ),
                   entity_aliases_json = ?,
                   updated_at_ts = ?,
                   status = {new_status_expr}
@@ -2382,6 +2490,8 @@ class NewsPoolDB:
                     actual_link_count,
                     best_pub,
                     best_exp,
+                    now,
+                    _HARD_MAX_EVENT_TTL_SECONDS,
                     merged_aliases_json,
                     now,
                     actual_link_count,

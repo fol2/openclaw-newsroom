@@ -20,6 +20,7 @@ OPENCLAW_HOME = Path(__file__).resolve().parents[1]
 os.environ.setdefault("OPENCLAW_HOME", str(OPENCLAW_HOME))
 sys.path.insert(0, str(OPENCLAW_HOME))
 
+from newsroom.event_gc import run_periodic_unposted_event_gc  # noqa: E402
 from newsroom.event_manager import cluster_all_pending, merge_events  # noqa: E402
 from newsroom.gemini_client import GeminiClient  # noqa: E402
 from newsroom.news_pool_db import NewsPoolDB  # noqa: E402
@@ -82,6 +83,35 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM clustering.")
     parser.add_argument("--no-gdelt", action="store_true", help="Skip GDELT pool update.")
     parser.add_argument("--no-rss", action="store_true", help="Skip RSS pool update.")
+    parser.add_argument(
+        "--event-gc-state-key",
+        default="event_gc_unposted",
+        help="Fetch-state key used by periodic stale-event GC.",
+    )
+    parser.add_argument(
+        "--event-gc-min-interval-seconds",
+        type=int,
+        default=6 * 3600,
+        help="Minimum seconds between stale-event GC runs (default: 21600).",
+    )
+    parser.add_argument(
+        "--event-gc-stale-hours",
+        type=int,
+        default=96,
+        help="Staleness threshold in hours for stale-event GC (default: 96).",
+    )
+    parser.add_argument(
+        "--event-gc-low-link-max",
+        type=int,
+        default=1,
+        help="Maximum link_count treated as low-link for stale-event GC (default: 1).",
+    )
+    parser.add_argument(
+        "--event-gc-summary-min-chars",
+        type=int,
+        default=80,
+        help="Minimum summary chars used by stale-event low-quality rule (default: 80).",
+    )
     parser.add_argument(
         "--write-path",
         default=str(OPENCLAW_HOME / "data" / "newsroom" / "daily_inputs_last.json"),
@@ -210,6 +240,28 @@ def main(argv: list[str]) -> int:
             merge_stats = {"error": str(e)}
 
     # ---------------------------------------------------------------
+    # Step 2c: Periodic stale-event GC (non-fatal)
+    # ---------------------------------------------------------------
+    event_gc: dict[str, Any]
+    gc_state_key = str(args.event_gc_state_key).strip() or "event_gc_unposted"
+    try:
+        event_gc = run_periodic_unposted_event_gc(
+            db_path=_DB_PATH,
+            state_key=gc_state_key,
+            min_interval_seconds=int(args.event_gc_min_interval_seconds),
+            stale_after_hours=int(args.event_gc_stale_hours),
+            low_link_max=int(args.event_gc_low_link_max),
+            low_quality_summary_chars=int(args.event_gc_summary_min_chars),
+        )
+    except Exception as e:
+        event_gc = {
+            "ok": False,
+            "state_key": gc_state_key,
+            "should_gc": True,
+            "error": str(e),
+        }
+
+    # ---------------------------------------------------------------
     # Step 3: Event selection (daily: 10-15, category balance, HK guarantee)
     # ---------------------------------------------------------------
     candidates: list[dict[str, Any]] = []
@@ -269,6 +321,7 @@ def main(argv: list[str]) -> int:
         },
         "clustering": clustering_stats,
         "merge": merge_stats,
+        "event_gc": event_gc,
         "candidates": candidates,
         "candidate_count": len(candidates),
     }
