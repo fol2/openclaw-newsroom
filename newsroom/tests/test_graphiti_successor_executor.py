@@ -657,8 +657,8 @@ def test_d_two_valid_packets_share_grant_and_do_not_reset_ceilings(
     assert first_marker["spend_gbp_microunits"] == spend
     assert first_marker["invocation_record_only"] is True
     starts, reserved = executor.default_prior_consumption(evidence)
-    assert starts == executor.CLASSIFIED_PRIOR_STARTS + 2
-    assert reserved == executor.CLASSIFIED_PRIOR_RESERVED
+    assert starts == executor.CLASSIFIED_PRIOR_STARTS + 2 * cohort_len
+    assert reserved == executor.CLASSIFIED_PRIOR_RESERVED + 2 * int(spend)
 
 
 def test_default_prior_consumption_keeps_classified_baseline(
@@ -726,12 +726,12 @@ def test_default_prior_consumption_keeps_classified_baseline(
     )
     successor = evidence / f".issue-895-f4-invocation-{'cd' * 32}.json"
     successor.write_text(
-        json.dumps({"event_count": 209, "spend_gbp_microunits": 104500000}),
+        json.dumps({"event_count": 3, "spend_gbp_microunits": 400000}),
         encoding="utf-8",
     )
     assert executor.default_prior_consumption(evidence) == (
-        executor.CLASSIFIED_PRIOR_STARTS + 1,
-        executor.CLASSIFIED_PRIOR_RESERVED,
+        executor.CLASSIFIED_PRIOR_STARTS + 3,
+        executor.CLASSIFIED_PRIOR_RESERVED + 400000,
     )
 
 

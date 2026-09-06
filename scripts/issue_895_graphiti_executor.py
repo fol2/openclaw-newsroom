@@ -158,13 +158,7 @@ def _terminal_evidence_complete(output: Path) -> bool:
 
 
 def default_prior_consumption(evidence_root: Path) -> tuple[int, int]:
-    """Retained classified starts/reservations, plus non-spent successor markers.
-
-    A successor marker records that one invocation happened. It must not treat
-    the planned whole-cohort event_count/spend as actual consumption: a
-    pre-provider classified stop can leave one attempted event and a released
-    reservation. Spent packet digests remain in the classified baseline.
-    """
+    """Retained classified starts/reservations, plus non-spent successor markers."""
 
     starts = CLASSIFIED_PRIOR_STARTS
     reserved = CLASSIFIED_PRIOR_RESERVED
@@ -192,9 +186,8 @@ def default_prior_consumption(evidence_root: Path) -> tuple[int, int]:
             stop("cannot inspect programme consumption")
         if event_count < 0 or spend < 0:
             stop("cannot inspect programme consumption")
-        if event_count == 0:
-            continue
-        starts += 1
+        starts += event_count
+        reserved += spend
     return starts, reserved
 
 
