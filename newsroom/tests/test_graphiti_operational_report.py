@@ -259,9 +259,14 @@ def test_operational_packet_composes_existing_contracts_once_without_live_io(
     assert result["non_effects_scope"] == "READ_ONLY_EVALUATOR_ONLY"
     assert result["operational_reconciliation"]["status"] == "COMPLETE"
     stderr = capsys.readouterr().err
+    assert "operational_stage\tBACKUP\tbegin" in stderr
     assert "operational_stage\tBACKUP\telapsed_s=" in stderr
-    assert "operational_stage\tCURRENT_COHORT_PLAN\telapsed_s=" in stderr
-    assert "operational_stage\tDORMANT_CAMPAIGN_INPUT\telapsed_s=" in stderr
+    assert "operational_stage\tRECOVERY_IDENTITY\telapsed_s=" in stderr
+    assert "operational_stage\tREADINESS_EVALUATOR\tbegin" in stderr
+    assert "operational_stage\tREADINESS_EVALUATOR\telapsed_s=" in stderr
+    assert "operational_stage\tSEAL_OPERATIONAL_RESULT\telapsed_s=" in stderr
+    assert "operational_stage\tREADY_PACKET_VALIDATION\telapsed_s=" in stderr
+    assert "operational_stage\tTOTAL\telapsed_s=" in stderr
     assert "stage_timings" not in result["operational_reconciliation"]
     assert result["operational_reconciliation"]["provider_calls"] == 0
     assert calls == 1
