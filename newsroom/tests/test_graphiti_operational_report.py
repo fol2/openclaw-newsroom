@@ -12,6 +12,7 @@ from scripts import graphiti_steady_state_report
 def test_operational_packet_composes_existing_contracts_once_without_live_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     events: list[str] = []
     proving = object()
@@ -257,6 +258,11 @@ def test_operational_packet_composes_existing_contracts_once_without_live_io(
     assert result["verdict"] == "READY_FOR_OWNER_DECISION"
     assert result["non_effects_scope"] == "READ_ONLY_EVALUATOR_ONLY"
     assert result["operational_reconciliation"]["status"] == "COMPLETE"
+    stderr = capsys.readouterr().err
+    assert "operational_stage\tBACKUP\telapsed_s=" in stderr
+    assert "operational_stage\tCURRENT_COHORT_PLAN\telapsed_s=" in stderr
+    assert "operational_stage\tDORMANT_CAMPAIGN_INPUT\telapsed_s=" in stderr
+    assert "stage_timings" not in result["operational_reconciliation"]
     assert result["operational_reconciliation"]["provider_calls"] == 0
     assert calls == 1
     assert events == [
