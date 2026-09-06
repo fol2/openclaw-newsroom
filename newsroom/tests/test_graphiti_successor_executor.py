@@ -198,6 +198,7 @@ def test_spent_packet_digest_constants_include_historical_bindings() -> None:
         "sha256:af152f8e777b0deaf8d756d54442267577d5c902d7997f4def476c74a63be70c",
         "sha256:ffcce3ff377c231540892939a9f3a104dea143006e54499395e0396b291f7a3d",
         "sha256:7b3dd53925e3fd85b9fec85b6699cc83310a10b3d5c2fa87229cc92dc147e956",
+        "sha256:8db610dbb06da896de504e9aa6de5bf5dc68769c38f3cc02b1c886a4dc5cfb40",
     }
     assert executor.DEFAULT_ATTEMPTED_EVENT_IDS >= {
         "sha256:1349b0c9f873c4da795732a974aab7db31b87cbeca50364f487f388093024cd1",
@@ -208,6 +209,7 @@ def test_spent_packet_digest_constants_include_historical_bindings() -> None:
         "sha256:ac29d8d72d287b5642203c33aaff93bba0374057b3768fd4f7fa2d1c413b3f4e",
         "sha256:94c81bf8a5285df858eb0d766fe646c4c837e2c5be521a5c454fe23fea029d81",
         "sha256:c5ed75e4bbc33f702a9d730e0a9ba7542cca591ad3eaffb0bcd2145b37c4d9fa",
+        "sha256:5d98022f37be76383cde3c4a049385f2bb9f108bf8113038c2d0703fd2e1ceeb",
     }
 
 
@@ -655,8 +657,8 @@ def test_d_two_valid_packets_share_grant_and_do_not_reset_ceilings(
     assert first_marker["spend_gbp_microunits"] == spend
     assert first_marker["invocation_record_only"] is True
     starts, reserved = executor.default_prior_consumption(evidence)
-    assert starts == executor.CLASSIFIED_PRIOR_STARTS + 2 * cohort_len
-    assert reserved == executor.CLASSIFIED_PRIOR_RESERVED + 2 * int(spend)
+    assert starts == executor.CLASSIFIED_PRIOR_STARTS + 2
+    assert reserved == executor.CLASSIFIED_PRIOR_RESERVED
 
 
 def test_default_prior_consumption_keeps_classified_baseline(
@@ -664,7 +666,7 @@ def test_default_prior_consumption_keeps_classified_baseline(
 ) -> None:
     evidence = tmp_path / "evidence"
     evidence.mkdir()
-    assert executor.CLASSIFIED_PRIOR_STARTS == 8
+    assert executor.CLASSIFIED_PRIOR_STARTS == 9
     assert executor.CLASSIFIED_PRIOR_RESERVED == 4_000_000
     assert executor.default_prior_consumption(evidence) == (
         executor.CLASSIFIED_PRIOR_STARTS,
@@ -710,18 +712,26 @@ def test_default_prior_consumption_keeps_classified_baseline(
         json.dumps({"event_count": 210, "spend_gbp_microunits": 105000000}),
         encoding="utf-8",
     )
+    configuration_spent = evidence / (
+        ".issue-895-f4-invocation-"
+        "8db610dbb06da896de504e9aa6de5bf5dc68769c38f3cc02b1c886a4dc5cfb40.json"
+    )
+    configuration_spent.write_text(
+        json.dumps({"event_count": 209, "spend_gbp_microunits": 104500000}),
+        encoding="utf-8",
+    )
     assert executor.default_prior_consumption(evidence) == (
         executor.CLASSIFIED_PRIOR_STARTS,
         executor.CLASSIFIED_PRIOR_RESERVED,
     )
     successor = evidence / f".issue-895-f4-invocation-{'cd' * 32}.json"
     successor.write_text(
-        json.dumps({"event_count": 3, "spend_gbp_microunits": 400000}),
+        json.dumps({"event_count": 209, "spend_gbp_microunits": 104500000}),
         encoding="utf-8",
     )
     assert executor.default_prior_consumption(evidence) == (
-        executor.CLASSIFIED_PRIOR_STARTS + 3,
-        executor.CLASSIFIED_PRIOR_RESERVED + 400000,
+        executor.CLASSIFIED_PRIOR_STARTS + 1,
+        executor.CLASSIFIED_PRIOR_RESERVED,
     )
 
 
