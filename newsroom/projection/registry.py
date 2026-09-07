@@ -54,6 +54,14 @@ class ProjectionFamilyRegistry:
         self._by_key = by_key
         self._current = selected
 
+        # These frozen contracts already form a fixed registry snapshot.
+        # Resolve retained identities without rehashing every contract per row.
+        by_digest: dict[str, ProjectionFamilyDefinition | None] = {}
+        for item in by_key.values():
+            digest = item.digest
+            by_digest[digest] = None if digest in by_digest else item
+        self._by_digest = by_digest
+
     def resolve(self, family_id: str, version: str | None = None) -> ProjectionFamilyDefinition:
         selected = self._current.get(family_id) if version is None else version
         try:
@@ -62,10 +70,10 @@ class ProjectionFamilyRegistry:
             raise ProjectionContractError(f"unknown projection family: {family_id}/{selected}") from exc
 
     def resolve_digest(self, digest: str) -> ProjectionFamilyDefinition:
-        matches = [item for item in self._by_key.values() if item.digest == digest]
-        if len(matches) != 1:
+        match = self._by_digest.get(digest) if isinstance(digest, str) else None
+        if match is None:
             raise ProjectionContractError("unknown or ambiguous family definition digest")
-        return matches[0]
+        return match
 
     def definitions(self) -> tuple[ProjectionFamilyDefinition, ...]:
         return tuple(self._by_key[key] for key in sorted(self._by_key))

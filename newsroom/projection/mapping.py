@@ -67,7 +67,7 @@ class StructuralNodeBinding:
             "identity_source": self.identity_source.value,
             "payload_field": self.payload_field,
         }
-        # Keep pre-3E contract digests byte-for-byte stable.  The optional
+        # Keep pre-3E contract digests byte-for-byte stable. The optional
         # namespace is emitted only for mappings that deliberately opt into
         # governed lifecycle identity convergence.
         if self.identity_namespace is not None:
@@ -457,6 +457,14 @@ class StructuralMappingRegistry:
         self._by_key = by_key
         self._current = selected
 
+        # These frozen contracts already form a fixed registry snapshot.
+        # Resolve retained identities without rehashing every contract per row.
+        by_digest: dict[str, StructuralMappingContract | None] = {}
+        for item in by_key.values():
+            digest = item.contract_digest
+            by_digest[digest] = None if digest in by_digest else item
+        self._by_digest = by_digest
+
     def resolve(self, mapping_id: str, version: str | None = None) -> StructuralMappingContract:
         selected = self._current.get(mapping_id) if version is None else version
         try:
@@ -465,10 +473,10 @@ class StructuralMappingRegistry:
             raise ProjectionContractError(f"unknown mapping: {mapping_id}/{selected}") from exc
 
     def resolve_digest(self, digest: str) -> StructuralMappingContract:
-        matches = [item for item in self._by_key.values() if item.contract_digest == digest]
-        if len(matches) != 1:
+        match = self._by_digest.get(digest) if isinstance(digest, str) else None
+        if match is None:
             raise ProjectionContractError("unknown or ambiguous mapping digest")
-        return matches[0]
+        return match
 
     def contracts(self) -> tuple[StructuralMappingContract, ...]:
         return tuple(self._by_key[key] for key in sorted(self._by_key))
