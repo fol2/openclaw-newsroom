@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
+import struct
 import tempfile
 from collections import Counter
 from collections.abc import Callable
@@ -12,7 +14,7 @@ from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
 
 from newsroom.authority.canonical import (
     canonical_json_bytes,
@@ -523,28 +525,92 @@ def _database_byte_size(connection: sqlite3.Connection) -> int:
     return page_count * page_size
 
 
-def _uncopied_logical_digest(connection: sqlite3.Connection) -> str:
-    tables = _tables(connection)
-    counts: dict[str, int] = {}
-    count_sql = {
-        "ledger_events": "SELECT COUNT(*) FROM ledger_events",
-        "ledger": "SELECT COUNT(*) FROM ledger",
-        "proving_observations": "SELECT COUNT(*) FROM proving_observations",
-        "unpublished_graphiti_ingest": (
-            "SELECT COUNT(*) FROM unpublished_graphiti_ingest"
-        ),
-    }
-    for name, sql in count_sql.items():
-        if name in tables:
-            counts[name] = int(connection.execute(sql).fetchone()[0])
-    return digest_canonical(
-        {
-            "schema_fingerprint": _schema_fingerprint(connection),
-            "watermark": _watermark(connection),
-            "row_counts": counts,
-            "copy_omitted": True,
-        }
+def _sql_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _update_sql_value(hasher: Any, value: object) -> None:
+    if value is None:
+        hasher.update(b"\x00")
+        return
+    if isinstance(value, bytes):
+        hasher.update(b"\x01")
+        hasher.update(len(value).to_bytes(8, "big"))
+        hasher.update(value)
+        return
+    if isinstance(value, memoryview):
+        data = value.tobytes()
+        hasher.update(b"\x01")
+        hasher.update(len(data).to_bytes(8, "big"))
+        hasher.update(data)
+        return
+    if isinstance(value, str):
+        data = value.encode("utf-8")
+        hasher.update(b"\x02")
+        hasher.update(len(data).to_bytes(8, "big"))
+        hasher.update(data)
+        return
+    if isinstance(value, bool):
+        hasher.update(b"\x03")
+        hasher.update(b"\x01" if value else b"\x00")
+        return
+    if isinstance(value, int):
+        data = str(value).encode("ascii")
+        hasher.update(b"\x04")
+        hasher.update(len(data).to_bytes(8, "big"))
+        hasher.update(data)
+        return
+    if isinstance(value, float):
+        hasher.update(b"\x05")
+        hasher.update(struct.pack(">d", value))
+        return
+    raise sqlite3.DatabaseError(
+        f"unsupported SQLite value type {type(value).__name__}"
     )
+
+
+def _table_order_sql(connection: sqlite3.Connection, table: str) -> str:
+    quoted = _sql_ident(table)
+    columns = list(connection.execute(f"PRAGMA table_info({quoted})"))
+    pk_columns = [
+        str(row[1])
+        for row in sorted(columns, key=lambda item: int(item[5]))
+        if int(row[5]) > 0
+    ]
+    if pk_columns:
+        return "ORDER BY " + ", ".join(_sql_ident(name) for name in pk_columns)
+    return "ORDER BY rowid"
+
+
+def _hash_retained_table(
+    hasher: Any, connection: sqlite3.Connection, table: str
+) -> None:
+    encoded = table.encode("utf-8")
+    hasher.update(b"T")
+    hasher.update(len(encoded).to_bytes(8, "big"))
+    hasher.update(encoded)
+    quoted = _sql_ident(table)
+    order = _table_order_sql(connection, table)
+    for row in connection.execute(f"SELECT * FROM {quoted} {order}"):
+        hasher.update(b"R")
+        hasher.update(len(row).to_bytes(4, "big"))
+        for value in row:
+            _update_sql_value(hasher, value)
+
+
+def _uncopied_logical_digest(connection: sqlite3.Connection) -> str:
+    """Hash retained table bytes. Counts and watermarks are not content."""
+
+    hasher = hashlib.sha256()
+    fingerprint = _schema_fingerprint(connection).encode("utf-8")
+    hasher.update(len(fingerprint).to_bytes(8, "big"))
+    hasher.update(fingerprint)
+    tables = sorted(
+        name for name in _tables(connection) if not name.startswith("sqlite_")
+    )
+    for table in tables:
+        _hash_retained_table(hasher, connection, table)
+    return f"sha256:{hasher.hexdigest()}"
 
 
 def _logical_content_digest(
@@ -553,8 +619,9 @@ def _logical_content_digest(
     """Bind store identity without a tempfile copy or a ≳2 GiB serialize.
 
     A planted ``snapshot_files`` sha256 remains authoritative for tests.
-    Small images still use ``Connection.serialize()``. Larger stores use
-    schema fingerprint, watermark and append-only row counts.
+    Small images still use ``Connection.serialize()``. Larger stores hash
+    schema plus every retained user-table row so same-count mutations change
+    identity. SQLite errors fail closed; they do not fall back to counts.
     """
 
     files = getattr(snapshot, "snapshot_files", ())
