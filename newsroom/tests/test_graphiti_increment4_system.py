@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
@@ -13,7 +14,10 @@ from newsroom.authority import (
     StaticPrincipal,
 )
 from newsroom.authority._graphiti_increment4_system import _open_with_adapter
-from newsroom.authority.persistence import AuthorityWriterBusy
+from newsroom.authority.persistence import (
+    AuthorityPersistenceError,
+    AuthorityWriterBusy,
+)
 from newsroom.increment4 import increment4_admitted_contract_registry
 
 from .authority_a2b_helpers import _policy_registries
@@ -198,3 +202,98 @@ def test_combined_increment4_system_closes_adapter_on_cas_construction_failure(
 
     assert adapter.closed is True
     assert adapter.close_count == 1
+
+
+def _seed_combined_increment4_store(tmp_path: Path) -> Path:
+    adapter = TrackingMemoryNeo4jAdapter()
+    system = _open(tmp_path, adapter)
+    try:
+        system.objects.admit(
+            ObjectAdmissionRequest("source.capture", "combined-object-1"),
+            b"combined-authority",
+            proof=proof(),
+        )
+        system.sources.register_definition(definition_request(), proof=proof())
+    finally:
+        system.close()
+    return tmp_path / "authority.sqlite3"
+
+
+def _tamper_restoring_trigger(
+    database: Path, *, trigger: str, sql: str, parameters: tuple[object, ...]
+) -> None:
+    connection = sqlite3.connect(database)
+    try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone()[0]
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        connection.execute(sql, parameters)
+        connection.execute(trigger_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_increment4_open_revalidates_clean_store(tmp_path: Path) -> None:
+    _seed_combined_increment4_store(tmp_path)
+    reopened = _open(tmp_path, TrackingMemoryNeo4jAdapter())
+    reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("trigger", "sql", "parameters", "match"),
+    [
+        (
+            "immutable_authentication_contexts_update",
+            "UPDATE authentication_contexts SET canonical_bytes=?",
+            (b'{"tampered":true}',),
+            "authentication",
+        ),
+        (
+            "immutable_authorization_requests_update",
+            "UPDATE authorization_requests SET canonical_bytes=?",
+            (b'{"tampered":true}',),
+            "request",
+        ),
+        (
+            "immutable_authorization_decisions_update",
+            "UPDATE authorization_decisions SET canonical_bytes=?",
+            (b'{"tampered":true}',),
+            "decision",
+        ),
+        (
+            "immutable_authority_commands_update",
+            "UPDATE authority_commands SET result_bytes=?",
+            (b'{"tampered":true}',),
+            "result digest",
+        ),
+        (
+            "immutable_source_definition_update",
+            "UPDATE source_definitions SET canonical_digest=?",
+            ("sha256:" + "0" * 64,),
+            "canonical digest",
+        ),
+    ],
+    ids=(
+        "authentication",
+        "request",
+        "decision",
+        "result",
+        "source-definition",
+    ),
+)
+def test_increment4_open_refuses_corrupt_immutable_and_domain_rows(
+    tmp_path: Path,
+    trigger: str,
+    sql: str,
+    parameters: tuple[object, ...],
+    match: str,
+) -> None:
+    database = _seed_combined_increment4_store(tmp_path)
+    _tamper_restoring_trigger(
+        database, trigger=trigger, sql=sql, parameters=parameters
+    )
+    with pytest.raises(AuthorityPersistenceError, match=match):
+        _open(tmp_path, TrackingMemoryNeo4jAdapter())

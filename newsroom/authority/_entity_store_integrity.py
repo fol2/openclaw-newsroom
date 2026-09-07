@@ -14,8 +14,6 @@ from newsroom.entities.types import (
 class _EntityIntegrityMixin:
     def _validate_schema_and_integrity(self) -> None:
         super()._validate_schema_and_integrity()
-        if not self._should_validate_row_integrity():
-            return
         self._validate_entity_integrity(self._connection)
 
     def _validate_entity_integrity(self, conn: sqlite3.Connection) -> None:

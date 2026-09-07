@@ -34,8 +34,6 @@ _SOURCE_TABLES = frozenset(
 class _SourceRegistryIntegrityMixin:
     def _validate_schema_and_integrity(self) -> None:
         super()._validate_schema_and_integrity()
-        if not self._should_validate_row_integrity():
-            return
         self._validate_source_registry_integrity(self._connection)
 
     def _validate_source_registry_integrity(

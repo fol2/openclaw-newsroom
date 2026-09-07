@@ -31,26 +31,6 @@ def test_source_system_open_skips_page_walk_pragmas() -> None:
     assert 'execute("PRAGMA integrity_check")' not in source
 
 
-def test_increment4_open_skips_full_table_row_decode() -> None:
-    from newsroom.authority._entity_store_integrity import _EntityIntegrityMixin
-    from newsroom.authority._event_store_base import _EventStoreBase
-    from newsroom.authority._graphiti_increment4_system import (
-        _GraphitiIncrement4AuthorityStore,
-    )
-
-    assert "return False" in inspect.getsource(
-        _GraphitiIncrement4AuthorityStore._should_validate_row_integrity
-    )
-    assert "return True" in inspect.getsource(
-        _EventStoreBase._should_validate_row_integrity
-    )
-    entity = inspect.getsource(_EntityIntegrityMixin._validate_schema_and_integrity)
-    assert "if not self._should_validate_row_integrity():" in entity
-    base = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
-    assert "if self._should_validate_row_integrity():" in base
-    assert "_validate_immutable_records" in base
-
-
 def test_checked_source_registry_migration_is_retained_in_v11(
     tmp_path,
 ) -> None:

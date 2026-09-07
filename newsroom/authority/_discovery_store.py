@@ -1586,8 +1586,6 @@ class _DiscoveryAuthorityStore(_CheckAuthorityStore):
     # ------------------------------------------------------------------
     def _validate_schema_and_integrity(self) -> None:
         super()._validate_schema_and_integrity()
-        if not self._should_validate_row_integrity():
-            return
         conn = self._connection
         for row in conn.execute("SELECT * FROM discovery_signals ORDER BY recorded_at,signal_id"):
             self._signal_from_row(conn, row, replayed=False)

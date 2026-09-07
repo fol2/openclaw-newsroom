@@ -30,8 +30,6 @@ _STATE_BY_ACTION = {
 class _EditorialRelationIntegrityMixin:
     def _validate_schema_and_integrity(self) -> None:
         super()._validate_schema_and_integrity()
-        if not self._should_validate_row_integrity():
-            return
         self._validate_editorial_relation_integrity(self._connection)
 
     def _validate_editorial_relation_integrity(
