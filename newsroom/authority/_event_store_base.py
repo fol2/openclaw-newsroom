@@ -228,8 +228,8 @@ class _EventStoreBase:
             raise AuthoritySchemaError(
                 "SQLite synchronous=FULL is not active"
             )
-        self._validate_relational_invariants(conn)
         if self._should_validate_row_integrity():
+            self._validate_relational_invariants(conn)
             self._validate_immutable_records(conn)
         self._validate_registry_coverage(conn)
 

@@ -49,6 +49,9 @@ def test_increment4_open_skips_full_table_row_decode() -> None:
     base = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
     assert "if self._should_validate_row_integrity():" in base
     assert "_validate_immutable_records" in base
+    assert base.index("if self._should_validate_row_integrity():") < base.index(
+        "_validate_relational_invariants"
+    )
 
 
 def test_checked_source_registry_migration_is_retained_in_v11(
