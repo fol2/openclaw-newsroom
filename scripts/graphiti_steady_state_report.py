@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from newsroom.authority.canonical import (
-    digest_bytes,
     digest_canonical,
     validate_sha256_digest,
 )
@@ -40,7 +39,6 @@ from newsroom.control_plane.paths import (
     require_canonical_proving_store,
     require_canonical_unpublished_store,
 )
-from newsroom.control_plane.read_only_snapshot import read_only_snapshot
 from newsroom.control_plane.sqlite_profile import apply_control_plane_sqlite_profile
 from scripts.hermes_graphiti_worker import compose_governed_graphiti_worker_runtime
 
@@ -110,29 +108,19 @@ def _locked_operational_inputs() -> Iterator[
 
 
 def _authority_backup_identity(output_dir: Path) -> str:
+    """Record pre-bootstrap presence without copying the authority store."""
+
     source = CANONICAL_INCREMENT4_AUTHORITY_STORE
+    output_dir.mkdir(parents=True, exist_ok=True)
     if not source.exists():
         return digest_canonical(
             {"source_path": str(source), "pre_bootstrap_state": "ABSENT"}
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    backup = output_dir / "increment4-authority-pre-bootstrap.sqlite3"
-    if backup.exists():
-        raise FileExistsError(backup)
-    with read_only_snapshot(source) as snapshot:
-        destination = sqlite3.connect(backup)
-        try:
-            snapshot.connection.backup(destination)
-            if destination.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise RuntimeError("Increment 4 authority backup failed quick_check")
-        finally:
-            destination.close()
     return digest_canonical(
         {
             "source_path": str(source.resolve()),
             "pre_bootstrap_state": "PRESENT",
-            "backup_path": str(backup.resolve()),
-            "backup_digest": digest_bytes(backup.read_bytes()),
+            "backup_omitted": True,
         }
     )
 
