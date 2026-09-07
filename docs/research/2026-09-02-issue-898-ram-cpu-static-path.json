@@ -1,0 +1,11 @@
+{
+  "canonical_packet": "docs/research/2026-09-02-issue-898-ram-cpu-measurements.json",
+  "canonical_summary": "docs/research/2026-09-02-issue-898-ram-cpu.md",
+  "decision": "FEASIBILITY_GO",
+  "decision_boundary": "retained_observation_body_scan",
+  "first_migration_atom": "GO",
+  "issue": 898,
+  "previous_no_go_withdrawn": true,
+  "r2": "GO",
+  "status": "SUPERSEDED_BY_CORRECTED_MEASURED_PACKET"
+}

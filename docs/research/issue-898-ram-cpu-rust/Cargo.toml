@@ -1,0 +1,12 @@
+[package]
+name = "issue-898-ram-cpu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Research-only #898 observation-scan comparator. Not a product crate."
+
+[dependencies]
+quick-xml = "0.37"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
