@@ -1208,7 +1208,7 @@ def test_authority_snapshot_evidence_omits_integrity_check() -> None:
     assert "AUTHORITY_STORE_INTEGRITY_FAILURE" not in blockers
 
 
-def test_uncopied_store_identity_tracks_watermark_not_bytes(
+def test_uncopied_store_identity_detects_same_count_payload_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import newsroom.control_plane.graphiti_steady_state as module
@@ -1217,13 +1217,30 @@ def test_uncopied_store_identity_tracks_watermark_not_bytes(
     proving = tmp_path / "proving.sqlite3"
     unpublished = tmp_path / "unpublished.sqlite3"
     authority = tmp_path / "authority.sqlite3"
-    for path in (proving, unpublished, authority):
-        connection = sqlite3.connect(path)
+    with sqlite3.connect(proving) as connection:
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("CREATE TABLE ledger_events (ledger_seq INTEGER)")
-        connection.execute("INSERT INTO ledger_events VALUES (1)")
-        connection.commit()
-        connection.close()
+        connection.execute(
+            "CREATE TABLE proving_observations(run_id TEXT, body BLOB NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO proving_observations VALUES ('run', x'01')"
+        )
+    with sqlite3.connect(unpublished) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            "CREATE TABLE unpublished_graphiti_ingest("
+            "ingest_id TEXT PRIMARY KEY, receipt_digest TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO unpublished_graphiti_ingest VALUES ('ing', 'state-a')"
+        )
+    with sqlite3.connect(authority) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            "CREATE TABLE ledger_events("
+            "ledger_seq INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO ledger_events VALUES (1, 'payload-a')")
     first = graphiti_store_snapshot_digests(
         proving_store=proving,
         unpublished_store=unpublished,
@@ -1239,16 +1256,32 @@ def test_uncopied_store_identity_tracks_watermark_not_bytes(
         )
         == first
     )
-    with sqlite3.connect(authority) as connection:
-        connection.execute("INSERT INTO ledger_events VALUES (2)")
-    assert (
-        graphiti_store_snapshot_digests(
-            proving_store=proving,
-            unpublished_store=unpublished,
-            authority_store=authority,
-        )["authority"]
-        != first["authority"]
+    with sqlite3.connect(proving) as connection:
+        connection.execute("UPDATE proving_observations SET body=x'02'")
+    after_proving = graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
     )
+    assert after_proving["proving"] != first["proving"]
+    with sqlite3.connect(unpublished) as connection:
+        connection.execute(
+            "UPDATE unpublished_graphiti_ingest SET receipt_digest='state-b'"
+        )
+    after_ingest = graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    )
+    assert after_ingest["unpublished"] != after_proving["unpublished"]
+    with sqlite3.connect(authority) as connection:
+        connection.execute("UPDATE ledger_events SET payload='payload-b'")
+    after_payload = graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    )
+    assert after_payload["authority"] != after_ingest["authority"]
 
 
 def test_wal_snapshot_is_logical_and_query_only(tmp_path: Path) -> None:
