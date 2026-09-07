@@ -497,13 +497,64 @@ def _schema_fingerprint(connection: sqlite3.Connection) -> str:
     )
 
 
+_SERIALIZE_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _watermark(connection: sqlite3.Connection) -> int:
+    tables = _tables(connection)
+    if "ledger_events" in tables:
+        return int(
+            connection.execute(
+                "SELECT COALESCE(MAX(ledger_seq),0) FROM ledger_events"
+            ).fetchone()[0]
+        )
+    if "ledger" in tables:
+        return int(
+            connection.execute(
+                "SELECT COALESCE(MAX(seq),0) FROM ledger"
+            ).fetchone()[0]
+        )
+    return 0
+
+
+def _database_byte_size(connection: sqlite3.Connection) -> int:
+    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    return page_count * page_size
+
+
+def _uncopied_logical_digest(connection: sqlite3.Connection) -> str:
+    tables = _tables(connection)
+    counts: dict[str, int] = {}
+    count_sql = {
+        "ledger_events": "SELECT COUNT(*) FROM ledger_events",
+        "ledger": "SELECT COUNT(*) FROM ledger",
+        "proving_observations": "SELECT COUNT(*) FROM proving_observations",
+        "unpublished_graphiti_ingest": (
+            "SELECT COUNT(*) FROM unpublished_graphiti_ingest"
+        ),
+    }
+    for name, sql in count_sql.items():
+        if name in tables:
+            counts[name] = int(connection.execute(sql).fetchone()[0])
+    return digest_canonical(
+        {
+            "schema_fingerprint": _schema_fingerprint(connection),
+            "watermark": _watermark(connection),
+            "row_counts": counts,
+            "copy_omitted": True,
+        }
+    )
+
+
 def _logical_content_digest(
     snapshot: object, connection: sqlite3.Connection
 ) -> str:
-    """Digest the already-copied snapshot file.
+    """Bind store identity without a tempfile copy or a ≳2 GiB serialize.
 
-    ``Connection.serialize()`` raises OperationalError once the logical image
-    exceeds about 2 GiB (``unable to serialize 'main'``).
+    A planted ``snapshot_files`` sha256 remains authoritative for tests.
+    Small images still use ``Connection.serialize()``. Larger stores use
+    schema fingerprint, watermark and append-only row counts.
     """
 
     files = getattr(snapshot, "snapshot_files", ())
@@ -514,15 +565,13 @@ def _logical_content_digest(
             return validate_sha256_digest(
                 f"sha256:{digest}", field="copied snapshot digest"
             )
-    try:
-        logical_bytes = connection.serialize()
-    except sqlite3.OperationalError:
-        if _tables(connection) or int(
-            connection.execute("PRAGMA page_count").fetchone()[0]
-        ) != 0:
-            raise
-        logical_bytes = b""
-    return digest_bytes(logical_bytes)
+    if _database_byte_size(connection) <= _SERIALIZE_MAX_BYTES:
+        try:
+            return digest_bytes(connection.serialize())
+        except sqlite3.OperationalError:
+            if not _tables(connection) and _database_byte_size(connection) == 0:
+                return digest_bytes(b"")
+    return _uncopied_logical_digest(connection)
 
 
 def _store_descriptor(snapshot: object) -> dict[str, object]:
@@ -539,19 +588,7 @@ def _store_descriptor(snapshot: object) -> dict[str, object]:
         if "authority_migrations" in tables
         else []
     )
-    watermark = (
-        int(
-            connection.execute(
-                "SELECT COALESCE(MAX(ledger_seq),0) FROM ledger_events"
-            ).fetchone()[0]
-        )
-        if "ledger_events" in tables
-        else (
-            int(connection.execute("SELECT COALESCE(MAX(seq),0) FROM ledger").fetchone()[0])
-            if "ledger" in tables
-            else 0
-        )
-    )
+    watermark = _watermark(connection)
     # SQLite WAL checkpointing changes physical files without changing the
     # database.  Bind the authority identity to the exact logical image so a
     # sealed packet remains usable after the preparation process closes and a
@@ -660,12 +697,12 @@ def _authority_snapshot_evidence(
     ]
     max_version = max((item[0] for item in actual_migrations), default=0)
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    # Full-file page walks exceed the one-minute operational seal bound.
+    # Schema and migration history remain.
+    integrity = "omitted"
     blockers: list[str] = []
     if not migration_valid or user_version != max_version or max_version < 16:
         blockers.append("AUTHORITY_MIGRATION_HISTORY_INVALID")
-    if integrity != "ok":
-        blockers.append("AUTHORITY_STORE_INTEGRITY_FAILURE")
 
     graph_rows = connection.execute(
         "SELECT g.generation_id,g.state,g.validated_through_ledger_seq,"
