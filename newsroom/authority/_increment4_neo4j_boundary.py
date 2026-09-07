@@ -364,16 +364,32 @@ class _Increment4Neo4jBoundary:
                 "Increment 4 admitted batch exceeds source watermark"
             )
         deleted = self._adapter.cleanup_generation(str(request.generation_id))
-        projected = 0
-        ignored = 0
-        snapshot_digest: str | None = None
-
-        for ledger_seq in range(1, source_watermark + 1):
-            batch = batch_by_seq.get(ledger_seq)
-            state = self._store.projection_rebuild_delivery_state(
-                request.generation_id,
-                ledger_seq,
+        metadata = self._store.projection_generation_metadata(
+            request.generation_id
+        )
+        if metadata.generation.state not in {
+            ProjectionGenerationState.BUILDING,
+            ProjectionGenerationState.VALIDATING,
+        }:
+            raise ProjectionStateError(
+                "Increment 4 unfinished delivery requires a BUILDING generation"
             )
+        # The request owns one immutable snapshot, including all ledger events.
+        # Hash it once so a later delivery key and canonical refusal share identity.
+        snapshot_digest = request.snapshot.canonical_digest
+        projected = 0
+        states = self._store.projection_rebuild_delivery_states(
+            request.generation_id
+        )
+        # Include sequence 1 so one delivery can advance the optional/unmapped
+        # checkpoint across retained history. Remaining skippable sequences are
+        # not written as IGNORED_OPTIONAL commands.
+        work_seqs = set(batch_by_seq) | set(states)
+        if source_watermark >= 1:
+            work_seqs.add(1)
+        for ledger_seq in sorted(work_seqs):
+            batch = batch_by_seq.get(ledger_seq)
+            state = states.get(ledger_seq)
             if state is not None and state.finalized:
                 source = self._store.projection_delivery_source(
                     request.generation_id,
@@ -400,7 +416,6 @@ class _Increment4Neo4jBoundary:
                         raise ProjectionStateError(
                             "Increment 4 admitted batch was previously ignored"
                         )
-                    ignored += 1
                     continue
                 raise ProjectionStateError(
                     "Increment 4 retained delivery is finalized as a failure"
@@ -413,11 +428,6 @@ class _Increment4Neo4jBoundary:
                 raise ProjectionStateError(
                     "Increment 4 unfinished delivery requires a BUILDING generation"
                 )
-            # The request owns one immutable snapshot, including all ledger events.
-            # Hash it only for the first new delivery; recomputing it per sequence
-            # makes an empty-graph rebuild quadratic in retained history.
-            if snapshot_digest is None:
-                snapshot_digest = request.snapshot.canonical_digest
             key_value = {
                 "generation_id": str(request.generation_id),
                 "ledger_seq": ledger_seq,
@@ -442,7 +452,6 @@ class _Increment4Neo4jBoundary:
                     ),
                     proof=proof,
                 )
-                ignored += 1
             else:
                 self._apply_and_record(
                     batch=batch,
@@ -469,7 +478,7 @@ class _Increment4Neo4jBoundary:
             raise ProjectionStateError(
                 "Increment 4 build retained gaps or dead letters"
             )
-        return deleted, projected, ignored
+        return deleted, projected, source_watermark - projected
 
     def _transition_to_validating(
         self,

@@ -1,4 +1,4 @@
-"""Keep materialisation hashing linear in the full retained snapshot.
+"""Keep empty-history materialisation off the per-sequence delivery path.
 
 Only graph/store I/O is replaced. Requests, snapshots, ledger records, delivery
 requests, key derivation and the materialisation loop use production code.
@@ -47,6 +47,9 @@ class _MemoryIO:
 
     def projection_rebuild_delivery_state(self, generation_id, ledger_seq):
         return self.states.get(ledger_seq)
+
+    def projection_rebuild_delivery_states(self, generation_id):
+        return dict(self.states)
 
     def projection_generation_metadata(self, generation_id):
         return self.metadata
@@ -118,11 +121,10 @@ def _run(boundary, request):
 
 
 @pytest.mark.parametrize("count", [1, 8, 32])
-def test_materialization_hashes_full_snapshot_once_and_preserves_delivery_keys(
+def test_materialization_skips_ignored_writes_and_hashes_snapshot_once(
     monkeypatch: pytest.MonkeyPatch, count: int,
 ) -> None:
     request = _request(count)
-    expected_digest = request.snapshot.canonical_digest
     original = snapshot_models._event_digest
     visits: list[int] = []
 
@@ -135,17 +137,8 @@ def test_materialization_hashes_full_snapshot_once_and_preserves_delivery_keys(
     boundary = _boundary(io)
     assert _run(boundary, request) == (0, 0, count)
     assert visits == list(range(1, count + 1))
-    assert len(io.deliveries) == count
-    for seq, delivery in enumerate(io.deliveries, start=1):
-        assert delivery.ledger_seq == seq
-        assert delivery.expected_authority_version == seq
-        assert delivery.outcome is ProjectionDeliveryOutcome.IGNORED_OPTIONAL
-        assert delivery.idempotency_key == boundary._operation_key(
-            request.idempotency_key, "delivery", {
-                "generation_id": str(request.generation_id), "ledger_seq": seq,
-                "snapshot_digest": expected_digest, "outcome": "IGNORED_OPTIONAL",
-            },
-        )
+    assert [item.ledger_seq for item in io.deliveries] == [1]
+    assert io.deliveries[0].outcome is ProjectionDeliveryOutcome.IGNORED_OPTIONAL
 
 
 def test_materialization_digest_is_not_reused_across_invocations(monkeypatch):
@@ -160,39 +153,93 @@ def test_materialization_digest_is_not_reused_across_invocations(monkeypatch):
     monkeypatch.setattr(snapshot_models, "_event_digest", counted)
     io = _MemoryIO(4)
     boundary = _boundary(io)
-    io.fail_at = 3
+    io.fail_at = 1
     with pytest.raises(RuntimeError, match="injected delivery failure"):
         _run(boundary, request)
-    assert len(io.deliveries) == 2
+    assert io.deliveries == []
     io.fail_at = None
     assert _run(boundary, request) == (0, 0, 4)
     assert visits == [1, 2, 3, 4] * 2
-    assert [item.ledger_seq for item in io.deliveries] == [1, 2, 3, 4]
-    # A completely finalised replay neither rehashes nor records new deliveries.
+    assert [item.ledger_seq for item in io.deliveries] == [1]
     assert _run(boundary, request) == (0, 0, 4)
-    assert visits == [1, 2, 3, 4] * 2
-    assert len(io.deliveries) == 4
+    assert visits == [1, 2, 3, 4] * 3
+    assert [item.ledger_seq for item in io.deliveries] == [1]
+
+
+def test_materialization_refuses_drifted_retained_ignored_state():
+    request = _request(3)
+    io = _MemoryIO(3)
+    io.states[1] = SimpleNamespace(
+        finalized=True,
+        outcome=ProjectionDeliveryOutcome.IGNORED_OPTIONAL,
+        source_event_id="1",
+        source_event_digest="retained-1",
+    )
+    boundary = _boundary(io)
+    assert _run(boundary, request) == (0, 0, 3)
+    assert io.deliveries == []
     io.states[1].source_event_digest = "drifted"
     with pytest.raises(ProjectionStateError, match="provenance changed"):
         _run(boundary, request)
 
 
-def test_changed_snapshot_gets_new_keys_on_same_controller():
+def test_finalized_failure_still_refuses_materialization():
+    io = _MemoryIO(3)
+    io.states[1] = SimpleNamespace(
+        finalized=True,
+        outcome=ProjectionDeliveryOutcome.RETRYABLE_FAILURE,
+        source_event_id="1",
+        source_event_digest="retained-1",
+        attempt_count=3,
+    )
+    with pytest.raises(ProjectionStateError, match="finalized as a failure"):
+        _run(_boundary(io), _request(3))
+    assert io.deliveries == []
+
+
+def test_previously_ignored_seq_cannot_gain_an_admitted_batch():
+    io = _MemoryIO(3)
+    io.states[1] = SimpleNamespace(
+        finalized=True,
+        outcome=ProjectionDeliveryOutcome.IGNORED_OPTIONAL,
+        source_event_id="1",
+        source_event_digest="retained-1",
+    )
+    batch = SimpleNamespace(ledger_seq=1)
+    boundary = _boundary(io)
+    with pytest.raises(ProjectionStateError, match="previously ignored"):
+        boundary._materialize_generation(
+            request=_request(3),
+            batches=(batch,),
+            source_watermark=3,
+            proof=AuthenticationProof(
+                method="STATIC_TOKEN", credential="fixture-only"
+            ),
+        )
+
+
+def test_unfinalized_optional_state_still_records_ignored_delivery():
     request = _request(3)
     io = _MemoryIO(3)
+    io.states[2] = SimpleNamespace(
+        finalized=False,
+        outcome=ProjectionDeliveryOutcome.RETRYABLE_FAILURE,
+        source_event_id="2",
+        source_event_digest="retained-2",
+        attempt_count=1,
+    )
     boundary = _boundary(io)
-    _run(boundary, request)
-    prior_keys = [item.idempotency_key for item in io.deliveries]
-    changed = replace(request, snapshot=replace(
-        request.snapshot,
-        events=(replace(request.snapshot.events[0], principal_id="changed"),
-                *request.snapshot.events[1:]),
-    ))
-    io.states.clear()
-    io.deliveries.clear()
-    io.metadata.generation.authority_aggregate_version = 1
-    _run(boundary, changed)
-    assert all(a != b.idempotency_key for a, b in zip(prior_keys, io.deliveries, strict=True))
+    assert _run(boundary, request) == (0, 0, 3)
+    assert [item.ledger_seq for item in io.deliveries] == [1, 2]
+    delivery = io.deliveries[1]
+    assert delivery.outcome is ProjectionDeliveryOutcome.IGNORED_OPTIONAL
+    assert delivery.idempotency_key == boundary._operation_key(
+        request.idempotency_key, "delivery", {
+            "generation_id": str(request.generation_id), "ledger_seq": 2,
+            "snapshot_digest": request.snapshot.canonical_digest,
+            "outcome": "IGNORED_OPTIONAL",
+        },
+    )
 
 
 @pytest.mark.parametrize("field,value,message", [
