@@ -366,6 +366,7 @@ class _Increment4Neo4jBoundary:
         deleted = self._adapter.cleanup_generation(str(request.generation_id))
         projected = 0
         ignored = 0
+        snapshot_digest: str | None = None
 
         for ledger_seq in range(1, source_watermark + 1):
             batch = batch_by_seq.get(ledger_seq)
@@ -412,10 +413,13 @@ class _Increment4Neo4jBoundary:
                 raise ProjectionStateError(
                     "Increment 4 unfinished delivery requires a BUILDING generation"
                 )
+            if snapshot_digest is None:
+                # The frozen request snapshot is unchanged throughout this invocation.
+                snapshot_digest = request.snapshot.canonical_digest
             key_value = {
                 "generation_id": str(request.generation_id),
                 "ledger_seq": ledger_seq,
-                "snapshot_digest": request.snapshot.canonical_digest,
+                "snapshot_digest": snapshot_digest,
                 "outcome": (
                     ProjectionDeliveryOutcome.APPLIED.value
                     if batch is not None
