@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,14 +13,6 @@ from newsroom.control_plane.sqlite_profile import apply_control_plane_sqlite_pro
 
 class ReadOnlySnapshotError(RuntimeError):
     """A stable read-only snapshot could not be established."""
-
-
-def _digest_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _source_file_observations(database: Path) -> tuple[dict[str, object], ...]:
@@ -46,43 +36,34 @@ class ReadOnlySnapshot:
 
 @contextmanager
 def read_only_snapshot(path: str | Path) -> Iterator[ReadOnlySnapshot]:
-    """Expose a transaction-consistent logical SQLite snapshot for reading."""
+    """Expose a transaction-consistent logical SQLite snapshot for reading.
+
+    Isolation is a read transaction on the source, not a tempfile copy.
+    Copying the live Increment 4 store is a multi-GiB backup and misses
+    the one-minute operational seal bound.
+    """
 
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
         raise ReadOnlySnapshotError(f"store does not exist: {resolved}")
-    with tempfile.TemporaryDirectory(prefix="newsroom-readonly-") as scratch:
-        copied = Path(scratch) / resolved.name
-        source = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
-        try:
-            apply_control_plane_sqlite_profile(source, query_only=True, wal=None)
-            source.execute("BEGIN")
-            source.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
-            destination = sqlite3.connect(copied)
-            try:
-                source.backup(destination)
-            finally:
-                destination.close()
-                source.rollback()
-            copied_identity = {
-                "name": copied.name,
-                "size": copied.stat().st_size,
-                "sha256": _digest_file(copied),
-            }
-            connection = sqlite3.connect(
-                f"{copied.as_uri()}?mode=ro&immutable=1", uri=True
-            )
-            try:
-                apply_control_plane_sqlite_profile(
-                    connection, query_only=True, wal=False
-                )
-                yield ReadOnlySnapshot(
-                    connection=connection,
-                    source_path=str(resolved),
-                    source_files=_source_file_observations(resolved),
-                    snapshot_files=(copied_identity,),
-                )
-            finally:
-                connection.close()
-        finally:
-            source.close()
+    connection = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    try:
+        apply_control_plane_sqlite_profile(connection, query_only=True, wal=None)
+        connection.execute("BEGIN")
+        connection.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
+        yield ReadOnlySnapshot(
+            connection=connection,
+            source_path=str(resolved),
+            source_files=_source_file_observations(resolved),
+            snapshot_files=(
+                {
+                    "name": resolved.name,
+                    "size": resolved.stat().st_size,
+                    "copy_omitted": True,
+                },
+            ),
+        )
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()

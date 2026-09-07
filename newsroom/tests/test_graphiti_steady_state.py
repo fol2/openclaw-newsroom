@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -40,6 +41,7 @@ from newsroom.control_plane.graphiti_spend_reconciliation import (
 )
 from newsroom.control_plane.graphiti_steady_state import (
     GraphitiCampaignRuntime,
+    _authority_snapshot_evidence,
     _mint_graphiti_campaign_runtime,
     _spend,
     _store_descriptor,
@@ -1146,6 +1148,109 @@ def test_campaign_runtime_rejects_non_governed_construction_token() -> None:
         )
 
 
+def test_read_only_snapshot_does_not_copy_the_store(tmp_path: Path) -> None:
+    from newsroom.control_plane import read_only_snapshot as snapshot_module
+
+    path = tmp_path / "store.sqlite3"
+    sqlite3.connect(path).close()
+    source = inspect.getsource(snapshot_module.read_only_snapshot)
+    assert "backup(" not in source
+    assert "TemporaryDirectory" not in source
+    with read_only_snapshot(path) as snapshot:
+        assert snapshot.snapshot_files == (
+            {
+                "name": "store.sqlite3",
+                "size": path.stat().st_size,
+                "copy_omitted": True,
+            },
+        )
+        assert snapshot.connection.execute("PRAGMA query_only").fetchone() == (1,)
+
+
+def test_authority_snapshot_evidence_omits_integrity_check() -> None:
+    source = inspect.getsource(_authority_snapshot_evidence)
+    assert 'execute("PRAGMA integrity_check")' not in source
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE authority_migrations (version INTEGER, name TEXT, checksum TEXT)"
+    )
+    connection.execute("CREATE TABLE ledger_events (ledger_seq INTEGER)")
+    for name in (
+        "extraction_proposals",
+        "graphiti_adapter_attempts",
+        "entity_resolution_decisions",
+        "editorial_relation_decisions",
+    ):
+        connection.execute(f"CREATE TABLE {name} (x INTEGER)")
+    connection.execute(
+        "CREATE TABLE projection_generations ("
+        "generation_id TEXT, state TEXT, validated_through_ledger_seq INTEGER,"
+        "family_id TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE projection_families (family_id TEXT, definition_digest TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE projection_family_definitions ("
+        "definition_digest TEXT, projector_version TEXT,"
+        "ontology_contract_digest TEXT, mapping_contract_digest TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE projection_ontology_contracts ("
+        "contract_digest TEXT, ontology_id TEXT, ontology_version TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE projection_mapping_contracts ("
+        "contract_digest TEXT, mapping_id TEXT, mapping_version TEXT)"
+    )
+    evidence, blockers = _authority_snapshot_evidence(connection)
+    assert evidence["integrity_check"] == "omitted"
+    assert "AUTHORITY_STORE_INTEGRITY_FAILURE" not in blockers
+
+
+def test_uncopied_store_identity_tracks_watermark_not_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import newsroom.control_plane.graphiti_steady_state as module
+
+    monkeypatch.setattr(module, "_SERIALIZE_MAX_BYTES", 0)
+    proving = tmp_path / "proving.sqlite3"
+    unpublished = tmp_path / "unpublished.sqlite3"
+    authority = tmp_path / "authority.sqlite3"
+    for path in (proving, unpublished, authority):
+        connection = sqlite3.connect(path)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE ledger_events (ledger_seq INTEGER)")
+        connection.execute("INSERT INTO ledger_events VALUES (1)")
+        connection.commit()
+        connection.close()
+    first = graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    )
+    with sqlite3.connect(authority) as connection:
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    assert (
+        graphiti_store_snapshot_digests(
+            proving_store=proving,
+            unpublished_store=unpublished,
+            authority_store=authority,
+        )
+        == first
+    )
+    with sqlite3.connect(authority) as connection:
+        connection.execute("INSERT INTO ledger_events VALUES (2)")
+    assert (
+        graphiti_store_snapshot_digests(
+            proving_store=proving,
+            unpublished_store=unpublished,
+            authority_store=authority,
+        )["authority"]
+        != first["authority"]
+    )
+
+
 def test_wal_snapshot_is_logical_and_query_only(tmp_path: Path) -> None:
     path = tmp_path / "wal.sqlite3"
     connection = sqlite3.connect(path)
@@ -1212,7 +1317,8 @@ def test_store_identity_binds_copied_snapshot_digest_not_serialize(
     connection.commit()
     planted = "ab" * 32
     with read_only_snapshot(path) as snapshot:
-        assert str(snapshot.snapshot_files[0]["sha256"]) != planted
+        assert snapshot.snapshot_files[0].get("copy_omitted") is True
+        assert "sha256" not in snapshot.snapshot_files[0]
         planted_snapshot = SimpleNamespace(
             connection=snapshot.connection,
             source_path=snapshot.source_path,
@@ -1244,11 +1350,12 @@ def test_snapshot_accepts_checkpoint_churn_without_logical_change(
     writer.commit()
 
     with read_only_snapshot(path) as snapshot:
-        assert writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+        writer.execute("PRAGMA wal_checkpoint(PASSIVE)")
         path.touch()
         assert snapshot.connection.execute(
             "SELECT value FROM evidence"
         ).fetchone() == ("retained",)
+    assert writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
 
     writer.close()
 

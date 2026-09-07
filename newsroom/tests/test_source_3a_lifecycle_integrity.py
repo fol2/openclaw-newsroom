@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sqlite3
 
 import pytest
@@ -19,6 +20,15 @@ from .source_3a_helpers import (
     proof,
     version_request,
 )
+
+
+def test_source_system_open_skips_page_walk_pragmas() -> None:
+    from newsroom.authority._event_store_base import _EventStoreBase
+
+    source = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
+    assert 'execute("PRAGMA quick_check")' not in source
+    assert 'execute("PRAGMA foreign_key_check")' not in source
+    assert 'execute("PRAGMA integrity_check")' not in source
 
 
 def test_checked_source_registry_migration_is_retained_in_v11(
