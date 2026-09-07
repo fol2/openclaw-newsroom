@@ -15,6 +15,10 @@ class CanonicalizationError(ValueError):
 
 
 def _validate_string(value: str, path: str) -> None:
+    # ASCII cannot contain a surrogate. Use the built-in implementation even
+    # for str subclasses, then retain the existing Unicode/error-path checks.
+    if str.isascii(value):
+        return
     for character in value:
         if 0xD800 <= ord(character) <= 0xDFFF:
             raise CanonicalizationError(f"lone surrogate is unsupported at {path}")

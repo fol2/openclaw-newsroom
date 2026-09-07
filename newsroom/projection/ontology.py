@@ -196,6 +196,14 @@ class OntologyRegistry:
         self._by_key = by_key
         self._current = selected
 
+        # These frozen contracts already form a fixed registry snapshot.
+        # Resolve retained identities without rehashing every contract per row.
+        by_digest: dict[str, OntologyContract | None] = {}
+        for item in by_key.values():
+            digest = item.contract_digest
+            by_digest[digest] = None if digest in by_digest else item
+        self._by_digest = by_digest
+
     def resolve(self, ontology_id: str, version: str | None = None) -> OntologyContract:
         selected = self._current.get(ontology_id) if version is None else version
         try:
@@ -204,10 +212,10 @@ class OntologyRegistry:
             raise ProjectionContractError(f"unknown ontology: {ontology_id}/{selected}") from exc
 
     def resolve_digest(self, digest: str) -> OntologyContract:
-        matches = [item for item in self._by_key.values() if item.contract_digest == digest]
-        if len(matches) != 1:
+        match = self._by_digest.get(digest) if isinstance(digest, str) else None
+        if match is None:
             raise ProjectionContractError("unknown or ambiguous ontology digest")
-        return matches[0]
+        return match
 
     def contracts(self) -> tuple[OntologyContract, ...]:
         return tuple(self._by_key[key] for key in sorted(self._by_key))
