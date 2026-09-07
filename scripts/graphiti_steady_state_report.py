@@ -7,6 +7,8 @@ import json
 import secrets
 import sqlite3
 import subprocess
+import sys
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -48,6 +50,24 @@ OPERATIONAL_RESULT_SCHEMA_VERSION = "newsroom.graphiti-operational-readiness-res
 
 def _utc_text(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _begin_operational_stage(name: str) -> float:
+    """Mark stage entry on stderr so an unfinished stage is visible."""
+
+    print(f"operational_stage\t{name}\tbegin", file=sys.stderr, flush=True)
+    return time.monotonic()
+
+
+def _log_operational_stage(name: str, started: float) -> None:
+    """Emit stage elapsed time on stderr; not part of packet identity."""
+
+    elapsed = time.monotonic() - started
+    print(
+        f"operational_stage\t{name}\telapsed_s={elapsed:.3f}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _git(*args: str) -> str:
@@ -225,19 +245,25 @@ def _build_operational_packet(
             "publication_effects": 0,
             "production_admission_effects": 0,
         }
+        overall_started = _begin_operational_stage("TOTAL")
         try:
             try:
+                stage_started = _begin_operational_stage("BACKUP")
                 backup_identity = _authority_backup_identity(output_dir)
                 operational_evidence["backup_identity"] = backup_identity
                 completed_steps.append("BACKUP")
+                _log_operational_stage("BACKUP", stage_started)
 
                 stage = "CANONICAL_AUTHORITY_OPEN"
+                stage_started = _begin_operational_stage(stage)
                 system, proof = open_operational_graphiti_authority_system(
                     credential=secrets.token_urlsafe(32)
                 )
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
                 stage = "CURRENT_COHORT_PLAN"
+                stage_started = _begin_operational_stage(stage)
                 authority = sqlite3.connect(CANONICAL_INCREMENT4_AUTHORITY_STORE)
                 authority.row_factory = sqlite3.Row
                 apply_control_plane_sqlite_profile(authority, query_only=True, wal=None)
@@ -253,8 +279,10 @@ def _build_operational_packet(
                 operational_evidence["plan_digest"] = plan.plan_digest
                 operational_evidence["cohort_digest"] = plan.cohort_digest
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
                 stage = "SOURCE_AND_OBJECT_BOOTSTRAP"
+                stage_started = _begin_operational_stage(stage)
                 bootstrap, binder = bootstrap_operational_authority(
                     system,
                     proof=proof,
@@ -262,8 +290,10 @@ def _build_operational_packet(
                 )
                 operational_evidence["bootstrap"] = bootstrap.canonical_value()
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
                 stage = "ACTIVE_GENERATION_RECONCILIATION"
+                stage_started = _begin_operational_stage(stage)
                 reconciliation = build_and_reconcile_operational_generation(
                     system,
                     proof=proof,
@@ -271,8 +301,10 @@ def _build_operational_packet(
                     bootstrap=bootstrap,
                 )
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
                 stage = "STORE_IDENTITY_SNAPSHOT"
+                stage_started = _begin_operational_stage(stage)
                 snapshots = graphiti_store_snapshot_digests(
                     proving_store=CANONICAL_PROVING_STORE,
                     unpublished_store=CANONICAL_UNPUBLISHED_STORE,
@@ -280,8 +312,10 @@ def _build_operational_packet(
                 )
                 operational_evidence["store_snapshot_digests"] = dict(snapshots)
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
                 stage = "DORMANT_RUNTIME_COMPOSITION"
+                stage_started = _begin_operational_stage(stage)
                 runtime = compose_governed_graphiti_worker_runtime(
                     authority_system=system,
                     authority_store_descriptor_digest=snapshots["authority"],
@@ -292,15 +326,20 @@ def _build_operational_packet(
                     ),
                 )
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
                 stage = "AUTHENTICATED_GRAPH_READBACK"
+                stage_started = _begin_operational_stage(stage)
                 graph_readback = graphiti_graph_destination_readback(
                     destination_id=system.graph_destination_id,
                     reconciliation=reconciliation,
                 )
                 operational_evidence["graph_readback"] = graph_readback
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
 
+                stage = "RECOVERY_IDENTITY"
+                stage_started = _begin_operational_stage(stage)
                 recovery_identity = digest_canonical(
                     {
                         "pre_bootstrap_backup": backup_identity,
@@ -309,7 +348,9 @@ def _build_operational_packet(
                         "active_graph": graph_readback,
                     }
                 )
+                _log_operational_stage(stage, stage_started)
                 stage = "DORMANT_CAMPAIGN_INPUT"
+                stage_started = _begin_operational_stage(stage)
                 campaign = build_operational_campaign_input(
                     head_sha=head_sha,
                     tree_sha=tree_sha,
@@ -323,8 +364,10 @@ def _build_operational_packet(
                 )
                 operational_evidence["campaign_authorised"] = False
                 completed_steps.append(stage)
+                _log_operational_stage(stage, stage_started)
                 operational_evidence["status"] = "COMPLETE"
             except Exception as error:
+                _log_operational_stage(stage, stage_started)
                 preparation_failure = _failure_evidence(
                     "OPERATIONAL_PREPARATION_FAILED",
                     error,
@@ -334,7 +377,8 @@ def _build_operational_packet(
                 operational_evidence["failure"] = preparation_failure
 
             if preparation_failure is not None:
-                return _seal_operational_result(
+                stage_started = _begin_operational_stage("SEAL_OPERATIONAL_RESULT")
+                sealed = _seal_operational_result(
                     None,
                     head_sha=head_sha,
                     tree_sha=tree_sha,
@@ -343,8 +387,12 @@ def _build_operational_packet(
                     failure=preparation_failure,
                     evaluator_attempted=False,
                 )
+                _log_operational_stage("SEAL_OPERATIONAL_RESULT", stage_started)
+                return sealed
 
             evaluator_observed_at = datetime.now(tz=UTC)
+            stage = "READINESS_EVALUATOR"
+            stage_started = _begin_operational_stage(stage)
             try:
                 packet = build_graphiti_steady_state_packet(
                     proving_store=CANONICAL_PROVING_STORE,
@@ -362,7 +410,9 @@ def _build_operational_packet(
                     governed_runtime=runtime,
                 )
             except Exception as error:
-                return _seal_operational_result(
+                _log_operational_stage(stage, stage_started)
+                stage_started = _begin_operational_stage("SEAL_OPERATIONAL_RESULT")
+                sealed = _seal_operational_result(
                     None,
                     head_sha=head_sha,
                     tree_sha=tree_sha,
@@ -375,7 +425,12 @@ def _build_operational_packet(
                         stage="READINESS_EVALUATOR",
                     ),
                 )
+                _log_operational_stage("SEAL_OPERATIONAL_RESULT", stage_started)
+                return sealed
+            _log_operational_stage(stage, stage_started)
 
+            stage = "SEAL_OPERATIONAL_RESULT"
+            stage_started = _begin_operational_stage(stage)
             result = _seal_operational_result(
                 packet,
                 head_sha=head_sha,
@@ -384,10 +439,15 @@ def _build_operational_packet(
                 operational_evidence=operational_evidence,
                 failure=preparation_failure,
             )
+            _log_operational_stage(stage, stage_started)
             try:
                 if result.get("verdict") == "READY_FOR_OWNER_DECISION":
+                    stage = "READY_PACKET_VALIDATION"
+                    stage_started = _begin_operational_stage(stage)
                     validate_graphiti_campaign_packet(result)
+                    _log_operational_stage(stage, stage_started)
             except Exception as error:
+                _log_operational_stage(stage, stage_started)
                 failure = _failure_evidence(
                     "READY_PACKET_VALIDATION_FAILED",
                     error,
@@ -395,6 +455,7 @@ def _build_operational_packet(
                 )
                 operational_evidence["status"] = "FAILED"
                 operational_evidence["failure"] = failure
+                stage_started = _begin_operational_stage("SEAL_OPERATIONAL_RESULT")
                 result = _seal_operational_result(
                     result,
                     head_sha=head_sha,
@@ -403,8 +464,10 @@ def _build_operational_packet(
                     operational_evidence=operational_evidence,
                     failure=failure,
                 )
+                _log_operational_stage("SEAL_OPERATIONAL_RESULT", stage_started)
             return result
         finally:
+            _log_operational_stage("TOTAL", overall_started)
             if system is not None:
                 system.close()
 
@@ -458,12 +521,16 @@ def main() -> int:
             authority_store=args.authority,
             campaign_input=campaign_input,
         )
+    stage_started = _begin_operational_stage("CODE_IDENTITY_CONFIRM")
     if _exact_main_identity() != (head_sha, tree_sha):
         raise RuntimeError("code identity changed while building steady-state evidence")
+    _log_operational_stage("CODE_IDENTITY_CONFIRM", stage_started)
     if args.output_dir is None:
         print(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True))
     else:
+        stage_started = _begin_operational_stage("PACKET_OUTPUT")
         print(write_content_addressed_packet(packet, args.output_dir))
+        _log_operational_stage("PACKET_OUTPUT", stage_started)
     return 0 if packet["verdict"] == "READY_FOR_OWNER_DECISION" else 2
 
 

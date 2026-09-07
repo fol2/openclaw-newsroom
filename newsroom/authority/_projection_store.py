@@ -1477,12 +1477,12 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                     "projection delivery finalized state is inconsistent"
                 )
 
+        state_keys = {
+            (str(state["generation_id"]), int(state["ledger_seq"]))
+            for state in states
+        }
         orphan_attempt = next(
-            (key for key in attempts_by_delivery if not any(
-                str(state["generation_id"]) == key[0]
-                and int(state["ledger_seq"]) == key[1]
-                for state in states
-            )),
+            (key for key in attempts_by_delivery if key not in state_keys),
             None,
         )
         if orphan_attempt is not None:
