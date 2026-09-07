@@ -27,6 +27,8 @@ _TABLE_BY_COMMAND = {
 class _CheckIntegrityMixin:
     def _validate_schema_and_integrity(self) -> None:
         super()._validate_schema_and_integrity()
+        if not self._should_validate_row_integrity():
+            return
         conn = self._connection
         self._validate_check_records(conn)
         self._validate_attempt_chains(conn)

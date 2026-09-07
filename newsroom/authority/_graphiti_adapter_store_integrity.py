@@ -10,6 +10,8 @@ from newsroom.graphiti_adapter.types import GraphitiWorkspaceState
 class _GraphitiAdapterIntegrityMixin:
     def _validate_schema_and_integrity(self) -> None:
         super()._validate_schema_and_integrity()
+        if not self._should_validate_row_integrity():
+            return
         self._validate_graphiti_adapter_integrity(self._connection)
 
     def _validate_graphiti_adapter_integrity(

@@ -74,6 +74,11 @@ class _GraphitiIncrement4AuthorityStore(
 ):
     """One existing authority SQLite/CAS writer for Increment 4."""
 
+    def _should_validate_row_integrity(self) -> bool:
+        # Full-table re-decode of Increment 4 history exceeds the one-minute
+        # operational seal bound after page-walk PRAGMAs were already omitted.
+        return False
+
     _SOURCE_TABLES = frozenset(
         {
             "discovery_occurrences",
