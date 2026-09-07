@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -239,6 +240,19 @@ def test_increment4_controller_builds_validates_promotes_and_reads_active(
     assert result.ignored_optional_count == (
         snapshot.through_ledger_seq - result.projected_batch_count
     )
+    conn = sqlite3.connect(state.entity.extraction.database)
+    try:
+        recorded = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM projection_delivery_states "
+                "WHERE generation_id=?",
+                (str(GENERATION_1),),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    assert result.projected_batch_count <= recorded <= result.projected_batch_count + 1
+    assert recorded < snapshot.through_ledger_seq
     assert result.validation.projection_state_digest == result.projection_state_digest
     assert result.promotion.generation.generation_id == GENERATION_1
     assert status.generation == result.generation

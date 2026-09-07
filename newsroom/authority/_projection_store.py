@@ -2781,55 +2781,12 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
         maximum_ledger_seq: int | None = None,
     ) -> None:
         current = self._checkpoint_seq(conn, generation_id)
-        candidate = current
-        while True:
-            next_seq = candidate + 1
-            if (
-                maximum_ledger_seq is not None
-                and next_seq > maximum_ledger_seq
-            ):
-                break
-            gap = conn.execute(
-                "SELECT 1 FROM projection_gaps WHERE generation_id=? "
-                "AND state='OPEN' AND ledger_seq_start<=? AND ledger_seq_end>=? LIMIT 1",
-                (generation_id, next_seq, next_seq),
-            ).fetchone()
-            if gap is not None:
-                break
-            delivery = conn.execute(
-                "SELECT finalized,current_outcome FROM projection_delivery_states "
-                "WHERE generation_id=? AND ledger_seq=?",
-                (generation_id, next_seq),
-            ).fetchone()
-            if delivery is not None:
-                if int(delivery["finalized"]) != 1:
-                    break
-                if ProjectionDeliveryOutcome(str(delivery["current_outcome"])) not in _SUCCESS_OUTCOMES:
-                    break
-                candidate = next_seq
-                continue
-
-            # Projection management events and other explicitly optional/unmapped
-            # events are deterministically skipped under the retained mapping
-            # contract. Requiring a new delivery command for those events would
-            # create an infinite self-generated ledger tail.
-            source = conn.execute(
-                "SELECT event_type FROM ledger_events WHERE ledger_seq=?",
-                (next_seq,),
-            ).fetchone()
-            if source is None:
-                break
-            generation = self._generation_row(conn, generation_id)
-            family = self._registered_family_definition(
-                conn, str(generation["family_id"])
-            )
-            mapping_contract = self._projection_contracts.mappings.resolve_digest(
-                family.mapping_contract_digest
-            )
-            mapping = mapping_contract.resolve(str(source["event_type"]))
-            if mapping is not None and mapping.required:
-                break
-            candidate = next_seq
+        candidate = self._skippable_checkpoint_candidate(
+            conn,
+            generation_id=generation_id,
+            current=current,
+            maximum_ledger_seq=maximum_ledger_seq,
+        )
         if candidate == current:
             return
         version = int(
@@ -2853,6 +2810,108 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
                 recorded_at,
             ),
         )
+
+    def _skippable_checkpoint_candidate(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        generation_id: str,
+        current: int,
+        maximum_ledger_seq: int | None,
+    ) -> int:
+        # Projection management events and other explicitly optional/unmapped
+        # events are deterministically skipped under the retained mapping
+        # contract. Requiring a new delivery command for those events would
+        # create an infinite self-generated ledger tail.
+        ledger_max_row = conn.execute(
+            "SELECT MAX(ledger_seq) FROM ledger_events"
+        ).fetchone()
+        ledger_max = int(ledger_max_row[0] or 0)
+        if ledger_max <= current:
+            return current
+        upper = (
+            ledger_max
+            if maximum_ledger_seq is None
+            else min(ledger_max, maximum_ledger_seq)
+        )
+        if upper <= current:
+            return current
+        if conn.execute(
+            "SELECT 1 FROM ledger_events WHERE ledger_seq=?",
+            (current + 1,),
+        ).fetchone() is None:
+            return current
+
+        blockers = [upper + 1]
+        expected = upper - current
+        observed = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM ledger_events "
+                "WHERE ledger_seq>? AND ledger_seq<=?",
+                (current, upper),
+            ).fetchone()[0]
+        )
+        if observed != expected:
+            hole = conn.execute(
+                "SELECT e.ledger_seq + 1 FROM ledger_events e "
+                "LEFT JOIN ledger_events n ON n.ledger_seq=e.ledger_seq + 1 "
+                "WHERE e.ledger_seq>=? AND e.ledger_seq<? "
+                "AND n.ledger_seq IS NULL "
+                "ORDER BY e.ledger_seq LIMIT 1",
+                (current if current > 0 else 1, upper),
+            ).fetchone()
+            if hole is not None and hole[0] is not None:
+                blockers.append(int(hole[0]))
+
+        gap = conn.execute(
+            "SELECT MIN(CASE WHEN ledger_seq_start>? THEN ledger_seq_start ELSE ? END) "
+            "FROM projection_gaps WHERE generation_id=? AND state='OPEN' "
+            "AND ledger_seq_end>=? AND ledger_seq_start<=?",
+            (current, current + 1, generation_id, current + 1, upper),
+        ).fetchone()
+        if gap is not None and gap[0] is not None:
+            blockers.append(int(gap[0]))
+
+        bad_delivery = conn.execute(
+            "SELECT MIN(ledger_seq) FROM projection_delivery_states "
+            "WHERE generation_id=? AND ledger_seq>? AND ledger_seq<=? "
+            "AND (finalized!=1 OR current_outcome NOT IN ('APPLIED','IGNORED_OPTIONAL'))",
+            (generation_id, current, upper),
+        ).fetchone()
+        if bad_delivery is not None and bad_delivery[0] is not None:
+            blockers.append(int(bad_delivery[0]))
+
+        generation = self._generation_row(conn, generation_id)
+        family = self._registered_family_definition(
+            conn, str(generation["family_id"])
+        )
+        mapping_contract = self._projection_contracts.mappings.resolve_digest(
+            family.mapping_contract_digest
+        )
+        required_types = tuple(
+            sorted(
+                mapping.event_type
+                for mapping in mapping_contract.mappings
+                if mapping.required
+            )
+        )
+        if required_types:
+            placeholders = ",".join("?" * len(required_types))
+            required = conn.execute(
+                "SELECT MIN(e.ledger_seq) FROM ledger_events e "
+                "LEFT JOIN projection_delivery_states d "
+                "ON d.generation_id=? AND d.ledger_seq=e.ledger_seq "
+                "AND d.finalized=1 AND d.current_outcome IN "
+                "('APPLIED','IGNORED_OPTIONAL') "
+                f"WHERE e.ledger_seq>? AND e.ledger_seq<=? "
+                f"AND e.event_type IN ({placeholders}) AND d.ledger_seq IS NULL",
+                (generation_id, current, upper, *required_types),
+            ).fetchone()
+            if required is not None and required[0] is not None:
+                blockers.append(int(required[0]))
+
+        candidate = min(blockers) - 1
+        return current if candidate < current else candidate
 
     @staticmethod
     def _update_generation_authority_version(
@@ -3168,13 +3227,36 @@ class _ProjectionAuthorityStore(_EventAuthorityStore):
             if row is None:
                 return None
             self._require_delivery_source_integrity(self._connection, row)
-            return _ProjectionRebuildDeliveryState(
-                outcome=ProjectionDeliveryOutcome(str(row["current_outcome"])),
-                finalized=bool(row["finalized"]),
-                attempt_count=int(row["attempt_count"]),
-                source_event_id=EventId.parse(str(row["source_event_id"])),
-                source_event_digest=str(row["source_event_digest"]),
-            )
+            return self._rebuild_delivery_state_from_row(row)
+
+    def projection_rebuild_delivery_states(
+        self,
+        generation_id: ProjectionGenerationId,
+    ) -> dict[int, _ProjectionRebuildDeliveryState]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM projection_delivery_states WHERE generation_id=?",
+                (str(generation_id),),
+            ).fetchall()
+            states: dict[int, _ProjectionRebuildDeliveryState] = {}
+            for row in rows:
+                self._require_delivery_source_integrity(self._connection, row)
+                states[int(row["ledger_seq"])] = (
+                    self._rebuild_delivery_state_from_row(row)
+                )
+            return states
+
+    @staticmethod
+    def _rebuild_delivery_state_from_row(
+        row: sqlite3.Row,
+    ) -> _ProjectionRebuildDeliveryState:
+        return _ProjectionRebuildDeliveryState(
+            outcome=ProjectionDeliveryOutcome(str(row["current_outcome"])),
+            finalized=bool(row["finalized"]),
+            attempt_count=int(row["attempt_count"]),
+            source_event_id=EventId.parse(str(row["source_event_id"])),
+            source_event_digest=str(row["source_event_digest"]),
+        )
 
     def projection_delivery_source(
         self,
