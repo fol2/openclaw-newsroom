@@ -290,6 +290,46 @@ def _authority_action(body: str) -> str | None:
     return action if isinstance(action, str) else ""
 
 
+def _released_restrictions(comments: Sequence[Mapping[str, object]]) -> set[int]:
+    """Resolve exact owner releases, never infer expiry from progress prose."""
+    by_id = {comment.get("id"): comment for comment in comments}
+    released: set[int] = set()
+    for comment in comments:
+        body = comment.get("body")
+        if not _is_owner(comment) or not isinstance(body, str):
+            continue
+        if _authority_action(body) != "release_restriction":
+            continue
+        value = json.loads(body)
+        target_id = _comment_id(value.get("restriction_comment_id"))
+        target = by_id.get(target_id)
+        release_id = _comment_id(comment.get("id"))
+        if (
+            set(value) != {"authority_action", "restriction_comment_id",
+                           "restriction_body_sha256", "standing_grant_reference"}
+            or value.get("standing_grant_reference") != STANDING_GRANT_ID
+            or target is None or target_id is None or release_id is None
+            or release_id <= target_id
+            or not comment.get("created_at")
+            or comment.get("created_at") != comment.get("updated_at")
+            or comment.get("issue_url") != f"https://api.github.com{ISSUE_URL_MARK}"
+            or target.get("issue_url") != comment.get("issue_url")
+            or not _is_owner(target)
+        ):
+            stop("restriction release identity differs")
+        target_body = target.get("body")
+        if (
+            not isinstance(target_body, str)
+            or _authority_action(target_body) != "restrict"
+            or any(token in target_body for token in RESTRICTION_TOKENS)
+            or _sha256_bytes(target_body.encode("utf-8"))
+            != value.get("restriction_body_sha256")
+        ):
+            stop("restriction release target differs")
+        released.add(target_id)
+    return released
+
+
 def verify_standing_grant(
     list_comments: ListComments,
     incomplete_view: object = None,
@@ -330,6 +370,7 @@ def verify_standing_grant(
     if grant.get("created_at") != grant.get("updated_at"):
         stop("standing grant bytes drifted")
 
+    released = _released_restrictions(comments)
     for raw in comments:
         comment = _mapping(raw, "authority comment")
         if _comment_id(comment.get("id")) == STANDING_GRANT_ID or not _is_owner(
@@ -342,6 +383,8 @@ def verify_standing_grant(
         if not isinstance(body, str):
             stop("authority content is unresolved")
         action = _authority_action(body)
+        if action == "release_restriction" or comment.get("id") in released:
+            continue
         if action is not None and action not in AUTHORITY_STOP_ACTIONS:
             stop("authority content is unresolved")
         if action in AUTHORITY_STOP_ACTIONS or any(

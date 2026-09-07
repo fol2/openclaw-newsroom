@@ -213,7 +213,9 @@ def test_spent_packet_digest_constants_include_historical_bindings() -> None:
     }
 
 
+@pytest.mark.parametrize("with_release", [False, True])
 def test_a_valid_fresh_binding_preflight_then_one_stubbed_dispatch(
+    with_release: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -237,6 +239,8 @@ def test_a_valid_fresh_binding_preflight_then_one_stubbed_dispatch(
             _owner_comment(PROGRESS_BODY),
         ]
     )
+    if with_release:
+        comments.comments.extend(_restriction_release())
     dispatch = DispatchStub()
     hooks = _hooks(comments, dispatch)
     argv = [
@@ -883,3 +887,59 @@ def test_lock_identity_drift_and_store_attempted_and_worker_stop(
     )
     assert code == 2
     assert "campaign worker stopped" in payload["message"]
+
+
+def _restriction_release():
+    restriction = _owner_comment(
+        json.dumps({'authority_action': 'restrict', 'scope': 'old-code sealer'}),
+        comment_id=5600000100,
+    )
+    release = _owner_comment(json.dumps({
+        'authority_action': 'release_restriction',
+        'restriction_comment_id': restriction['id'],
+        'restriction_body_sha256': hashlib.sha256(restriction['body'].encode()).hexdigest(),
+        'standing_grant_reference': executor.STANDING_GRANT_ID,
+    }), comment_id=5600000101)
+    return restriction, release
+
+
+def test_exact_owner_release_resolves_only_named_restriction():
+    restriction, release = _restriction_release()
+    # Input order is not an authority signal; the durable comment IDs are.
+    executor.verify_standing_grant(CommentView([release, _grant(), restriction]))
+    with pytest.raises(executor.GraphitiCampaignStop, match='signed stop'):
+        executor.verify_standing_grant(CommentView([
+            _grant(), restriction, release,
+            _owner_comment('NEWSROOM_SIGNED_STOP', comment_id=5600000102),
+        ]))
+    other = _owner_comment(json.dumps({'authority_action': 'restrict'}), comment_id=5600000102)
+    with pytest.raises(executor.GraphitiCampaignStop, match='signed stop'):
+        executor.verify_standing_grant(CommentView([_grant(), restriction, release, other]))
+
+
+@pytest.mark.parametrize('mutation', ['owner', 'issue', 'earlier', 'digest', 'grant', 'target_missing', 'release_edited', 'target_edited', 'target_revoke', 'target_signed_stop'])
+def test_restriction_release_refuses_inexact_authority(mutation):
+    restriction, release = _restriction_release()
+    body = json.loads(release['body'])
+    if mutation == 'owner':
+        release['user'] = {'login': 'other', 'id': 1}
+    elif mutation == 'issue':
+        release['issue_url'] = ISSUE_URL + '0'
+    elif mutation == 'release_edited':
+        release['updated_at'] = '2026-09-08T00:00:00Z'
+    elif mutation == 'earlier':
+        release['id'] = restriction['id'] - 1
+    elif mutation in ('digest', 'grant', 'target_missing'):
+        field, value = {'digest': ('restriction_body_sha256', '0' * 64), 'grant': ('standing_grant_reference', 1), 'target_missing': ('restriction_comment_id', 1)}[mutation]
+        body[field] = value
+    else:
+        restriction['body'] = {
+            'target_edited': json.dumps({'authority_action': 'restrict', 'scope': 'changed'}),
+            'target_revoke': json.dumps({'authority_action': 'revoke'}),
+            'target_signed_stop': json.dumps({'authority_action': 'restrict', 'reason': 'NEWSROOM_SIGNED_STOP'}),
+        }[mutation]
+        if mutation != 'target_edited':
+            body['restriction_body_sha256'] = hashlib.sha256(restriction['body'].encode()).hexdigest()
+    release['body'] = json.dumps(body)
+    with pytest.raises(executor.GraphitiCampaignStop):
+        executor.verify_standing_grant(CommentView([_grant(), restriction, release]))
