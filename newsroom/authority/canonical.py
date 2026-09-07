@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 MIN_SAFE_INTEGER = -9_007_199_254_740_991
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 DIGEST_ALGORITHM = "sha256"
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 class CanonicalizationError(ValueError):
@@ -24,7 +26,43 @@ def _validate_string(value: str, path: str) -> None:
             raise CanonicalizationError(f"lone surrogate is unsupported at {path}")
 
 
+def _is_restricted_builtin(value: Any) -> bool:
+    """Check ordinary JSON values without building unused diagnostic paths.
+
+    Subclasses/custom collections use the existing diagnostic validator. No
+    accepted type or value rule is added here; False means validate normally.
+    """
+
+    kind = type(value)
+    if kind is str:
+        return value.isascii() or _SURROGATE.search(value) is None
+    if value is None or kind is bool:
+        return True
+    if kind is int:
+        return MIN_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER
+    if kind is dict:
+        for key, item in value.items():
+            if type(key) is not str or not (
+                key.isascii() or _SURROGATE.search(key) is None
+            ):
+                return False
+            if not _is_restricted_builtin(item):
+                return False
+        return True
+    if kind is list or kind is tuple:
+        for item in value:
+            if not _is_restricted_builtin(item):
+                return False
+        return True
+    return False
+
+
 def _validate_restricted_value(value: Any, path: str = "$") -> None:
+    if not _is_restricted_builtin(value):
+        _validate_restricted_value_with_path(value, path)
+
+
+def _validate_restricted_value_with_path(value: Any, path: str = "$") -> None:
     if value is None or isinstance(value, bool):
         return
     if isinstance(value, int):
@@ -43,13 +81,13 @@ def _validate_restricted_value(value: Any, path: str = "$") -> None:
             if not isinstance(key, str):
                 raise CanonicalizationError(f"object names must be strings at {path}")
             _validate_string(key, f"{path}.<key>")
-            _validate_restricted_value(item, f"{path}.{key}")
+            _validate_restricted_value_with_path(item, f"{path}.{key}")
         return
     if isinstance(value, Sequence) and not isinstance(
         value, (str, bytes, bytearray, memoryview)
     ):
         for index, item in enumerate(value):
-            _validate_restricted_value(item, f"{path}[{index}]")
+            _validate_restricted_value_with_path(item, f"{path}[{index}]")
         return
     raise CanonicalizationError(
         f"unsupported value type at {path}: {type(value).__name__}"

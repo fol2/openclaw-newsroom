@@ -81,6 +81,10 @@ def test_reopen_checks_retained_deliveries_without_rehashing_registry(
 
         with monkeypatch.context() as scope:
             scope.setattr(canonical, "_validate_string", old_string_check)
+            scope.setattr(
+                canonical, "_validate_restricted_value",
+                canonical._validate_restricted_value_with_path,
+            )
             for cls, attribute, message in (
                 (ProjectionFamilyRegistry, "digest", "unknown or ambiguous family definition digest"),
                 (StructuralMappingRegistry, "contract_digest", "unknown or ambiguous mapping digest"),
