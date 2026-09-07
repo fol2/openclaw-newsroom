@@ -42,6 +42,7 @@ class ReadOnlySnapshot:
     source_path: str
     source_files: tuple[dict[str, object], ...]
     snapshot_files: tuple[dict[str, object], ...]
+    logical_content_digest: str
 
 
 @contextmanager
@@ -64,10 +65,11 @@ def read_only_snapshot(path: str | Path) -> Iterator[ReadOnlySnapshot]:
             finally:
                 destination.close()
                 source.rollback()
+            file_digest = _digest_file(copied)
             copied_identity = {
                 "name": copied.name,
                 "size": copied.stat().st_size,
-                "sha256": _digest_file(copied),
+                "sha256": file_digest,
             }
             connection = sqlite3.connect(
                 f"{copied.as_uri()}?mode=ro&immutable=1", uri=True
@@ -81,6 +83,7 @@ def read_only_snapshot(path: str | Path) -> Iterator[ReadOnlySnapshot]:
                     source_path=str(resolved),
                     source_files=_source_file_observations(resolved),
                     snapshot_files=(copied_identity,),
+                    logical_content_digest=f"sha256:{file_digest}",
                 )
             finally:
                 connection.close()

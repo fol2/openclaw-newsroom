@@ -500,12 +500,10 @@ def _schema_fingerprint(connection: sqlite3.Connection) -> str:
 def _store_descriptor(snapshot: object) -> dict[str, object]:
     connection = snapshot.connection
     tables = _tables(connection)
-    try:
-        logical_bytes = connection.serialize()
-    except sqlite3.OperationalError:
-        if tables or int(connection.execute("PRAGMA page_count").fetchone()[0]) != 0:
-            raise
-        logical_bytes = b""
+    logical_content_digest = validate_sha256_digest(
+        str(snapshot.logical_content_digest),
+        field="logical content digest",
+    )
     migrations = (
         [
             {"version": int(row[0]), "name": str(row[1]), "checksum": str(row[2])}
@@ -529,14 +527,17 @@ def _store_descriptor(snapshot: object) -> dict[str, object]:
             else 0
         )
     )
-    # SQLite WAL checkpointing changes physical files without changing the
-    # database.  Bind the authority identity to the exact logical image so a
-    # sealed packet remains usable after the preparation process closes and a
-    # later F4 process reopens the same store.  Physical file observations are
-    # retained as evidence, but are deliberately not authority inputs.
+    # Bind identity to the backup-API logical image, not live WAL files and not
+    # ``Connection.serialize()``.  CPython maps a NULL from sqlite3_serialize —
+    # including SQLITE_NOMEM when the entire main schema cannot fit in one
+    # contiguous buffer — to OperationalError "unable to serialize 'main'".
+    # The snapshot file is already that logical image; its streaming digest
+    # matches serialize() when serialisation succeeds, and remains defined for
+    # multi-gigabyte Increment 4 / proving stores.  Physical file observations
+    # of the live source are retained as evidence, not authority inputs.
     identity: dict[str, object] = {
         "source_path": snapshot.source_path,
-        "logical_content_digest": digest_bytes(logical_bytes),
+        "logical_content_digest": logical_content_digest,
         "schema_fingerprint": _schema_fingerprint(connection),
         "migration_identity": migrations,
         "watermark": watermark,

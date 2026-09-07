@@ -42,6 +42,7 @@ from newsroom.control_plane.graphiti_steady_state import (
     GraphitiCampaignRuntime,
     _mint_graphiti_campaign_runtime,
     _spend,
+    _store_descriptor,
     build_graphiti_steady_state_packet,
     graphiti_graph_destination_identity,
     graphiti_operational_partition_snapshot,
@@ -1160,6 +1161,108 @@ def test_wal_snapshot_is_logical_and_query_only(tmp_path: Path) -> None:
 
     assert connection.execute("SELECT value FROM evidence").fetchone() == ("retained",)
     connection.close()
+
+
+def test_sqlite_serialize_maps_unserialisable_main_to_operational_error(
+    tmp_path: Path,
+) -> None:
+    """CPython maps sqlite3_serialize() NULL to unable to serialize 'main'.
+
+    A 0-byte unwritten database is the smallest first-hand trigger of that
+    mapping (page_count=0).  The same OperationalError is raised for a
+    populated ~2 GiB Increment 4 store when serialize() cannot allocate a
+    contiguous main-schema image.  STORE_IDENTITY_SNAPSHOT previously
+    swallowed only the empty-page case and re-raised the populated case as
+    OPERATIONAL_PREPARATION_FAILED.
+    """
+
+    path = tmp_path / "unwritten.sqlite3"
+    sqlite3.connect(path).close()
+    connection = sqlite3.connect(path)
+    try:
+        with pytest.raises(
+            sqlite3.OperationalError, match=r"^unable to serialize 'main'$"
+        ):
+            connection.serialize()
+        assert connection.execute("PRAGMA page_count").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_store_identity_matches_serialize_and_survives_unable_to_serialize_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proving = tmp_path / "proving.sqlite3"
+    unpublished = tmp_path / "unpublished.sqlite3"
+    authority = tmp_path / "authority.sqlite3"
+    for path in (proving, unpublished, authority):
+        connection = sqlite3.connect(path)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE evidence(value TEXT)")
+        connection.execute("INSERT INTO evidence VALUES('retained')")
+        connection.commit()
+        connection.close()
+
+    with read_only_snapshot(authority) as snapshot:
+        serialised = snapshot.connection.serialize()
+        descriptor = _store_descriptor(snapshot)
+        assert snapshot.logical_content_digest == digest_bytes(serialised)
+        assert snapshot.logical_content_digest == (
+            "sha256:" + str(snapshot.snapshot_files[0]["sha256"])
+        )
+        assert descriptor["logical_content_digest"] == snapshot.logical_content_digest
+
+    expected = graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    )
+
+    def refuse_serialize(
+        self: sqlite3.Connection, *args: object, **kwargs: object
+    ) -> bytes:
+        raise sqlite3.OperationalError("unable to serialize 'main'")
+
+    monkeypatch.setattr(sqlite3.Connection, "serialize", refuse_serialize)
+    assert graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    ) == expected
+
+
+def test_unwritten_store_identity_does_not_require_serialize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proving = tmp_path / "proving.sqlite3"
+    unpublished = tmp_path / "unpublished.sqlite3"
+    authority = tmp_path / "authority.sqlite3"
+    sqlite3.connect(proving).close()
+    sqlite3.connect(unpublished).close()
+    connection = sqlite3.connect(authority)
+    connection.execute("CREATE TABLE evidence(value TEXT)")
+    connection.commit()
+    connection.close()
+
+    expected = graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    )
+
+    def refuse_serialize(
+        self: sqlite3.Connection, *args: object, **kwargs: object
+    ) -> bytes:
+        raise sqlite3.OperationalError("unable to serialize 'main'")
+
+    monkeypatch.setattr(sqlite3.Connection, "serialize", refuse_serialize)
+    assert graphiti_store_snapshot_digests(
+        proving_store=proving,
+        unpublished_store=unpublished,
+        authority_store=authority,
+    ) == expected
 
 
 def test_store_identity_survives_wal_checkpoint_but_detects_data_change(
