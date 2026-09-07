@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -373,3 +374,28 @@ def test_operational_preparation_failure_seals_no_go_without_known_failed_evalua
     assert result["operational_reconciliation"]["status"] == "FAILED"
     assert result["evaluator"] == {"attempted": False, "completed": False}
     assert result["blockers"] == ["OPERATIONAL_PREPARATION_FAILED"]
+
+
+def test_authority_backup_identity_does_not_copy_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "authority.sqlite3"
+    sqlite3.connect(source).close()
+    monkeypatch.setattr(
+        graphiti_steady_state_report,
+        "CANONICAL_INCREMENT4_AUTHORITY_STORE",
+        source,
+    )
+    output_dir = tmp_path / "out"
+    digest = graphiti_steady_state_report._authority_backup_identity(output_dir)
+    assert digest.startswith("sha256:")
+    assert not (output_dir / "increment4-authority-pre-bootstrap.sqlite3").exists()
+    assert graphiti_steady_state_report._authority_backup_identity(output_dir) == digest
+    monkeypatch.setattr(
+        graphiti_steady_state_report,
+        "CANONICAL_INCREMENT4_AUTHORITY_STORE",
+        tmp_path / "missing.sqlite3",
+    )
+    missing = graphiti_steady_state_report._authority_backup_identity(output_dir)
+    assert missing != digest
+    assert not (output_dir / "increment4-authority-pre-bootstrap.sqlite3").exists()
