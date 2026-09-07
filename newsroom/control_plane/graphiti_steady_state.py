@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -524,26 +525,51 @@ def _database_byte_size(connection: sqlite3.Connection) -> int:
 
 
 def _uncopied_logical_digest(connection: sqlite3.Connection) -> str:
-    tables = _tables(connection)
-    counts: dict[str, int] = {}
-    count_sql = {
-        "ledger_events": "SELECT COUNT(*) FROM ledger_events",
-        "ledger": "SELECT COUNT(*) FROM ledger",
-        "proving_observations": "SELECT COUNT(*) FROM proving_observations",
-        "unpublished_graphiti_ingest": (
-            "SELECT COUNT(*) FROM unpublished_graphiti_ingest"
-        ),
-    }
-    for name, sql in count_sql.items():
-        if name in tables:
-            counts[name] = int(connection.execute(sql).fetchone()[0])
-    return digest_canonical(
-        {
-            "schema_fingerprint": _schema_fingerprint(connection),
-            "watermark": _watermark(connection),
-            "row_counts": counts,
-            "copy_omitted": True,
-        }
+    """Content-sensitive identity without serialize() or a tempfile copy.
+
+    Counts and watermarks miss same-count payload replacements. Stream every
+    user-table row inside the caller's read transaction so WAL checkpointing
+    does not change the digest and a same-count UPDATE does.
+    """
+
+    hasher = hashlib.sha256()
+    tables = sorted(
+        name
+        for name in _tables(connection)
+        if not name.startswith("sqlite_") and '"' not in name
+    )
+    for table in tables:
+        hasher.update(b"T")
+        hasher.update(table.encode("utf-8"))
+        cursor = connection.execute(f'SELECT * FROM "{table}"')
+        columns = tuple(str(item[0]) for item in cursor.description)
+        hasher.update(repr(columns).encode("utf-8"))
+        for row in cursor:
+            for value in row:
+                if value is None:
+                    hasher.update(b"N")
+                elif isinstance(value, bool):
+                    hasher.update(b"B")
+                    hasher.update(b"1" if value else b"0")
+                elif isinstance(value, int):
+                    hasher.update(b"I")
+                    hasher.update(str(value).encode("ascii"))
+                elif isinstance(value, float):
+                    hasher.update(b"F")
+                    hasher.update(repr(value).encode("ascii"))
+                elif isinstance(value, (bytes, memoryview)):
+                    payload = bytes(value)
+                    hasher.update(b"Y")
+                    hasher.update(len(payload).to_bytes(8, "big"))
+                    hasher.update(payload)
+                else:
+                    encoded = str(value).encode("utf-8")
+                    hasher.update(b"S")
+                    hasher.update(len(encoded).to_bytes(8, "big"))
+                    hasher.update(encoded)
+            hasher.update(b"R")
+    return validate_sha256_digest(
+        f"sha256:{hasher.hexdigest()}", field="streamed logical digest"
     )
 
 

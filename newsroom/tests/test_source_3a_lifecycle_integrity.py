@@ -22,33 +22,27 @@ from .source_3a_helpers import (
 )
 
 
-def test_source_system_open_skips_page_walk_pragmas() -> None:
+def test_source_system_open_retains_page_and_foreign_key_checks() -> None:
     from newsroom.authority._event_store_base import _EventStoreBase
 
     source = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
-    assert 'execute("PRAGMA quick_check")' not in source
-    assert 'execute("PRAGMA foreign_key_check")' not in source
-    assert 'execute("PRAGMA integrity_check")' not in source
+    assert 'execute("PRAGMA quick_check")' in source
+    assert 'execute("PRAGMA foreign_key_check")' in source
 
 
-def test_increment4_open_skips_full_table_row_decode() -> None:
-    from newsroom.authority._entity_store_integrity import _EntityIntegrityMixin
+def test_increment4_open_retains_row_integrity() -> None:
     from newsroom.authority._event_store_base import _EventStoreBase
     from newsroom.authority._graphiti_increment4_system import (
         _GraphitiIncrement4AuthorityStore,
     )
 
-    assert "return False" in inspect.getsource(
+    assert (
         _GraphitiIncrement4AuthorityStore._should_validate_row_integrity
+        is _EventStoreBase._should_validate_row_integrity
     )
-    assert "return True" in inspect.getsource(
-        _EventStoreBase._should_validate_row_integrity
-    )
-    entity = inspect.getsource(_EntityIntegrityMixin._validate_schema_and_integrity)
-    assert "if not self._should_validate_row_integrity():" in entity
     base = inspect.getsource(_EventStoreBase._validate_schema_and_integrity)
-    assert "if self._should_validate_row_integrity():" in base
     assert "_validate_immutable_records" in base
+    assert "_validate_relational_invariants" in base
 
 
 def test_checked_source_registry_migration_is_retained_in_v11(
