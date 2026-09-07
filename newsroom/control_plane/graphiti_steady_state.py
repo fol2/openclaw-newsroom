@@ -497,15 +497,38 @@ def _schema_fingerprint(connection: sqlite3.Connection) -> str:
     )
 
 
-def _store_descriptor(snapshot: object) -> dict[str, object]:
-    connection = snapshot.connection
-    tables = _tables(connection)
+def _logical_content_digest(
+    snapshot: object, connection: sqlite3.Connection
+) -> str:
+    """Digest the already-copied snapshot file.
+
+    ``Connection.serialize()`` raises OperationalError once the logical image
+    exceeds about 2 GiB (``unable to serialize 'main'``).
+    """
+
+    files = getattr(snapshot, "snapshot_files", ())
+    if files:
+        recorded = files[0]
+        digest = recorded.get("sha256") if isinstance(recorded, dict) else None
+        if isinstance(digest, str):
+            return validate_sha256_digest(
+                f"sha256:{digest}", field="copied snapshot digest"
+            )
     try:
         logical_bytes = connection.serialize()
     except sqlite3.OperationalError:
-        if tables or int(connection.execute("PRAGMA page_count").fetchone()[0]) != 0:
+        if _tables(connection) or int(
+            connection.execute("PRAGMA page_count").fetchone()[0]
+        ) != 0:
             raise
         logical_bytes = b""
+    return digest_bytes(logical_bytes)
+
+
+def _store_descriptor(snapshot: object) -> dict[str, object]:
+    connection = snapshot.connection
+    tables = _tables(connection)
+    logical_content_digest = _logical_content_digest(snapshot, connection)
     migrations = (
         [
             {"version": int(row[0]), "name": str(row[1]), "checksum": str(row[2])}
@@ -536,7 +559,7 @@ def _store_descriptor(snapshot: object) -> dict[str, object]:
     # retained as evidence, but are deliberately not authority inputs.
     identity: dict[str, object] = {
         "source_path": snapshot.source_path,
-        "logical_content_digest": digest_bytes(logical_bytes),
+        "logical_content_digest": logical_content_digest,
         "schema_fingerprint": _schema_fingerprint(connection),
         "migration_identity": migrations,
         "watermark": watermark,

@@ -42,6 +42,7 @@ from newsroom.control_plane.graphiti_steady_state import (
     GraphitiCampaignRuntime,
     _mint_graphiti_campaign_runtime,
     _spend,
+    _store_descriptor,
     build_graphiti_steady_state_packet,
     graphiti_graph_destination_identity,
     graphiti_operational_partition_snapshot,
@@ -1199,6 +1200,37 @@ def test_store_identity_survives_wal_checkpoint_but_detects_data_change(
         unpublished_store=unpublished,
         authority_store=authority,
     )["authority"] != after_checkpoint["authority"]
+
+
+def test_store_identity_binds_copied_snapshot_digest_not_serialize(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authority.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE evidence(value TEXT)")
+    connection.execute("INSERT INTO evidence VALUES('retained')")
+    connection.commit()
+    planted = "ab" * 32
+    with read_only_snapshot(path) as snapshot:
+        assert str(snapshot.snapshot_files[0]["sha256"]) != planted
+        planted_snapshot = SimpleNamespace(
+            connection=snapshot.connection,
+            source_path=snapshot.source_path,
+            source_files=snapshot.source_files,
+            snapshot_files=(
+                {
+                    "name": "authority.sqlite3",
+                    "size": 1,
+                    "sha256": planted,
+                },
+            ),
+        )
+        descriptor = _store_descriptor(planted_snapshot)
+        assert descriptor["logical_content_digest"] == f"sha256:{planted}"
+        assert descriptor["logical_content_digest"] != digest_bytes(
+            snapshot.connection.serialize()
+        )
+    connection.close()
 
 
 def test_snapshot_accepts_checkpoint_churn_without_logical_change(
