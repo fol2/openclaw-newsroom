@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,7 +40,10 @@ from newsroom.control_plane.paths import (
     require_canonical_unpublished_store,
 )
 from newsroom.control_plane.sqlite_profile import apply_control_plane_sqlite_profile
-from scripts.hermes_graphiti_worker import compose_governed_graphiti_worker_runtime
+from scripts.hermes_graphiti_worker import (
+    GovernedGraphitiWorkerRuntime,
+    compose_governed_graphiti_worker_runtime,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 OPERATIONAL_RESULT_SCHEMA_VERSION = "newsroom.graphiti-operational-readiness-result.v1"
@@ -201,14 +204,51 @@ def _seal_operational_result(
     return {**body, "packet_digest": digest_canonical(body)}
 
 
-def _build_operational_packet(
+def _confirm_code_identity(head_sha: str, tree_sha: str) -> None:
+    stage_started = _begin_operational_stage("CODE_IDENTITY_CONFIRM")
+    if _exact_main_identity() != (head_sha, tree_sha):
+        raise RuntimeError("code identity changed while building steady-state evidence")
+    _log_operational_stage("CODE_IDENTITY_CONFIRM", stage_started)
+
+
+@contextmanager
+def sealed_operational_campaign_runtime(
     *,
     head_sha: str,
     tree_sha: str,
     focus_manifest_digest: str,
     output_dir: Path,
     observed_at: datetime,
-) -> dict[str, object]:
+) -> Iterator[tuple[dict[str, object], GovernedGraphitiWorkerRuntime | None]]:
+    """Seal once and retain its authority owner for immediate guarded dispatch.
+
+    Input snapshot locks end before handover; the authority writer remains owned
+    until context exit. Non-READY results never expose a dispatchable runtime.
+    Separate-process consumers still use the full reopen/currentness path.
+    """
+
+    with ExitStack() as owner:
+        packet, runtime = _prepare_operational_packet(
+            head_sha=head_sha,
+            tree_sha=tree_sha,
+            focus_manifest_digest=focus_manifest_digest,
+            output_dir=output_dir,
+            observed_at=observed_at,
+            owner=owner,
+        )
+        _confirm_code_identity(head_sha, tree_sha)
+        yield packet, runtime
+
+
+def _prepare_operational_packet(
+    *,
+    head_sha: str,
+    tree_sha: str,
+    focus_manifest_digest: str,
+    output_dir: Path,
+    observed_at: datetime,
+    owner: ExitStack,
+) -> tuple[dict[str, object], GovernedGraphitiWorkerRuntime | None]:
     require_canonical_proving_store(str(CANONICAL_PROVING_STORE))
     require_canonical_unpublished_store(str(CANONICAL_UNPUBLISHED_STORE))
     validate_sha256_digest(
@@ -247,6 +287,7 @@ def _build_operational_packet(
                 system, proof = open_operational_graphiti_authority_system(
                     credential=secrets.token_urlsafe(32)
                 )
+                owner.callback(system.close)
                 completed_steps.append(stage)
                 _log_operational_stage(stage, stage_started)
 
@@ -376,7 +417,7 @@ def _build_operational_packet(
                     evaluator_attempted=False,
                 )
                 _log_operational_stage("SEAL_OPERATIONAL_RESULT", stage_started)
-                return sealed
+                return sealed, None
 
             evaluator_observed_at = datetime.now(tz=UTC)
             stage = "READINESS_EVALUATOR"
@@ -414,7 +455,7 @@ def _build_operational_packet(
                     ),
                 )
                 _log_operational_stage("SEAL_OPERATIONAL_RESULT", stage_started)
-                return sealed
+                return sealed, None
             _log_operational_stage(stage, stage_started)
 
             stage = "SEAL_OPERATIONAL_RESULT"
@@ -453,11 +494,11 @@ def _build_operational_packet(
                     failure=failure,
                 )
                 _log_operational_stage("SEAL_OPERATIONAL_RESULT", stage_started)
-            return result
+            return result, (
+                runtime if result.get("verdict") == "READY_FOR_OWNER_DECISION" else None
+            )
         finally:
             _log_operational_stage("TOTAL", overall_started)
-            if system is not None:
-                system.close()
 
 
 def main() -> int:
@@ -485,13 +526,14 @@ def main() -> int:
         output_dir = args.output_dir.expanduser().resolve()
         if output_dir == REPOSITORY_ROOT or REPOSITORY_ROOT in output_dir.parents:
             raise ValueError("operational evidence must be outside the repository")
-        packet = _build_operational_packet(
+        with sealed_operational_campaign_runtime(
             head_sha=head_sha,
             tree_sha=tree_sha,
             focus_manifest_digest=args.focus_manifest_digest,
             output_dir=output_dir,
             observed_at=observed_at,
-        )
+        ) as (packet, _runtime):
+            pass
     else:
         campaign_input = (
             json.loads(args.campaign_input.read_text(encoding="utf-8"))
@@ -509,10 +551,7 @@ def main() -> int:
             authority_store=args.authority,
             campaign_input=campaign_input,
         )
-    stage_started = _begin_operational_stage("CODE_IDENTITY_CONFIRM")
-    if _exact_main_identity() != (head_sha, tree_sha):
-        raise RuntimeError("code identity changed while building steady-state evidence")
-    _log_operational_stage("CODE_IDENTITY_CONFIRM", stage_started)
+        _confirm_code_identity(head_sha, tree_sha)
     if args.output_dir is None:
         print(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True))
     else:

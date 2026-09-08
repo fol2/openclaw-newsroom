@@ -238,3 +238,90 @@ def test_second_stage_experiment_plan_is_serial_bounded_and_owner_gated() -> Non
     assert decision["tool_call_count_must_equal"] == 0
     assert decision["tool_call_execution_must_be_observed_for_qualification"] is True
     assert decision["missing_usage_is_zero"] is False
+
+
+def test_missing_node_names_are_batched_before_pinned_bulk_persistence() -> None:
+    import newsroom.graphiti_adapter.real as real
+    from graphiti_core.driver.driver import GraphProvider
+    from graphiti_core.nodes import EntityNode
+    from graphiti_core.utils.bulk_utils import add_nodes_and_edges_bulk_tx
+    from newsroom.graphiti_adapter.embedding_meter import MeteredOpenAIEmbedder
+
+    provider_inputs: list[list[str]] = []
+
+    class Embeddings:
+        async def create(self, **values: object) -> object:
+            inputs = list(values["input"])
+            provider_inputs.append(inputs)
+            return SimpleNamespace(
+                id="batch-1",
+                data=[
+                    SimpleNamespace(embedding=[float(index), 0.5, 99.0])
+                    for index, _item in enumerate(inputs)
+                ],
+                usage={
+                    "prompt_tokens": len(inputs),
+                    "total_tokens": len(inputs),
+                    "cost": "0",
+                },
+            )
+
+    delegate = SimpleNamespace(
+        client=SimpleNamespace(embeddings=Embeddings()),
+        config=SimpleNamespace(embedding_model="model", embedding_dim=2),
+    )
+    embedder = MeteredOpenAIEmbedder(delegate)
+    nodes = [
+        EntityNode(name=f"node\n{index}", group_id="group")
+        for index in range(7)
+    ]
+    retained = EntityNode(
+        name="retained",
+        group_id="group",
+        name_embedding=[8.0, 8.0],
+    )
+    nodes.append(retained)
+    persisted: list[dict[str, object]] = []
+
+    class Operations:
+        async def episodic_node_save_bulk(self, *_args: object) -> None:
+            return None
+
+        async def node_save_bulk(
+            self,
+            _name: object,
+            _driver: object,
+            _tx: object,
+            values: list[dict[str, object]],
+        ) -> None:
+            persisted.extend(values)
+
+        async def episodic_edge_save_bulk(self, *_args: object) -> None:
+            return None
+
+        async def edge_save_bulk(self, *_args: object) -> None:
+            return None
+
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEO4J,
+        graph_operations_interface=Operations(),
+    )
+
+    async def exercise() -> None:
+        await real._batch_missing_node_name_embeddings(embedder, nodes)
+        await add_nodes_and_edges_bulk_tx(
+            object(), [], [], nodes, [], embedder, driver
+        )
+
+    asyncio.run(exercise())
+
+    assert provider_inputs == [[f"node {index}" for index in range(7)]]
+    assert [node.name_embedding for node in nodes[:-1]] == [
+        [float(index), 0.5] for index in range(7)
+    ]
+    assert retained.name_embedding == [8.0, 8.0]
+    assert [item["name_embedding"] for item in persisted] == [
+        *[[float(index), 0.5] for index in range(7)],
+        [8.0, 8.0],
+    ]
+    assert embedder.receipt()["request_count"] == 1

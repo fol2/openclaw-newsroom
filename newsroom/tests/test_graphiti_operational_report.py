@@ -10,10 +10,15 @@ import pytest
 from scripts import graphiti_steady_state_report
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [None, "consumer", "identity", "validation", "evaluator", "preparation", "no_go"],
+)
 def test_operational_packet_composes_existing_contracts_once_without_live_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    failure: str | None,
 ) -> None:
     events: list[str] = []
     proving = object()
@@ -248,13 +253,58 @@ def test_operational_packet_composes_existing_contracts_once_without_live_io(
         lambda _supplied: events.append("validate"),
     )
 
-    result = graphiti_steady_state_report._build_operational_packet(
-        head_sha="h" * 40,
-        tree_sha="t" * 40,
-        focus_manifest_digest="sha256:" + "f" * 64,
-        output_dir=tmp_path,
-        observed_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
-    )
+    def code_identity():
+        events.append("identity")
+        return ("changed", "tree") if failure == "identity" else ("h" * 40, "t" * 40)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(graphiti_steady_state_report, "_exact_main_identity", code_identity)
+    if failure in {"validation", "evaluator", "preparation"}:
+        symbol = {
+            "validation": "validate_graphiti_campaign_packet",
+            "evaluator": "build_graphiti_steady_state_packet",
+            "preparation": "plan_operational_authority_bootstrap",
+        }[failure]
+        monkeypatch.setattr(graphiti_steady_state_report, symbol, fail)
+    elif failure == "no_go":
+        packet["verdict"] = "NO_GO"
+
+    yielded = False
+    try:
+        with graphiti_steady_state_report.sealed_operational_campaign_runtime(
+            head_sha="h" * 40,
+            tree_sha="t" * 40,
+            focus_manifest_digest="sha256:" + "f" * 64,
+            output_dir=tmp_path,
+            observed_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
+        ) as (result, supplied_runtime):
+            yielded = True
+            assert "lock-exit" in events
+            assert "system-close" not in events
+            assert events[-1] == "identity"
+            if failure in {"validation", "evaluator", "preparation", "no_go"}:
+                assert result["verdict"] == "NO_GO"
+                assert supplied_runtime is None
+            else:
+                assert supplied_runtime is runtime
+            events.append("consumer")
+            if failure == "consumer":
+                raise RuntimeError("consumer failure")
+    except RuntimeError as error:
+        assert failure in {"consumer", "identity"}
+        assert str(error) == (
+            "consumer failure" if failure == "consumer"
+            else "code identity changed while building steady-state evidence"
+        )
+    assert yielded is (failure != "identity")
+    assert events.count("open-system") == 1
+    assert events.count("system-close") == 1
+    assert events[-1] == "system-close"
+    assert events.index("lock-exit") < events.index("identity")
+    if failure is not None:
+        return
 
     assert result["verdict"] == "READY_FOR_OWNER_DECISION"
     assert result["non_effects_scope"] == "READ_ONLY_EVALUATOR_ONLY"
@@ -289,8 +339,10 @@ def test_operational_packet_composes_existing_contracts_once_without_live_io(
         "campaign",
         "evaluator",
         "validate",
-        "system-close",
         "lock-exit",
+        "identity",
+        "consumer",
+        "system-close",
     ]
 
 
@@ -304,7 +356,7 @@ def test_operational_cli_rejects_incomplete_authority_shape_before_execution(
     )
     monkeypatch.setattr(
         graphiti_steady_state_report,
-        "_build_operational_packet",
+        "sealed_operational_campaign_runtime",
         lambda **_kwargs: pytest.fail("invalid operational shape was executed"),
     )
     monkeypatch.setattr(
@@ -362,13 +414,18 @@ def test_operational_preparation_failure_seals_no_go_without_known_failed_evalua
         lambda **_kwargs: pytest.fail("known-incomplete evaluator was called"),
     )
 
-    result = graphiti_steady_state_report._build_operational_packet(
+    monkeypatch.setattr(
+        graphiti_steady_state_report, "_exact_main_identity",
+        lambda: ("h" * 40, "t" * 40),
+    )
+    with graphiti_steady_state_report.sealed_operational_campaign_runtime(
         head_sha="h" * 40,
         tree_sha="t" * 40,
         focus_manifest_digest="sha256:" + "f" * 64,
         output_dir=tmp_path,
         observed_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
-    )
+    ) as (result, runtime):
+        assert runtime is None
 
     assert result["verdict"] == "NO_GO"
     assert result["operational_reconciliation"]["status"] == "FAILED"
