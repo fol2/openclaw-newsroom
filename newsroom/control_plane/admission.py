@@ -705,7 +705,23 @@ class DeterministicWriteAdmission:
         *,
         decided_at: str,
     ) -> WriteAdmissionDecision:
-        if (candidate.candidate_id, candidate.hypothesis_id) != (
+        return self.decide_candidate_identity(
+            candidate_id=candidate.candidate_id,
+            hypothesis_id=candidate.hypothesis_id,
+            package=package,
+            decided_at=decided_at,
+        )
+
+    def decide_candidate_identity(
+        self,
+        *,
+        candidate_id: str,
+        hypothesis_id: str,
+        package: EvidencePackage,
+        decided_at: str,
+    ) -> WriteAdmissionDecision:
+        """Apply the existing policy to an authenticated native identity."""
+        if (candidate_id, hypothesis_id) != (
             package.candidate_id,
             package.hypothesis_id,
         ):
