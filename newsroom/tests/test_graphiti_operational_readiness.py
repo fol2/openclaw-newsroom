@@ -25,6 +25,7 @@ from newsroom.control_plane.graphiti_operational_readiness import (
     OperationalAuthorityBootstrapPlan,
     _accepted_source_contract,
     _evaluation_attempt_for_unit,
+    _operational_entity_write_scopes,
     _operational_graphiti_write_scopes,
     _operational_generation_identity,
     _operational_plan_semantic_digest,
@@ -45,6 +46,17 @@ from newsroom.control_plane.graphiti_steady_state import (
     graphiti_store_snapshot_digests,
 )
 from newsroom.effective_revision import EffectiveRevisionIdentity
+from newsroom.entities.policy import (
+    ENTITY_MENTION_ADMIT_COMMAND,
+    ENTITY_MERGE_DECIDE_COMMAND,
+    ENTITY_RESOLUTION_DECIDE_COMMAND,
+    ENTITY_RESOLUTION_DEPENDENCY_BIND_COMMAND,
+    ENTITY_RESOLUTION_PROPOSE_COMMAND,
+    ENTITY_REVERSAL_DECIDE_COMMAND,
+    ENTITY_SPLIT_DECIDE_COMMAND,
+    entity_command_definitions,
+)
+from newsroom.entities.types import EntityResolutionDecisionAction
 from newsroom.graphiti_adapter.evaluation_packet import (
     GRAPHITI_EXTRACTION_TIMEOUT_MS,
 )
@@ -71,7 +83,16 @@ from scripts.hermes_graphiti_worker import GraphitiCampaignStop
 
 from .authority_event_helpers import payload_schemas, registry_v1
 from .editorial_relation_4c_helpers import relation_read_policy
-from .entity_4b_helpers import entity_read_policy
+from .entity_4b_helpers import (
+    EN_MENTION_ID,
+    decision_request,
+    dependency_request,
+    entity_read_policy,
+    mention_request,
+    new_entity_proposal_request,
+    open_entity_system,
+    seed_entity_fixture,
+)
 from .extraction_4a_helpers import extraction_read_policy
 from .graphiti_adapter_4d_authority_helpers import graphiti_read_policy
 from .increment4e_helpers import increment4_projection_read_policy
@@ -96,6 +117,40 @@ def test_operational_graphiti_write_scopes_follow_canonical_commands() -> None:
         "authority.graphiti.execute",
         "authority.graphiti.replay.approve",
     }
+
+
+def test_operational_entity_write_scopes_are_the_supported_canonical_subset() -> None:
+    definitions = {
+        definition.command_type: definition
+        for definition in entity_command_definitions()
+    }
+    supported = frozenset(
+        {
+            ENTITY_MENTION_ADMIT_COMMAND,
+            ENTITY_RESOLUTION_PROPOSE_COMMAND,
+            ENTITY_RESOLUTION_DECIDE_COMMAND,
+            ENTITY_RESOLUTION_DEPENDENCY_BIND_COMMAND,
+        }
+    )
+    excluded = frozenset(
+        {
+            ENTITY_MERGE_DECIDE_COMMAND,
+            ENTITY_SPLIT_DECIDE_COMMAND,
+            ENTITY_REVERSAL_DECIDE_COMMAND,
+        }
+    )
+
+    scopes = _operational_entity_write_scopes()
+
+    assert scopes == frozenset(
+        definitions[command_type].required_scope
+        for command_type in supported
+    )
+    assert len(scopes) == 4
+    assert scopes.isdisjoint(
+        definitions[command_type].required_scope
+        for command_type in excluded
+    )
 
 
 def _unit(*, item_key: str = "current-item") -> CorpusIngestUnit:
@@ -307,8 +362,7 @@ def _open_operational_test_system(
             "authority.extraction.metadata.read",
             "authority.extraction.proposal.read",
             "authority.extraction.raw.read",
-            "authority.entity.propose",
-            "authority.entity.admit",
+            *_operational_entity_write_scopes(),
             "authority.entity.proposal.read",
             "authority.entity.admitted.read",
             "authority.entity.projection.read",
@@ -364,6 +418,55 @@ def _open_operational_test_system(
         graph_destination_id=digest_canonical({"graph": "test"}),
         clock=lambda: UtcTimestamp.parse(now),
     )
+
+
+def test_operational_entity_scopes_admit_the_supported_authority_path(
+    tmp_path: Path,
+) -> None:
+    state = seed_entity_fixture(tmp_path)
+    system = open_entity_system(
+        state,
+        scopes=_operational_entity_write_scopes(),
+    )
+    try:
+        mention = system.entities.admit_mention(
+            mention_request(
+                state.en_source,
+                mention_id=EN_MENTION_ID,
+                language="en-GB",
+                key="operational-mention-en-v1",
+            ),
+            proof=_PROOF,
+        )
+        proposal = system.entities.propose_resolution(
+            new_entity_proposal_request(
+                state,
+                key="operational-entity-resolution-v1",
+            ),
+            proof=_PROOF,
+        )
+        dependency = system.entities.bind_resolution_dependency(
+            dependency_request(
+                state,
+                proposal,
+                key="operational-relation-dependency-v1",
+            ),
+            proof=_PROOF,
+        )
+        decision = system.entities.decide_resolution(
+            decision_request(
+                proposal,
+                action=EntityResolutionDecisionAction.HOLD,
+                key="operational-entity-hold-v1",
+            ),
+            proof=_PROOF,
+        )
+
+        assert mention.mention_id == EN_MENTION_ID
+        assert dependency.resolution_proposal_id == proposal.proposal_id
+        assert decision.proposal_id == proposal.proposal_id
+    finally:
+        system.close()
 
 
 def test_campaign_input_is_dormant_exact_bounded_machine_contract() -> None:
