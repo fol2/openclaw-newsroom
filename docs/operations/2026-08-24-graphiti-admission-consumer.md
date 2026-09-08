@@ -77,15 +77,39 @@ corpus-extraction execution path.
 
 ## Processing plan
 
-The private Control Plane caller performs one bounded admission atom after
-terminal receipt retention: call `enqueue_complete_receipts()`, then
-`drain(worker_id=..., limit=100)`. A later invocation reclaims expired leases and
-continues `DECIDED` projection work with the same idempotency identities. The
-same operational cycle calls `reconcile_rights(limit=100)` and, once the bounded
-backlog is terminal, `reconcile_projection(generation_id=...)`. Integrity holds,
-dead letters, non-zero projection gaps or a false reconciliation status page the
-operator; they never trigger extraction or source intake retries. This plan does
-not itself authorise or install a schedule.
+The private Control Plane caller composes
+`compose_existing_graphiti_admission_consumer()` with the existing authenticated
+Increment 4 system. For an exact retained cohort, call
+`enqueue_complete_receipts(ingest_ids=exact)`, then
+`drain(worker_id=..., limit=proposal_count, ingest_ids=exact,
+stop_on_failure=True)`. Once every proposal has a decision, call
+`finalise_decided_cohort(ingest_ids=exact)` once: the current contract builds and
+reconciles one full admitted generation, not one generation per proposal.
+Inspect `telemetry()` and the retained exact-cohort reconciliation receipt.
+These public operations do not enter extraction or source intake. Legacy
+per-proposal rights/projection reconciliation is not the exact-cohort finaliser.
+
+### Corrected admission-authorisation configuration
+
+An `AUTHZ_SCOPE_MISSING` admission failure is not permission to widen extraction
+authority or retry a consumed event. After the exact configuration correction
+has focused evidence, the existing authenticated `ControlPlaneCommandService`
+exposes `recover_graphiti_admission_authorization()` for one exact first-failure
+dead letter. It binds the ingest, proposal key, expected request digest and
+remediation evidence digest. Only the Hermes principal may invoke it.
+
+The command retains its recovery receipt in the existing reconciliation-command
+journal atomically with making that one item `READY`. It preserves the prior
+error and failed-attempt counter; it neither creates an admission decision nor
+changes the event, provider attempt or spend. A repeated identical command
+returns the retained receipt, not another recovery. Other failure classes,
+changed identities, existing effects and subsequent failures stay closed.
+
+Continue with the exact admission-only operations above, using the corrected
+governed system and the existing rights, command and projection checks. Preserve
+the original stopped campaign and report any successful continuation separately;
+never relabel it as an originally complete campaign. A source/provider retry,
+new schedule, blanket dead-letter reset or new backup is not part of recovery.
 
 ## Non-effects
 

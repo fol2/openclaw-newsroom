@@ -69,6 +69,13 @@ from newsroom.control_plane.paths import (
     ensure_increment4_state_paths,
 )
 from newsroom.control_plane.read_only_snapshot import read_only_snapshot
+from newsroom.entities.policy import (
+    ENTITY_MENTION_ADMIT_COMMAND,
+    ENTITY_RESOLUTION_DECIDE_COMMAND,
+    ENTITY_RESOLUTION_DEPENDENCY_BIND_COMMAND,
+    ENTITY_RESOLUTION_PROPOSE_COMMAND,
+    entity_command_definitions,
+)
 from newsroom.entities.types import EntityReadPolicy
 from newsroom.extraction.types import ExtractionReadPolicy
 from newsroom.graphiti_adapter import GraphitiAdapterReadPolicy
@@ -1448,6 +1455,25 @@ def _operational_graphiti_write_scopes() -> frozenset[str]:
     )
 
 
+def _operational_entity_write_scopes() -> frozenset[str]:
+    supported_commands = frozenset(
+        {
+            ENTITY_MENTION_ADMIT_COMMAND,
+            ENTITY_RESOLUTION_PROPOSE_COMMAND,
+            ENTITY_RESOLUTION_DECIDE_COMMAND,
+            ENTITY_RESOLUTION_DEPENDENCY_BIND_COMMAND,
+        }
+    )
+    definitions = {
+        definition.command_type: definition
+        for definition in entity_command_definitions()
+    }
+    return frozenset(
+        definitions[command_type].required_scope
+        for command_type in supported_commands
+    )
+
+
 def open_operational_graphiti_authority_system(
     *,
     credential: str,
@@ -1513,10 +1539,12 @@ def open_operational_graphiti_authority_system(
         definition.required_scope for definition in registry.definitions()
     }
     graphiti_write_scopes = _operational_graphiti_write_scopes()
+    entity_write_scopes = _operational_entity_write_scopes()
     scopes = frozenset(
         {
             *command_scopes,
             *graphiti_write_scopes,
+            *entity_write_scopes,
             source_read.metadata_required_scope,
             source_read.sensitive_required_scope,
             extraction_read.metadata_required_scope,
@@ -1540,8 +1568,6 @@ def open_operational_graphiti_authority_system(
             "authority.admitted.write",
             "authority.extraction.execute",
             "authority.extraction.manage",
-            "authority.entity.propose",
-            "authority.entity.admit",
             "authority.relation.propose",
             "authority.relation.admit",
             "authority.projection.manage",
