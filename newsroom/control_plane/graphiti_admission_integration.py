@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from newsroom.authority.auth import AuthenticationProof
 from newsroom.authority.canonical import (
@@ -1189,18 +1189,39 @@ class ExistingGovernedGraphitiAdmissionAuthority:
         proposed = self._entities.propose_resolution(
             plan.proposal_request, proof=self._proof
         )
+        proposal_request = plan.proposal_request
         if (
-            proposed.proposal_id != plan.decision_request.proposal_id
+            proposed.proposal_id != proposal_request.proposal_id
             or proposed.proposal_version_id
-            != plan.decision_request.expected_proposal_version_id
-            or proposed.canonical_digest
-            != plan.decision_request.expected_proposal_digest
+            != proposal_request.proposal_version_id
+            or proposed.version_number != proposal_request.version_number
+            or proposed.previous_proposal_version_id
+            != proposal_request.expected_previous_version_id
+            or proposed.source_proposal_id != proposal_request.source_proposal_id
+            or proposed.source_proposal_digest
+            != proposal_request.expected_source_proposal_digest
+            or proposed.kind is not proposal_request.kind
+            or proposed.subject_mention_id != proposal_request.subject_mention_id
+            or proposed.object_mention_id != proposal_request.object_mention_id
+            or proposed.candidate_entity_id != proposal_request.candidate_entity_id
+            or proposed.candidate_entity_version_id
+            != proposal_request.candidate_entity_version_id
+            or proposed.confidence_basis_points
+            != proposal_request.confidence_basis_points
+            or proposed.uncertainty_codes != proposal_request.uncertainty_codes
+            or proposed.basis_codes != proposal_request.basis_codes
+            or proposed.stable_semantic_digest
+            != proposal_request.stable_semantic_digest
         ):
             raise GraphitiAdmissionConsumerError(
                 "entity decision command differs from the retained authority proposal"
             )
+        decision_request = replace(
+            plan.decision_request,
+            expected_proposal_digest=proposed.canonical_digest,
+        )
         decided = self._entities.decide_resolution(
-            plan.decision_request, proof=self._proof
+            decision_request, proof=self._proof
         )
         if not isinstance(decided, EntityResolutionDecision):
             raise GraphitiAdmissionConsumerError(

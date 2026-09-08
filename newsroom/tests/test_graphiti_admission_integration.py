@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -13,12 +15,14 @@ from newsroom.authority.canonical import (
 )
 from newsroom.authority.types import EventId, UtcTimestamp
 from newsroom.control_plane.graphiti_admission import (
+    GraphitiAdmissionConsumer,
     GraphitiAdmissionConsumerError,
     GraphitiAdmissionRequest,
     GraphitiGovernedDecision,
     GraphitiProposalAuthorityBinding,
     GraphitiProjectionRequest,
 )
+from newsroom.control_plane.store import connect
 from newsroom.control_plane.graphiti_admission_integration import (
     ConservativeGraphitiRelationPlanBuilder,
     ExistingIncrement4GenerationProjector,
@@ -30,6 +34,10 @@ from newsroom.control_plane.graphiti_admission_integration import (
     GraphitiRelationOperationalDecisionPlan,
     compose_existing_graphiti_admission_consumer,
     conservative_entity_mention_plan,
+)
+from newsroom.control_plane.governed_context import (
+    GovernedContextHydrator,
+    GovernedContextStatus,
 )
 from newsroom.entities.models import (
     EntityMentionAdmissionRequest,
@@ -84,6 +92,12 @@ from newsroom.relations.editorial_types import (
     EditorialRelationAssertionLifecycle,
     EditorialRelationDecisionAction,
 )
+
+from .entity_4b_helpers import seed_homonym_entity_fixture
+from .extraction_4a_helpers import extraction_proof
+from .projection_b2_helpers import MemoryNeo4jAdapter
+from .source_3a_helpers import SOURCE_NOW
+from . import test_graphiti_increment4_system
 
 DIGEST = "sha256:" + ("ab" * 32)
 
@@ -297,7 +311,22 @@ class _Entities:
         return SimpleNamespace(
             proposal_id=request.proposal_id,
             proposal_version_id=request.proposal_version_id,
-            canonical_digest=self.plan.decision_request.expected_proposal_digest,
+            version_number=request.version_number,
+            previous_proposal_version_id=request.expected_previous_version_id,
+            source_proposal_id=request.source_proposal_id,
+            source_proposal_digest=request.expected_source_proposal_digest,
+            kind=request.kind,
+            subject_mention_id=request.subject_mention_id,
+            object_mention_id=request.object_mention_id,
+            candidate_entity_id=request.candidate_entity_id,
+            candidate_entity_version_id=request.candidate_entity_version_id,
+            confidence_basis_points=request.confidence_basis_points,
+            uncertainty_codes=request.uncertainty_codes,
+            basis_codes=request.basis_codes,
+            stable_semantic_digest=request.stable_semantic_digest,
+            canonical_digest=digest_canonical(
+                {"retained_proposal": request.canonical_value()}
+            ),
         )
 
     def decide_resolution(self, request, *, proof):
@@ -391,6 +420,270 @@ def test_existing_authority_executes_typed_entity_commands() -> None:
         ("admitted_at", "2026-08-24T00:00:00.000000Z"),
     )
     assert context.admitted_structured_value["authority_kind"] == "CANONICAL_ENTITY"
+
+
+def test_existing_authority_rejects_substituted_retained_entity_proposal() -> None:
+    request = _request()
+    plan = _plan(request)
+    entities = _Entities(plan)
+    propose_resolution = entities.propose_resolution
+
+    def substituted_proposal(proposal_request, *, proof):
+        proposed = propose_resolution(proposal_request, proof=proof)
+        proposed.source_proposal_digest = "sha256:" + ("cd" * 32)
+        return proposed
+
+    entities.propose_resolution = substituted_proposal  # type: ignore[method-assign]
+    authority = ExistingGovernedGraphitiAdmissionAuthority(
+        entities=entities,  # type: ignore[arg-type]
+        relations=SimpleNamespace(),  # type: ignore[arg-type]
+        proof=AuthenticationProof(method="STATIC_TOKEN", credential="fixture"),
+        entity_plan=lambda *_: plan,
+        relation_plan=lambda *_: pytest.fail("relation planner called"),
+    )
+
+    with pytest.raises(
+        GraphitiAdmissionConsumerError,
+        match="differs from the retained authority proposal",
+    ):
+        authority.decide_entity_resolution(
+            request,
+            required_action=GraphitiProposalAdmissionAction.ADMIT,
+            idempotency_key="graphiti-admit:proposal-key",
+        )
+
+    assert entities.calls == ["mention", "propose"]
+
+
+def test_actual_entity_authority_replays_partial_work_and_builds_four_item_generation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state = seed_homonym_entity_fixture(tmp_path)
+    sources = (
+        state.en_transit_source,
+        state.en_association_source,
+        state.zh_transit_source,
+        state.zh_association_source,
+    )
+
+    ingest_id = "00000000-0000-4000-8000-0000000076d0"
+    unsigned_receipt = {
+        "ingest_id": ingest_id,
+        "outcome": "COMPLETE",
+        "proposal_count": len(sources),
+    }
+    receipt_digest = digest_bytes(canonical_json_bytes(unsigned_receipt))
+    input_binding = state.extraction.input_binding
+    passage_by_id = {
+        str(item.passage_id): item for item in input_binding.passages
+    }
+
+    def admission_request(source) -> GraphitiAdmissionRequest:
+        proposal = ProposalDraft(
+            local_id=source.local_id,
+            kind=source.kind,
+            subject_placeholder=source.subject_placeholder,
+            object_placeholder=source.object_placeholder,
+            predicate_hint=source.predicate_hint,
+            confidence_basis_points=source.confidence_basis_points,
+            uncertainty_codes=source.uncertainty_codes,
+            rationale_codes=source.rationale_codes,
+            evidence=source.evidence,
+        )
+        language = "zh-HK" if ".zh-hk" in source.local_id else "en-GB"
+        seed = source.canonical_digest
+        return GraphitiAdmissionRequest(
+            queue_seq=1,
+            proposal_key=f"proposal-{source.local_id}",
+            source_receipt_digest=receipt_digest,
+            proposal_authority_binding=GraphitiProposalAuthorityBinding(
+                graphiti_attempt_id=str(
+                    typed_id(ProposalEnvelopeId, "attempt", seed)
+                ),
+                graphiti_attempt_authority_event_id=str(
+                    typed_id(ProposalEnvelopeId, "attempt-event", seed)
+                ),
+                proposal_envelope=source,
+            ),
+            proposal=proposal,
+            proposal_payload=proposal.canonical_value(),
+            evidence_passages=tuple(
+                {
+                    **passage_by_id[str(item.passage_id)].canonical_value(),
+                    "language": language,
+                }
+                for item in source.evidence
+            ),
+            proposed_endpoints=None,
+            relation_statement=None,
+            relation_temporal_bounds=None,
+            source_lineage={
+                "ingest_id": ingest_id,
+                "source_id": "UK-01",
+                "item_key": "item-1",
+                "revision_id": str(input_binding.revision_id),
+                "reference_time": SOURCE_NOW.to_text(),
+                "temporal_basis": "SOURCE_PUBLISHED",
+            },
+        )
+
+    requests = tuple(
+        admission_request(source) for source in sources
+    )
+    proof = extraction_proof()
+    adapter = MemoryNeo4jAdapter()
+
+    monkeypatch.setattr(test_graphiti_increment4_system, "FIXED_NOW", SOURCE_NOW)
+    with test_graphiti_increment4_system._open(tmp_path, adapter) as system:
+        connection = connect(str(tmp_path / "unpublished.sqlite3"))
+        receipt = {**unsigned_receipt, "receipt_digest": receipt_digest}
+        connection.execute(
+            "INSERT INTO unpublished_graphiti_ingest("
+            "ingest_id,source_id,item_key,outcome,proposal_count,entity_count,"
+            "relation_count,failure_code,temporal_basis,reference_time,"
+            "generation_id,receipt_digest,at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ingest_id,
+                "UK-01",
+                "item-1",
+                "COMPLETE",
+                4,
+                4,
+                0,
+                "NONE",
+                "SOURCE_PUBLISHED",
+                "2026-08-24T00:00:00Z",
+                "fixture-generation",
+                receipt_digest,
+                "2026-08-24T00:00:00Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO unpublished_graphiti_receipts(ingest_id,receipt_json) "
+            "VALUES(?,?)",
+            (ingest_id, canonical_json_bytes(receipt).decode()),
+        )
+        queued_requests = []
+        for request in requests:
+            cursor = connection.execute(
+                "INSERT INTO unpublished_graphiti_admission_queue("
+                "proposal_key,ingest_id,source_revision_id,source_receipt_digest,"
+                "proposal_digest,proposal_kind,request_json,request_digest,state,"
+                "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'READY',?,?)",
+                (
+                    request.proposal_key,
+                    ingest_id,
+                    str(input_binding.revision_id),
+                    receipt_digest,
+                    request.proposal.digest,
+                    request.proposal.kind.value,
+                    "{}",
+                    request.proposal_key,
+                    "2026-08-24T00:00:00Z",
+                    "2026-08-24T00:00:00Z",
+                ),
+            )
+            queued = replace(request, queue_seq=cursor.lastrowid)
+            encoded = canonical_json_bytes(queued.canonical_value())
+            connection.execute(
+                "UPDATE unpublished_graphiti_admission_queue "
+                "SET request_json=?,request_digest=? WHERE proposal_key=?",
+                (encoded.decode(), digest_bytes(encoded), queued.proposal_key),
+            )
+            queued_requests.append(queued)
+        connection.commit()
+
+        first_plan = conservative_entity_mention_plan(
+            queued_requests[0],
+            GraphitiProposalAdmissionAction.ADMIT,
+            f"graphiti-admit:{queued_requests[0].proposal_key}",
+        )
+        system.entities.admit_mention(first_plan.mention_requests[0], proof=proof)
+        retained = system.entities.propose_resolution(
+            first_plan.proposal_request,
+            proof=proof,
+        )
+        assert retained.canonical_digest != (
+            first_plan.decision_request.expected_proposal_digest
+        )
+
+        class CountingEntities:
+            def __init__(self, wrapped) -> None:
+                self.wrapped = wrapped
+                self.decision_calls = 0
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def decide_resolution(self, request, *, proof):
+                self.decision_calls += 1
+                return self.wrapped.decide_resolution(request, proof=proof)
+
+        entities = CountingEntities(system.entities)
+        authority = ExistingGovernedGraphitiAdmissionAuthority(
+            entities=entities,  # type: ignore[arg-type]
+            relations=SimpleNamespace(),  # type: ignore[arg-type]
+            proof=proof,
+            entity_plan=conservative_entity_mention_plan,
+            relation_plan=lambda *_: pytest.fail("relation planner called"),
+        )
+        rights = ExistingGovernedGraphitiRightsAuthority(
+            objects=system.objects,
+            proof=proof,
+        )
+        consumer = GraphitiAdmissionConsumer(
+            connection,
+            proposal_authority=SimpleNamespace(),  # type: ignore[arg-type]
+            authority=authority,
+            projector=ExistingIncrement4GenerationProjector(
+                controller=system.increment4,
+                proof=proof,
+            ),
+            rights=rights,
+            clock=lambda: datetime(2026, 8, 24, 12, tzinfo=UTC),
+        )
+        decisions = consumer.drain(
+            worker_id="fixture-worker",
+            limit=4,
+            ingest_ids=(ingest_id,),
+        )
+
+        assert decisions.decided == 4
+        assert entities.decision_calls == 4
+        with sqlite3.connect(state.extraction.database) as authority_connection:
+            assert authority_connection.execute(
+                "SELECT COUNT(*) FROM entity_mentions"
+            ).fetchone() == (4,)
+            assert authority_connection.execute(
+                "SELECT COUNT(*) FROM entity_resolution_proposal_versions"
+            ).fetchone() == (4,)
+            assert authority_connection.execute(
+                "SELECT COUNT(*) FROM entity_resolution_decisions"
+            ).fetchone() == (4,)
+
+        projection = consumer.finalise_decided_cohort(ingest_ids=(ingest_id,))
+
+        assert projection.projected == 4
+        assert connection.execute(
+            "SELECT COUNT(*) FROM unpublished_graphiti_projection_receipts"
+        ).fetchone() == (4,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM unpublished_graphiti_projection_reconciliations"
+        ).fetchone() == (1,)
+        assert len(adapter.deliveries) > 0
+        context = GovernedContextHydrator(
+            connection,
+            authority=authority,
+            rights=rights,
+            clock=lambda: datetime(2042, 3, 12, 10, tzinfo=UTC),
+        ).hydrate()
+        assert context.status is GovernedContextStatus.READY
+        assert len(context.items) == 4
+        assert {item.projection_generation_id for item in context.items} == {
+            context.projection_generation_id
+        }
+        connection.close()
 
 
 def test_existing_authority_marks_merged_entity_head_stale() -> None:

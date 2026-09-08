@@ -44,6 +44,15 @@ from newsroom.extraction.types import (
 from newsroom.graphiti_adapter.admission import GraphitiProposalAdmissionAction
 from newsroom.graphiti_adapter.identity import typed_id
 
+from .test_graphiti_admission_consumer import (
+    _Authority as _AdmissionAuthority,
+    _Projector as _AdmissionProjector,
+    _Rights as _AdmissionRights,
+    _consumer as _admission_consumer,
+    _draft as _admission_draft,
+    _seed_receipt as _seed_admission_receipt,
+)
+
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
 DIGEST_A = "sha256:" + ("a1" * 32)
 DIGEST_B = "sha256:" + ("b2" * 32)
@@ -562,6 +571,139 @@ def _seed_exact_all_hold_cohort(connection) -> str:
     )
     connection.commit()
     return generation_id
+
+
+def _seed_four_member_exact_generation(connection) -> None:
+    drafts = tuple(
+        _admission_draft(
+            f"entity.{number:04d}",
+            ExtractionProposalKind.ENTITY_MENTION,
+            subject=f"Entity {number}",
+        )
+        for number in range(1, 5)
+    )
+    receipt = _seed_admission_receipt(connection, *drafts)
+    consumer = _admission_consumer(
+        connection,
+        _AdmissionAuthority(
+            {
+                draft.local_id: GraphitiProposalAdmissionAction.ADMIT
+                for draft in drafts
+            }
+        ),
+        _AdmissionProjector(),
+        _AdmissionRights(),
+    )
+    ingest_id = str(receipt["ingest_id"])
+    assert consumer.enqueue_complete_receipts(ingest_ids=(ingest_id,)) == 4
+    for proposal_key, request_json in connection.execute(
+        "SELECT proposal_key,request_json "
+        "FROM unpublished_graphiti_admission_queue"
+    ).fetchall():
+        request = json.loads(str(request_json))
+        request["evidence_passages"][0].update(
+            {
+                "hydration_policy_contract_digest": DIGEST_A,
+                "principal_id": "newsroom.hermes",
+                "authority_domain": "newsroom.control-plane",
+                "purpose": "fixture",
+                "object_class": "article",
+                "allowed_use": "extraction",
+                "security_scope": "fixture",
+                "retention_scope": "fixture",
+                "language": "en",
+                "text": None,
+            }
+        )
+        encoded = canonical_json_bytes(request).decode()
+        connection.execute(
+            "UPDATE unpublished_graphiti_admission_queue "
+            "SET request_json=?,request_digest=? WHERE proposal_key=?",
+            (encoded, digest_bytes(encoded.encode()), proposal_key),
+        )
+    connection.commit()
+    assert consumer.drain(
+        worker_id="fixture-worker", limit=4, ingest_ids=(ingest_id,)
+    ).decided == 4
+    assert consumer.finalise_decided_cohort(
+        ingest_ids=(ingest_id,)
+    ).projected == 4
+
+
+def test_full_generation_watermark_covers_all_member_decisions(tmp_path) -> None:
+    connection = connect(str(tmp_path / "full-generation.sqlite3"))
+    _seed_four_member_exact_generation(connection)
+
+    context = GovernedContextHydrator(
+        connection,
+        authority=_CurrentAuthority(),
+        rights=_Rights(),
+        clock=lambda: NOW,
+    ).hydrate()
+
+    assert context.status is GovernedContextStatus.READY
+    assert len(context.items) == 4
+    assert {item.admission_authority_version for item in context.items} == {
+        101,
+        102,
+        103,
+        104,
+    }
+    assert {item.projection_authority_watermark for item in context.items} == {104}
+    assert len({item.projection_generation_id for item in context.items}) == 1
+    future_decision = replace(context.items[0], admission_authority_version=105)
+    with pytest.raises(ValueError, match="currency differs"):
+        replace(context, items=(future_decision, *context.items[1:]))
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("underflow", "future", "wrong_generation", "reconciliation"),
+)
+def test_full_generation_watermark_tampering_fails_closed(
+    tmp_path, tamper: str
+) -> None:
+    connection = connect(str(tmp_path / f"full-generation-{tamper}.sqlite3"))
+    _seed_four_member_exact_generation(connection)
+    if tamper == "reconciliation":
+        connection.execute(
+            "DROP TRIGGER immutable_graphiti_projection_reconciliations_update"
+        )
+        connection.execute(
+            "UPDATE unpublished_graphiti_projection_reconciliations "
+            "SET authority_watermark=105"
+        )
+    else:
+        connection.execute(
+            "DROP TRIGGER immutable_graphiti_projection_receipts_update"
+        )
+        field, value = (
+            ("authority_watermark", 100)
+            if tamper == "underflow"
+            else ("authority_watermark", 105)
+            if tamper == "future"
+            else ("generation_id", "00000000-0000-4000-8000-0000000075ff")
+        )
+        connection.execute(
+            f"UPDATE unpublished_graphiti_projection_receipts SET {field}=?",
+            (value,),
+        )
+    connection.commit()
+
+    context = GovernedContextHydrator(
+        connection,
+        authority=_CurrentAuthority(),
+        rights=_Rights(),
+        clock=lambda: NOW,
+    ).hydrate()
+
+    assert context.status is GovernedContextStatus.HOLD
+    assert context.reason_code in {
+        "AMBIGUOUS_PROJECTION_WATERMARK",
+        "ADMITTED_CONTEXT_RECEIPT_DRIFT",
+        "ADMITTED_CONTEXT_RECEIPT_INVALID",
+    }
+    assert context.items == ()
 
 
 def test_admitted_context_survives_hypothesis_candidate_evidence_and_cont(
