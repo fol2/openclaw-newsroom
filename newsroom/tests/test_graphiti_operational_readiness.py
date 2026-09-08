@@ -711,6 +711,92 @@ def test_bootstrap_plan_fails_closed_on_event_membership_drift(
         authority.close()
 
 
+def test_bootstrap_plan_cohort_contains_frontier_not_old_bindable_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from newsroom.control_plane.graphiti_steady_state import (
+        PRE_FRONTIER_BACKLOG_HOLD_REASON,
+        graphiti_operational_partition_snapshot,
+    )
+    from newsroom.tests.test_graphiti_steady_state import (
+        NOW,
+        _current_unit,
+        _nonterminal_obligation,
+        _queued_rows,
+        _stores,
+    )
+
+    old_unit = _unit()
+    frontier_unit = _next_revision(_unit())
+    proving, _unpublished, connection = _stores(tmp_path)
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=1,
+        item_key="old-backlog",
+        ingest_id=old_unit.ingest_id,
+    )
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=2,
+        item_key="frontier",
+        ingest_id=frontier_unit.ingest_id,
+    )
+    connection.commit()
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_steady_state."
+        "load_graphiti_units_from_connection",
+        lambda *_args, **_kwargs: (
+            _current_unit(
+                item_key="old-backlog", ingest_id=old_unit.ingest_id
+            ),
+            _current_unit(
+                item_key="frontier", ingest_id=frontier_unit.ingest_id
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_operational_readiness."
+        "load_graphiti_units_from_connection",
+        lambda *_args, **_kwargs: (old_unit, frontier_unit),
+    )
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_operational_readiness."
+        "_dispatch_rights_decision",
+        lambda *_args, **_kwargs: _rights(),
+    )
+    proving_connection = sqlite3.connect(proving)
+    authority = sqlite3.connect(":memory:")
+    try:
+        snapshot = graphiti_operational_partition_snapshot(
+            proving_connection,
+            connection,
+            authority=authority,
+            observed_at=NOW,
+        )
+        plan = plan_operational_authority_bootstrap(
+            proving_connection,
+            connection,
+            authority,
+            observed_at=NOW,
+        )
+    finally:
+        proving_connection.close()
+        authority.close()
+        connection.close()
+
+    assert [item["ledger_seq"] for item in snapshot["actionable"]] == [2]
+    assert snapshot["holds"][0]["reason"] == PRE_FRONTIER_BACKLOG_HOLD_REASON
+    assert [item["ledger_seq"] for item in plan.candidate_events] == [2]
+    assert list(plan.candidate_events[0]["ingest_ids"]) == [frontier_unit.ingest_id]
+    assert [unit.ingest_id for unit in plan.units] == [frontier_unit.ingest_id]
+    unpublished = sqlite3.connect(_unpublished)
+    try:
+        assert _queued_rows(unpublished) == [(1, "QUEUED", 0), (2, "QUEUED", 0)]
+    finally:
+        unpublished.close()
+
+
 def test_source_requests_reject_missing_retained_or_rights_identity() -> None:
     unit = _unit()
     with pytest.raises(GraphitiOperationalReadinessError, match="retained source"):

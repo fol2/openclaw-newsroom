@@ -41,6 +41,7 @@ from newsroom.control_plane.graphiti_spend_reconciliation import (
 )
 from newsroom.control_plane.graphiti_steady_state import (
     GraphitiCampaignRuntime,
+    PRE_FRONTIER_BACKLOG_HOLD_REASON,
     _authority_snapshot_evidence,
     _mint_graphiti_campaign_runtime,
     _spend,
@@ -1718,6 +1719,144 @@ def test_operational_partition_reuses_fresh_gap_and_hold_policy(
     connection.close()
 
 
+def _queued_rows(connection: sqlite3.Connection) -> list[tuple[object, ...]]:
+    return [
+        tuple(row)
+        for row in connection.execute(
+            "SELECT ledger_seq,state,attempt_count FROM "
+            "unpublished_graphiti_revision_events ORDER BY ledger_seq"
+        )
+    ]
+
+
+def test_empty_actionable_then_frontier_supply_excludes_old_bindable_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proving, _unpublished, connection = _stores(tmp_path)
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=1,
+        item_key="old-backlog",
+        ingest_id="old-ingest",
+    )
+    connection.commit()
+    proving_connection = sqlite3.connect(proving)
+    authority = sqlite3.connect(":memory:")
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_steady_state."
+        "load_graphiti_units_from_connection",
+        lambda _connection, *, evaluated_at: (),
+    )
+
+    empty = graphiti_operational_partition_snapshot(
+        proving_connection,
+        connection,
+        authority=authority,
+        observed_at=NOW,
+    )
+
+    assert empty["actionable"] == []
+    assert [item["ledger_seq"] for item in empty["holds"]] == [1]
+    assert _queued_rows(connection) == [(1, "QUEUED", 0)]
+
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=2,
+        item_key="frontier",
+        ingest_id="frontier-ingest",
+    )
+    connection.commit()
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_steady_state."
+        "load_graphiti_units_from_connection",
+        lambda _connection, *, evaluated_at: (
+            _current_unit(item_key="old-backlog", ingest_id="old-ingest"),
+            _current_unit(item_key="frontier", ingest_id="frontier-ingest"),
+        ),
+    )
+
+    supplied = graphiti_operational_partition_snapshot(
+        proving_connection,
+        connection,
+        authority=authority,
+        observed_at=NOW,
+    )
+
+    assert [(item["ledger_seq"], item["kind"]) for item in supplied["actionable"]] == [
+        (2, "FRESH_EVENT")
+    ]
+    assert supplied["actionable"][0]["ingest_ids"] == ["frontier-ingest"]
+    assert [item["ledger_seq"] for item in supplied["holds"]] == [1]
+    assert supplied["holds"][0]["reason"] == PRE_FRONTIER_BACKLOG_HOLD_REASON
+    assert _queued_rows(connection) == [(1, "QUEUED", 0), (2, "QUEUED", 0)]
+    authority.close()
+    proving_connection.close()
+    connection.close()
+
+
+def test_pre_frontier_bindable_queued_stay_held_when_frontier_is_fresh_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proving, _unpublished, connection = _stores(tmp_path)
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=1,
+        item_key="old-backlog",
+        ingest_id="old-ingest",
+    )
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=2,
+        item_key="projectable-gap",
+        ingest_id="gap-ingest",
+        with_event=False,
+    )
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=3,
+        item_key="frontier",
+        ingest_id="frontier-ingest",
+    )
+    connection.commit()
+    proving_connection = sqlite3.connect(proving)
+    authority = sqlite3.connect(":memory:")
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_steady_state."
+        "load_graphiti_units_from_connection",
+        lambda _connection, *, evaluated_at: (
+            _current_unit(item_key="old-backlog", ingest_id="old-ingest"),
+            _current_unit(item_key="projectable-gap", ingest_id="gap-ingest"),
+            _current_unit(item_key="frontier", ingest_id="frontier-ingest"),
+        ),
+    )
+
+    snapshot = graphiti_operational_partition_snapshot(
+        proving_connection,
+        connection,
+        authority=authority,
+        observed_at=NOW,
+    )
+
+    assert [(item["ledger_seq"], item["kind"]) for item in snapshot["actionable"]] == [
+        (2, "PROJECT_EVENT_GAP"),
+        (3, "FRESH_EVENT"),
+    ]
+    assert snapshot["actionable"][1]["ingest_ids"] == ["frontier-ingest"]
+    assert snapshot["holds"] == [
+        {
+            "ledger_seq": 1,
+            "event_id": "sha256:" + f"{1:064x}",
+            "reason": PRE_FRONTIER_BACKLOG_HOLD_REASON,
+        }
+    ]
+    assert _queued_rows(connection) == [(1, "QUEUED", 0), (3, "QUEUED", 0)]
+    authority.close()
+    proving_connection.close()
+    connection.close()
+
+
 def test_complete_packet_remains_no_go_without_graph_readback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2429,6 +2568,16 @@ def test_undercounted_campaign_cap_does_not_widen_to_selected_cohort(
         ledger_seq=2,
         item_key="candidate-b",
         ingest_id="candidate-b-ingest",
+    )
+    _nonterminal_obligation(
+        connection,
+        ledger_seq=3,
+        item_key="retry-held",
+        ingest_id="retry-held-ingest",
+    )
+    connection.execute(
+        "UPDATE unpublished_graphiti_revision_events SET state='RETRY_HELD',"
+        "attempt_count=1 WHERE ledger_seq=3"
     )
     connection.commit()
     connection.close()

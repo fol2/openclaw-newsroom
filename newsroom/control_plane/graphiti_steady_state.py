@@ -342,6 +342,8 @@ HISTORICAL_PARTITION_CATEGORIES = (
     "NON_REPLAYABLE_OR_AMBIGUOUS_EFFECT_HOLD",
     "UNCLASSIFIED",
 )
+PRE_FRONTIER_BACKLOG_HOLD_REASON = "PRE_FRONTIER_BACKLOG_NOT_ACTIONABLE"
+_CURRENT_PREFLIGHT_REASON = "CURRENT_RIGHTS_INPUT_AND_BINDING_VERIFIED"
 
 
 class GraphitiCampaignRuntime:
@@ -1644,7 +1646,7 @@ def _historical_partition(
                     )
                     if binding_reason is None:
                         category = "CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"
-                        reason = "CURRENT_RIGHTS_INPUT_AND_BINDING_VERIFIED"
+                        reason = _CURRENT_PREFLIGHT_REASON
                         current_ingest_ids = [
                             item.ingest_id
                             for item in sorted(
@@ -1720,27 +1722,29 @@ def _historical_partition(
             seq for seq, _revision_id in ordered if seq != keep
         )
 
-    if held_semantic_duplicates:
-        candidate_assignments = assignments["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"]
-        assignments["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"] = [
-            seq for seq in candidate_assignments if seq not in held_semantic_duplicates
-        ]
-        assignments["RIGHTS_OR_INPUT_HELD"].extend(held_semantic_duplicates)
-        assignments["RIGHTS_OR_INPUT_HELD"].sort()
-        current_reason = "CURRENT_RIGHTS_INPUT_AND_BINDING_VERIFIED"
-        reason_counts["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"][current_reason] -= len(
-            held_semantic_duplicates
+    candidate_events = _hold_current_preflight_candidates(
+        assignments=assignments,
+        reason_counts=reason_counts,
+        candidate_events=candidate_events,
+        held_sequences=held_semantic_duplicates,
+        hold_reason="UNCHANGED_CONTENT_REOBSERVATION_REQUIRES_OCCURRENCE",
+    )
+    frontier_ledger_seq = max((int(row[0]) for row in landed_rows), default=None)
+    candidate_sequences = {
+        int(candidate["ledger_seq"]) for candidate in candidate_events
+    }
+    pre_frontier_held: set[int] = set()
+    if frontier_ledger_seq in candidate_sequences:
+        pre_frontier_held = {
+            seq for seq in candidate_sequences if seq != frontier_ledger_seq
+        }
+        candidate_events = _hold_current_preflight_candidates(
+            assignments=assignments,
+            reason_counts=reason_counts,
+            candidate_events=candidate_events,
+            held_sequences=pre_frontier_held,
+            hold_reason=PRE_FRONTIER_BACKLOG_HOLD_REASON,
         )
-        if not reason_counts["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"][current_reason]:
-            del reason_counts["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"][current_reason]
-        reason_counts["RIGHTS_OR_INPUT_HELD"][
-            "UNCHANGED_CONTENT_REOBSERVATION_REQUIRES_OCCURRENCE"
-        ] += len(held_semantic_duplicates)
-        candidate_events = [
-            candidate
-            for candidate in candidate_events
-            if int(candidate["ledger_seq"]) not in held_semantic_duplicates
-        ]
 
     all_sequences = [seq for values in assignments.values() for seq in values]
     disjoint = len(all_sequences) == len(set(all_sequences))
@@ -1767,6 +1771,11 @@ def _historical_partition(
         "total": total,
         "categories": categories,
         "source_semantic_collision_holds": sorted(held_semantic_duplicates),
+        **(
+            {"pre_frontier_backlog_holds": sorted(pre_frontier_held)}
+            if pre_frontier_held
+            else {}
+        ),
         "current_preflight_candidates": candidate_events,
         "current_preflight_candidate_manifest_digest": digest_canonical(
             candidate_events
@@ -1785,6 +1794,41 @@ def _historical_partition(
     }, blockers
 
 
+def _hold_current_preflight_candidates(
+    *,
+    assignments: dict[str, list[int]],
+    reason_counts: dict[str, Counter[str]],
+    candidate_events: list[dict[str, object]],
+    held_sequences: set[int],
+    hold_reason: str,
+) -> list[dict[str, object]]:
+    """Move selected bindable FRESH candidates onto a hold without draining them."""
+
+    if not held_sequences:
+        return candidate_events
+    candidate_assignments = assignments["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"]
+    assignments["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"] = [
+        seq for seq in candidate_assignments if seq not in held_sequences
+    ]
+    assignments["RIGHTS_OR_INPUT_HELD"].extend(sorted(held_sequences))
+    assignments["RIGHTS_OR_INPUT_HELD"].sort()
+    reason_counts["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"][
+        _CURRENT_PREFLIGHT_REASON
+    ] -= len(held_sequences)
+    if not reason_counts["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"][
+        _CURRENT_PREFLIGHT_REASON
+    ]:
+        del reason_counts["CURRENT_DISPATCH_PREFLIGHT_CANDIDATE"][
+            _CURRENT_PREFLIGHT_REASON
+        ]
+    reason_counts["RIGHTS_OR_INPUT_HELD"][hold_reason] += len(held_sequences)
+    return [
+        candidate
+        for candidate in candidate_events
+        if int(candidate["ledger_seq"]) not in held_sequences
+    ]
+
+
 def graphiti_operational_partition_snapshot(
     proving: sqlite3.Connection,
     unpublished: sqlite3.Connection,
@@ -1792,7 +1836,11 @@ def graphiti_operational_partition_snapshot(
     authority: sqlite3.Connection,
     observed_at: datetime,
 ) -> dict[str, object]:
-    """Return the existing exact dispatch partition as bounded campaign evidence."""
+    """Return the existing exact dispatch partition as bounded campaign evidence.
+
+    Bindable pre-frontier QUEUED stays held when the current event-ledger
+    frontier is itself a FRESH candidate. The event rows are not drained.
+    """
 
     if observed_at.tzinfo is None:
         raise GraphitiEventReconciliationError(
@@ -1986,6 +2034,12 @@ def graphiti_operational_partition_snapshot(
         {
             int(ledger_seq): "UNCHANGED_CONTENT_REOBSERVATION_REQUIRES_OCCURRENCE"
             for ledger_seq in partition.get("source_semantic_collision_holds", ())
+        }
+    )
+    hold_reasons.update(
+        {
+            int(ledger_seq): PRE_FRONTIER_BACKLOG_HOLD_REASON
+            for ledger_seq in partition.get("pre_frontier_backlog_holds", ())
         }
     )
     for category in (
