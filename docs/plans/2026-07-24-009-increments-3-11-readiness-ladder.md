@@ -581,17 +581,17 @@ Do not begin Increment 10 until the exact system receives the required shadow an
 
 # Increment 10 — Governed Evidence Intake canary
 
-**Readiness state:** Prepared with normative and owner-decision blockers
+**Readiness state:** Historical preparation snapshot; current qualifying outcome tracked in #151
 **Dependency:** Increment 9 completed with qualifying outcome
-**Normative blocker:** Downstream evidence, rights, sensitive-content and publication specifications in the editorial suite remain Draft unless separately accepted or explicitly authorised
+**Normative basis:** The publication-facing evidence, rights, sensitive-content and publication specifications are now Accepted. Exact Evidence Intake, rights, reviewer and canary-plan authority remains a separate requirement; this status correction does not change the historical `BLOCKED_ACTIVE_COVERAGE` fixture closeout.
 
 ## Objective
 
 Hand a bounded set of exact Candidate Versions from the production-target GraphRAG deployment to a governed Evidence Intake canary. Add no direct drafting or publication path.
 
-## Required authority before implementation
+## Required Evidence Intake and canary authority
 
-The owner must accept or explicitly authorise the minimum Evidence Intake contract covering:
+Reuse applicable Accepted specifications; the exact Evidence Intake contract and canary authority must cover:
 
 - stable intake identity and exact Candidate Version correlation;
 - permitted source retrieval and rights authority;
@@ -604,7 +604,7 @@ The owner must accept or explicitly authorise the minimum Evidence Intake contra
 - canary scope, reviewer authority and rollback; and
 - proof that discovery material is not evidence.
 
-Until that authority exists, only transport-neutral interface and decision-template preparation is permitted.
+Accepted specification status alone grants no live canary or source/evidence effect. Ordinary preparation follows current issue intent; execution requires the exact applicable authority below.
 
 ## Prepared review units
 
