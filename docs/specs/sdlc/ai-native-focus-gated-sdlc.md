@@ -54,6 +54,16 @@ F4 remains owner gated.
 - **F4:** credentials, security, migration/deletion, publication, deployment,
   admission, activation and release remain exact and fail-closed.
 
+Internal publication implementation, retained payloads and tests are not public
+publication effects merely because their filename contains `publication`.
+Under the owner-approved #151 scope, ordinary engineering and private pipeline
+operation are autonomous; the public exposure control belongs to newsroom-hub.
+Do not add a per-story or per-batch human approval to that private pipeline.
+Verify the actual destination and exposure boundary before connecting it.
+This distinction does not authorise changing hub public exposure, bypassing
+credentials or integrity controls, or treating a failed revision as covered.
+
+
 ## Machine route
 
 `scripts/sdlc/focus_gate_v2.py` emits `newsroom.sdlc.focus-route.v1`, a canonical

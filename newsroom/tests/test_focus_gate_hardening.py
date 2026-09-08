@@ -387,3 +387,22 @@ def test_failed_phase_cannot_publish_stale_junit(
     assert focus_gate.execute_route(tmp_path, "route.json", junit=requested) == 3
     assert not requested.exists()
     assert not stale.exists()
+
+
+@pytest.mark.parametrize("route", [selector.select_focus, selector.legacy.select_focus])
+def test_internal_publication_is_not_a_public_effect_gate(route) -> None:
+    paths = (
+        "newsroom/increment10/publication.py",
+        "newsroom/tests/test_increment10_publication.py",
+    )
+    internal = route(paths)
+    assert internal["owner_authority_required"] is False
+    assert "F4" not in internal["gates"]
+    for effect in (
+        "deploy/hermes.plist",
+        "newsroom/control_plane/keychain.py",
+        "scripts/production_operational_admission.py",
+    ):
+        mixed = route((*paths, effect))
+        assert mixed["owner_authority_required"] is True
+        assert "F4" in mixed["gates"]

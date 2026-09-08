@@ -69,7 +69,6 @@ F4_PATTERNS = (
     "scripts/production_operational_admission.py",
     "newsroom/**/*credential*.py",
     "newsroom/**/*keychain*.py",
-    "newsroom/**/*publication*.py",
 )
 SHARED_BREADTH_PATTERNS = ("pyproject.toml", "uv.lock", "newsroom/tests/conftest.py")
 PREPARED_CANARY_PARITY_PATTERNS = (
