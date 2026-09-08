@@ -20,6 +20,7 @@ from newsroom.authority import (
     CommandRegistry,
     HydrationPolicyRegistry,
     HydrationRequest,
+    IdempotencyIdentityConflict,
     ObjectAdmissionDefinition,
     ObjectAdmissionRegistry,
     ObjectAdmissionRequest,
@@ -592,11 +593,82 @@ def _accepted_source_contract(source_id: str) -> _AcceptedSourceContract:
         ) from exc
 
 
+def _source_version_rights_decision_id(
+    authority_store: sqlite3.Connection | None,
+    unit: CorpusIngestUnit,
+    rights: Mapping[str, object],
+) -> str:
+    """Keep the immutable source-version rights identity when the packet is unchanged.
+
+    proving_run_id is dispatch/access identity. The version command is keyed by
+    source and packet digest, so a later poll of the same packet must replay the
+    retained rights_decision_id instead of minting a new one.
+    """
+
+    packet_digest = str(rights.get("packet_digest") or "")
+    run_id = str(rights.get("rights_authority_run_id") or "")
+    gate_id = str(rights.get("gate_id") or "")
+    current_id = str(
+        typed_id(
+            UUIDv4Id,
+            "retained-rights-packet",
+            run_id,
+            gate_id,
+            packet_digest,
+        )
+    )
+    if authority_store is None or unit.authority is None:
+        return current_id
+    tables = {
+        str(name)
+        for (name,) in authority_store.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ("
+            "'source_definition_versions','ledger_events','authority_commands')"
+        )
+    }
+    if tables != {
+        "source_definition_versions",
+        "ledger_events",
+        "authority_commands",
+    }:
+        return current_id
+    version_id = unit.authority.definition_version_id
+    if (
+        authority_store.execute(
+            "SELECT 1 FROM source_definition_versions WHERE version_id=?",
+            (version_id,),
+        ).fetchone()
+        is None
+    ):
+        return current_id
+    retained = authority_store.execute(
+        "SELECT v.rights_decision_id,c.idempotency_key "
+        "FROM source_definition_versions v "
+        "JOIN ledger_events e ON e.event_id=v.authority_event_id "
+        "JOIN authority_commands c ON c.command_id=e.command_id "
+        "WHERE v.version_id=?",
+        (version_id,),
+    ).fetchone()
+    if retained is None:
+        raise GraphitiOperationalReadinessError(
+            "retained source version lacks its exact command identity"
+        )
+    if str(retained[1]) != (
+        f"issue895-source-version:{unit.source_id}:{packet_digest}"
+    ):
+        raise GraphitiOperationalReadinessError(
+            "retained source version requires an explicit rights-packet change"
+        )
+    return str(retained[0])
+
+
 def _source_requests(
     unit: CorpusIngestUnit,
     rights: Mapping[str, object],
     *,
     prior_revision_id: SourceRevisionId | None = None,
+    authority_store: sqlite3.Connection | None = None,
 ) -> tuple[
     SourceDefinitionRequest,
     SourceDefinitionVersionRequest,
@@ -643,14 +715,8 @@ def _source_requests(
             "updated_at",
         ),
         rights=RightsReference(
-            rights_decision_id=str(
-                typed_id(
-                    UUIDv4Id,
-                    "retained-rights-packet",
-                    run_id,
-                    gate_id,
-                    packet_digest,
-                )
+            rights_decision_id=_source_version_rights_decision_id(
+                authority_store, unit, rights
             ),
             rights_policy_version=_RIGHTS_POLICY.implementation_version,
             allowed_use="proposal.extraction",
@@ -949,6 +1015,7 @@ def plan_operational_authority_bootstrap(
             prior_revision_id=(
                 None if prior is None else SourceRevisionId.parse(prior)
             ),
+            authority_store=authority,
         )
         revision_requests.append(requests[3])
         request_digests.append(
@@ -1028,28 +1095,30 @@ class OperationalCorpusAuthorityBinder:
         items: dict[str, SourceItemRequest] = {}
         revisions: dict[str, SourceRevisionRequest] = {}
         representations: dict[str, DiscoveryRepresentationRequest] = {}
-        for unit in self._plan.units:
-            definition, version, item, revision, representation = _source_requests(
-                unit,
-                self._plan.rights_for(unit.source_id),
-                prior_revision_id=self._plan.prior_revision_for(unit),
-            )
-            for target, identity, request in (
-                (definitions, str(definition.definition_id), definition),
-                (versions, str(version.version_id), version),
-                (items, str(item.item_id), item),
-                (revisions, str(revision.revision_id), revision),
-                (
-                    representations,
-                    str(representation.representation_id),
-                    representation,
-                ),
-            ):
-                retained = target.setdefault(identity, request)
-                if retained.digest != request.digest:
-                    raise GraphitiOperationalReadinessError(
-                        "one source authority identity has conflicting current semantics"
-                    )
+        with sqlite3.connect(self._system.authority_store_path) as authority_store:
+            for unit in self._plan.units:
+                definition, version, item, revision, representation = _source_requests(
+                    unit,
+                    self._plan.rights_for(unit.source_id),
+                    prior_revision_id=self._plan.prior_revision_for(unit),
+                    authority_store=authority_store,
+                )
+                for target, identity, request in (
+                    (definitions, str(definition.definition_id), definition),
+                    (versions, str(version.version_id), version),
+                    (items, str(item.item_id), item),
+                    (revisions, str(revision.revision_id), revision),
+                    (
+                        representations,
+                        str(representation.representation_id),
+                        representation,
+                    ),
+                ):
+                    retained = target.setdefault(identity, request)
+                    if retained.digest != request.digest:
+                        raise GraphitiOperationalReadinessError(
+                            "one source authority identity has conflicting current semantics"
+                        )
         sources = self._system.sources
         for request in definitions.values():
             sources.register_definition(request, proof=self._proof)
@@ -1215,8 +1284,13 @@ def bootstrap_operational_authority(
         proof=proof,
         plan=plan,
     )
-    binder.commit_sources()
-    bound_units = tuple(binder(unit) for unit in plan.units)
+    try:
+        binder.commit_sources()
+        bound_units = tuple(binder(unit) for unit in plan.units)
+    except IdempotencyIdentityConflict as exc:
+        raise GraphitiOperationalReadinessError(
+            "retained authority identity differs from the exact bootstrap request"
+        ) from exc
     attempts = tuple(_evaluation_attempt_for_unit(unit) for unit in bound_units)
     contract = attempts[0].extraction_contract
     configuration = attempts[0].configuration
