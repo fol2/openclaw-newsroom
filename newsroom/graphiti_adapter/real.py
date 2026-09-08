@@ -412,6 +412,10 @@ def combined_temporal_pipeline_for(
         return runtime.resolve_edge_pointers(typed_edges, uuid_map)
 
     async def persist_graph(nodes: list[Any], edges: list[Any]) -> None:
+        await _batch_missing_node_name_embeddings(
+            graphiti.clients.embedder,
+            nodes,
+        )
         await graphiti._process_episode_data(
             episode,
             nodes,
@@ -444,6 +448,29 @@ def combined_temporal_pipeline_for(
         expected_episode_uuid=expected_episode_uuid,
         expected_ingest_id=expected_ingest_id or guard.input_digest,
     )
+
+
+async def _batch_missing_node_name_embeddings(
+    embedder: Any,
+    nodes: list[Any],
+) -> None:
+    missing = [node for node in nodes if node.name_embedding is None]
+    if not missing:
+        return
+    create_batch = getattr(embedder, "create_batch", None)
+    if not callable(create_batch):
+        raise GraphitiAdapterContractError(
+            "node name embedding batch is unavailable"
+        )
+    embeddings = await create_batch(
+        [str(node.name).replace("\n", " ") for node in missing]
+    )
+    if len(embeddings) != len(missing):
+        raise GraphitiAdapterContractError(
+            "node name embedding batch cardinality differs"
+        )
+    for node, embedding in zip(missing, embeddings, strict=True):
+        node.name_embedding = embedding
 
 
 def _same_time(left: object, right: datetime) -> bool:
