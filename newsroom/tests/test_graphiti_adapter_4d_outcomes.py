@@ -52,6 +52,7 @@ from newsroom.graphiti_adapter.real import (
     _EpisodeTelemetry,
     _raw_receipt,
 )
+from newsroom.graphiti_adapter.models import adapter_outcome_for
 from newsroom.graphiti_adapter.result_mapping import extraction_usage
 from newsroom.graphiti_adapter.contracts import (
     GRAPHITI_ADAPTER_CODE_COMPONENT,
@@ -163,7 +164,11 @@ def _evaluation_execution(attempt, *, outcome: str) -> GraphitiAdapterExecution:
         failure_code=(
             ExtractionFailureCode.NONE
             if complete
-            else ExtractionFailureCode.PRODUCER_INTERNAL_ERROR
+            else (
+                ExtractionFailureCode.AMBIGUOUS_EFFECT
+                if outcome == "AMBIGUOUS_EFFECT"
+                else ExtractionFailureCode.PRODUCER_INTERNAL_ERROR
+            )
         ),
         validation=(ExtractionOutputValidation.VALID if complete else None),
         raw_output_value=(receipt if complete else None),
@@ -195,11 +200,7 @@ def _evaluation_execution(attempt, *, outcome: str) -> GraphitiAdapterExecution:
         ),
         created_at=started_at,
     )
-    adapter_outcome = (
-        GraphitiAdapterOutcome.COMPLETE
-        if complete
-        else GraphitiAdapterOutcome.FAILED
-    )
+    adapter_outcome = adapter_outcome_for(produced)
     return GraphitiAdapterExecution(
         attempt=attempt,
         outcome=adapter_outcome,
@@ -213,7 +214,11 @@ def _evaluation_execution(attempt, *, outcome: str) -> GraphitiAdapterExecution:
             reason=(
                 GraphitiCleanupReason.NORMAL
                 if complete
-                else GraphitiCleanupReason.FAILED
+                else (
+                    GraphitiCleanupReason.AMBIGUOUS_EFFECT
+                    if outcome == "AMBIGUOUS_EFFECT"
+                    else GraphitiCleanupReason.FAILED
+                )
             ),
             private_node_count=0,
             private_relation_count=0,
@@ -232,6 +237,7 @@ def _evaluation_execution(attempt, *, outcome: str) -> GraphitiAdapterExecution:
     (
         ("COMPLETE", GraphitiAdapterOutcome.COMPLETE, True),
         ("FAILED", GraphitiAdapterOutcome.FAILED, False),
+        ("AMBIGUOUS_EFFECT", GraphitiAdapterOutcome.AMBIGUOUS_EFFECT, False),
         ("LATE", GraphitiAdapterOutcome.TIMEOUT, False),
     ),
 )

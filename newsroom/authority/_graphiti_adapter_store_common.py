@@ -938,11 +938,12 @@ class _GraphitiAdapterStoreSupport:
             ExtractionOutcome.SUCCESS: GraphitiAdapterOutcome.COMPLETE,
             ExtractionOutcome.PARTIAL: GraphitiAdapterOutcome.PARTIAL,
             ExtractionOutcome.INVALID_OUTPUT: GraphitiAdapterOutcome.MALFORMED_OUTPUT,
-            ExtractionOutcome.RETRYABLE_FAILURE: (
-                GraphitiAdapterOutcome.TIMEOUT
-                if result.failure_code is ExtractionFailureCode.EXECUTION_TIMEOUT
-                else GraphitiAdapterOutcome.FAILED
-            ),
+            ExtractionOutcome.RETRYABLE_FAILURE: {
+                ExtractionFailureCode.AMBIGUOUS_EFFECT: (
+                    GraphitiAdapterOutcome.AMBIGUOUS_EFFECT
+                ),
+                ExtractionFailureCode.EXECUTION_TIMEOUT: GraphitiAdapterOutcome.TIMEOUT,
+            }.get(result.failure_code, GraphitiAdapterOutcome.FAILED),
             ExtractionOutcome.BLOCKING_FAILURE: (
                 GraphitiAdapterOutcome.POLICY_BLOCKED
                 if result.failure_code is ExtractionFailureCode.POLICY_BLOCKED
