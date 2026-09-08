@@ -60,6 +60,7 @@ class GovernedEvidencePackage:
     governing_manifest_digest: str
     source_admission_ids: tuple[ObjectAdmissionId, ...]
     record_admission_ids: tuple[ObjectAdmissionId, ...]
+    source_inventory: tuple[tuple[str, str], ...]
 
     @property
     def drafting_authority(self) -> bool:
@@ -124,7 +125,7 @@ class GovernedEvidencePackages:
         proof: AuthenticationProof,
     ) -> GovernedEvidencePackage:
         acknowledgement = self._ingress.receipt(receipt_id)
-        resolved, envelope = self._validated_envelope(
+        resolved, envelope, source_inventory = self._validated_envelope(
             package,
             acknowledgement=acknowledgement,
             candidate_port=candidate_port,
@@ -155,6 +156,7 @@ class GovernedEvidencePackages:
             acknowledgement,
             source_admission_ids,
             record_admission_ids,
+            source_inventory,
         )
 
     def read(
@@ -187,7 +189,7 @@ class GovernedEvidencePackages:
             acknowledgement = self._ingress.receipt(str(value["receipt_id"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise EvidencePackageError("package object bindings differ") from exc
-        resolved, rebuilt = self._validated_envelope(
+        resolved, rebuilt, source_inventory = self._validated_envelope(
             package,
             acknowledgement=acknowledgement,
             candidate_port=candidate_port,
@@ -198,7 +200,12 @@ class GovernedEvidencePackages:
         if rebuilt != hydrated.data:
             raise EvidencePackageError("retained package object differs")
         return self._result(
-            package_admission_id, resolved, acknowledgement, source_ids, record_ids
+            package_admission_id,
+            resolved,
+            acknowledgement,
+            source_ids,
+            record_ids,
+            source_inventory,
         )
 
     def _validated_envelope(
@@ -210,7 +217,7 @@ class GovernedEvidencePackages:
         source_admission_ids: tuple[ObjectAdmissionId, ...],
         record_admission_ids: tuple[ObjectAdmissionId, ...],
         proof: AuthenticationProof,
-    ) -> tuple[EvidencePackage, bytes]:
+    ) -> tuple[EvidencePackage, bytes, tuple[tuple[str, str], ...]]:
         if type(package) is not EvidencePackage or package.admitted_context is not None:
             raise EvidencePackageError("native package must use exact evidence values")
         package = _package_from_value(evidence_package_value(package))
@@ -348,7 +355,7 @@ class GovernedEvidencePackages:
                 "package_digest": resolved.digest,
             }
         )
-        return resolved, envelope
+        return resolved, envelope, source_inventory
 
     def _require_decision(
         self,
@@ -374,6 +381,7 @@ class GovernedEvidencePackages:
         acknowledgement: IntakeAcknowledgement,
         source_ids: tuple[ObjectAdmissionId, ...],
         record_ids: tuple[ObjectAdmissionId, ...],
+        source_inventory: tuple[tuple[str, str], ...],
     ) -> GovernedEvidencePackage:
         return GovernedEvidencePackage(
             admission_id,
@@ -384,6 +392,7 @@ class GovernedEvidencePackages:
             acknowledgement.governing_manifest_digest,
             source_ids,
             record_ids,
+            source_inventory,
         )
 
 
