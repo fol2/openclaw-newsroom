@@ -595,6 +595,10 @@ class NativeEditorial:
         candidate_port: StoryCandidateReadPort,
         proof: AuthenticationProof,
     ) -> tuple[StoryVersionReceipt, StoryVersion]:
+        if type(request) is not StoryVersionRequest:
+            raise EditorialError("immutable Story Version request is required")
+        if type(decision_reference) is not DecisionReference:
+            raise EditorialError("immutable editorial decision reference is required")
         retained = self._evidence.read(
             package_admission_id, candidate_port=candidate_port, proof=proof
         )
@@ -652,6 +656,8 @@ class NativeEditorial:
         candidate_port: StoryCandidateReadPort,
         proof: AuthenticationProof,
     ) -> StoryVersion:
+        if type(receipt) is not StoryVersionReceipt:
+            raise EditorialError("immutable Story Version receipt is required")
         self._verify_story_event(receipt, proof=proof)
         hydrated = self._objects.hydrate(
             HydrationRequest(receipt.admission_id, STORY_PURPOSE), proof=proof
@@ -696,6 +702,8 @@ class NativeEditorial:
         reference: DecisionReference,
     ) -> StoryVersion:
         package = retained.package
+        if str(request.story_id) == package.candidate_id:
+            raise EditorialError("Story identity must differ from Candidate identity")
         gates = policy.evidence_gate_results
         governed_claim_ids = tuple(item.claim_id for item in package.governed_claims)
         evaluated = replace(
