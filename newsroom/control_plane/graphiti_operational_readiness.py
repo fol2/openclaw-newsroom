@@ -8,6 +8,7 @@ planning and applying a bootstrap.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
@@ -592,6 +593,48 @@ def _accepted_source_contract(source_id: str) -> _AcceptedSourceContract:
         ) from exc
 
 
+def _source_definition_rights_run(
+    proving: sqlite3.Connection,
+    authority: sqlite3.Connection,
+    unit: CorpusIngestUnit,
+    rights: Mapping[str, object],
+) -> str:
+    """Keep an immutable version's anchor when a poll reuses its exact packet."""
+
+    current_run = str(rights["rights_authority_run_id"])
+    if unit.authority is None:
+        raise GraphitiOperationalReadinessError("current corpus unit lacks source identity")
+    if authority.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_definition_versions'"
+    ).fetchone() is None:
+        return current_run
+    retained = authority.execute(
+        "SELECT rights_decision_id FROM source_definition_versions WHERE version_id=?",
+        (unit.authority.definition_version_id,),
+    ).fetchone()
+    if retained is None:
+        return current_run
+    gate_id, packet_digest = str(rights["gate_id"]), str(rights["packet_digest"])
+    if str(typed_id(UUIDv4Id, "retained-rights-packet", current_run, gate_id, packet_digest)) == retained[0]:
+        return current_run
+    for run_id, packet_json in proving.execute(
+        "SELECT run_id,packet_json FROM proving_rights_packets WHERE gate_id=? AND packet_digest=?",
+        (gate_id, packet_digest),
+    ):
+        if str(typed_id(UUIDv4Id, "retained-rights-packet", str(run_id), gate_id, packet_digest)) != retained[0]:
+            continue
+        try:
+            valid = digest_canonical(json.loads(packet_json)) == packet_digest
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise GraphitiOperationalReadinessError("retained source rights packet is invalid")
+        return str(run_id)
+    raise GraphitiOperationalReadinessError(
+        "retained source version requires an explicit rights-packet change"
+    )
+
+
 def _source_requests(
     unit: CorpusIngestUnit,
     rights: Mapping[str, object],
@@ -611,7 +654,8 @@ def _source_requests(
         )
     contract = _accepted_source_contract(unit.source_id)
     packet_digest = str(rights.get("packet_digest") or "")
-    run_id = str(rights.get("rights_authority_run_id") or "")
+    run_id = str(rights.get("source_definition_rights_authority_run_id")
+                 or rights.get("rights_authority_run_id") or "")
     gate_id = str(rights.get("gate_id") or "")
     if not packet_digest or not run_id or not gate_id:
         raise GraphitiOperationalReadinessError(
@@ -936,6 +980,11 @@ def plan_operational_authority_bootstrap(
             raise GraphitiOperationalReadinessError(
                 f"{source_id} lacks current exact Graphiti dispatch rights"
             )
+        # Current dispatch rights stay current; only the immutable source anchor
+        # refers to the authenticated prior occurrence of the identical packet.
+        decision["source_definition_rights_authority_run_id"] = _source_definition_rights_run(
+            proving, authority, next(unit for unit in units if unit.source_id == source_id), decision
+        )
         rights_by_source.append((source_id, decision))
     rights_map = dict(rights_by_source)
     request_digests: list[dict[str, object]] = []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ from newsroom.control_plane.graphiti_operational_readiness import (
     _revision_predecessor_bindings,
     _source_contract_shape,
     _source_requests,
+    _source_definition_rights_run,
     bootstrap_operational_authority,
     build_and_reconcile_operational_generation,
     build_operational_campaign_input,
@@ -1244,4 +1246,43 @@ def test_operational_generation_identity_resumes_across_observation_times(
             configuration=configuration,
         )[0] != stable_id
     finally:
+        system.close()
+
+
+def test_same_rights_packet_new_poll_preserves_source_bootstrap(tmp_path: Path) -> None:
+    unit = _unit()
+    plan = _plan(unit)
+    system = _open_operational_test_system(tmp_path)
+    proving = sqlite3.connect(":memory:")
+    proving.execute("CREATE TABLE proving_rights_packets(run_id,gate_id,packet_digest,packet_json)")
+    proving.execute("INSERT INTO proving_rights_packets VALUES(?,?,?,?)", (
+        "rights-run-1", "RIGHTS_UK-01", _rights()["packet_digest"], json.dumps({"rights": "current"}),
+    ))
+    try:
+        first, _ = bootstrap_operational_authority(system, proof=_PROOF, plan=plan)
+        rights = {**_rights(), "rights_authority_run_id": "rights-run-2"}
+        with sqlite3.connect(tmp_path / "authority.sqlite3") as authority:
+            before = authority.execute("SELECT canonical_bytes FROM source_definition_versions").fetchall()
+            rights["source_definition_rights_authority_run_id"] = _source_definition_rights_run(
+                proving, authority, unit, rights
+            )
+        refreshed = replace(plan, rights_by_source=((unit.source_id, rights),))
+        second, _ = bootstrap_operational_authority(system, proof=_PROOF, plan=refreshed)
+        assert second.bound_units[0].ingest_id == first.bound_units[0].ingest_id
+        access = next(record for record in second.bound_units[0].authority.records
+                      if record["record_type"] == "OBJECT_ACCESS_DECISION")
+        assert access["rights_authority_run_id"] == "rights-run-2"
+        with sqlite3.connect(tmp_path / "authority.sqlite3") as authority:
+            assert authority.execute("SELECT canonical_bytes FROM source_definition_versions").fetchall() == before
+            # Same digest label with changed bytes is not an anchor.
+            proving.execute("UPDATE proving_rights_packets SET packet_json='{}'")
+            with pytest.raises(GraphitiOperationalReadinessError, match="packet is invalid"):
+                _source_definition_rights_run(proving, authority, unit, rights)
+            # A changed packet requires a real version transition, not a replay.
+            with pytest.raises(GraphitiOperationalReadinessError, match="explicit rights-packet change"):
+                _source_definition_rights_run(proving, authority, unit, {
+                    **rights, "packet_digest": digest_canonical({"rights": "changed"}),
+                })
+    finally:
+        proving.close()
         system.close()
