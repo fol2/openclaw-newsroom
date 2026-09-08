@@ -739,8 +739,10 @@ def test_existing_pipeline_rejects_a_malformed_complete_marker_without_effect() 
     assert guard.calls == ["begin", "completed"]
 
 
+@pytest.mark.parametrize("malformed_batch", (False, True))
 def test_real_factory_uses_graphiti_types_and_bulk_persistence(
     monkeypatch: pytest.MonkeyPatch,
+    malformed_batch: bool,
 ) -> None:
     guard = _Guard()
     calls: list[str] = []
@@ -752,6 +754,7 @@ def test_real_factory_uses_graphiti_types_and_bulk_persistence(
 
     class RuntimeObject:
         def __init__(self, **values: Any) -> None:
+            self.name_embedding = None
             vars(self).update(values)
 
         @classmethod
@@ -778,10 +781,19 @@ def test_real_factory_uses_graphiti_types_and_bulk_persistence(
     )
     monkeypatch.setattr(real, "_load_graphiti", lambda: runtime)
 
+    class Embedder:
+        async def create_batch(self, names: list[str]) -> list[list[float]]:
+            calls.append("node-embed")
+            embeddings = [[float(index)] for index, _name in enumerate(names)]
+            return embeddings[:-1] if malformed_batch else embeddings
+
+        def receipt(self) -> dict[str, object]:
+            return {"usage_basis": "TEST"}
+
     class Graphiti:
         clients = SimpleNamespace(
             llm_client=SimpleNamespace(invocations=[]),
-            embedder=SimpleNamespace(receipt=lambda: {"usage_basis": "TEST"}),
+            embedder=Embedder(),
         )
 
         async def _process_episode_data(self, *args: Any) -> None:
@@ -834,14 +846,29 @@ def test_real_factory_uses_graphiti_types_and_bulk_persistence(
             "relation_proposals": [{}],
         },
     }
+    if malformed_batch:
+        with pytest.raises(CombinedTemporalPipelineError) as caught:
+            pipeline.execute(
+                nodes=proposal_nodes,
+                edges=(proposal_edge,),
+                receipt=receipt,
+            )
+        assert isinstance(
+            caught.value.__cause__, real.GraphitiAdapterContractError
+        )
+        assert calls == ["retrieve", "pointers", "embed", "node-embed"]
+        assert guard.calls[-1] == "rollback"
+        return
+
     result = pipeline.execute(
         nodes=proposal_nodes,
         edges=(proposal_edge,),
         receipt=receipt,
     )
 
-    assert calls == ["retrieve", "pointers", "embed", "persist"]
+    assert calls == ["retrieve", "pointers", "embed", "node-embed", "persist"]
     assert isinstance(result.nodes[0], RuntimeObject)
+    assert [node.name_embedding for node in result.nodes] == [[0.0], [1.0]]
     assert isinstance(result.edges[0], RuntimeObject)
     assert result.edges[0].fact_embedding == [0.5]
 

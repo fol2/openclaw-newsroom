@@ -1498,6 +1498,7 @@ def test_step22_consumed_13683_unmarked_zero_after_embeddings_survives_full_path
 
     class EntityNode:
         def __init__(self, **values: object) -> None:
+            self.name_embedding = None
             self.__dict__.update(values)
 
         @classmethod
@@ -1591,10 +1592,14 @@ def test_step22_consumed_13683_unmarked_zero_after_embeddings_survives_full_path
             )
 
         async def _create(self, input=None, model=None, **_k: object) -> object:
-            del input, model
+            del model
+            count = len(input) if isinstance(input, list) else 1
             return SimpleNamespace(
                 id="emb-1",
-                data=[SimpleNamespace(embedding=[0.0, 1.0])],
+                data=[
+                    SimpleNamespace(embedding=[0.0, 1.0])
+                    for _index in range(count)
+                ],
                 usage={
                     "prompt_tokens": 2,
                     "total_tokens": 2,

@@ -870,6 +870,65 @@ def test_durable_guard_marker_restores_original_provider_metering() -> None:
     assert telemetry.chat_invocations == [{"provider": "cursor-agent-cli"}]
 
 
+def test_missing_node_names_use_one_ordered_normalised_batch() -> None:
+    import newsroom.graphiti_adapter.real as real
+
+    supplied: list[list[str]] = []
+    nodes = [
+        SimpleNamespace(name=f"node\n{index}", name_embedding=None)
+        for index in range(7)
+    ]
+
+    class Embedder:
+        async def create_batch(self, names: list[str]) -> list[list[float]]:
+            supplied.append(names)
+            return [[float(index)] for index, _name in enumerate(names)]
+
+    asyncio.run(real._batch_missing_node_name_embeddings(Embedder(), nodes))
+
+    assert supplied == [[f"node {index}" for index in range(7)]]
+    assert [node.name_embedding for node in nodes] == [
+        [float(index)] for index in range(7)
+    ]
+
+
+@pytest.mark.parametrize(
+    "nodes",
+    ([], [SimpleNamespace(name="kept", name_embedding=[1.0])]),
+)
+def test_node_name_batch_skips_empty_and_already_embedded_nodes(
+    nodes: list[object],
+) -> None:
+    import newsroom.graphiti_adapter.real as real
+
+    class Embedder:
+        async def create_batch(self, _values: list[str]) -> list[list[float]]:
+            pytest.fail("node embedding provider was called")
+
+    asyncio.run(real._batch_missing_node_name_embeddings(Embedder(), nodes))
+
+
+def test_malformed_node_name_batch_fails_before_partial_assignment() -> None:
+    import newsroom.graphiti_adapter.real as real
+
+    nodes = [
+        SimpleNamespace(name="first", name_embedding=None),
+        SimpleNamespace(name="second", name_embedding=None),
+    ]
+
+    class Embedder:
+        async def create_batch(self, _values: list[str]) -> list[list[float]]:
+            return [[1.0]]
+
+    with pytest.raises(
+        real.GraphitiAdapterContractError,
+        match="batch cardinality differs",
+    ):
+        asyncio.run(real._batch_missing_node_name_embeddings(Embedder(), nodes))
+
+    assert [node.name_embedding for node in nodes] == [None, None]
+
+
 def test_episode_uses_default_database_and_validates_before_complete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
