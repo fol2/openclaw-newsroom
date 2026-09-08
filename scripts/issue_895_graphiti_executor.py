@@ -12,6 +12,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TextIO
@@ -30,8 +31,10 @@ OWNER_USER_ID = 105634418
 ISSUE_URL_MARK = "/repos/fol2/newsroom/issues/895"
 PROGRAMME_LOCK_NAME = ".issue-895-f4-programme.lock"
 PROGRAMME_LOCK_IDENTITY = "newsroom.issue-895-standing-f4-programme-lock.v1\n"
-PROGRAMME_MAX_EVENTS = 218
-PROGRAMME_MAX_SPEND = 109_000_000
+# Owner instruction on 8 September 2026 waives cumulative programme ceilings.
+# Keep invocation accounting and finite packet caps; no event retries are enabled.
+PROGRAMME_MAX_EVENTS: int | None = None
+PROGRAMME_MAX_SPEND: int | None = None
 CLASSIFIED_PRIOR_STARTS = 9
 CLASSIFIED_PRIOR_RESERVED = 4_000_000
 SPENT_PACKET_DIGESTS = frozenset(
@@ -114,24 +117,29 @@ def default_code_identity() -> tuple[str, str]:
 
 
 def default_list_comments() -> list[Mapping[str, object]]:
-    try:
-        raw = subprocess.run(
-            (
-                "gh",
-                "api",
-                "--paginate",
-                "repos/fol2/newsroom/issues/895/comments?per_page=100",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        values = json.loads(raw)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        raise GraphitiCampaignStop("authority view is incomplete") from exc
-    if not isinstance(values, list):
-        stop("authority view is incomplete")
-    return values
+    # Retry only a failed metadata read, never a campaign event or a parsed stop.
+    for attempt in range(2):
+        try:
+            raw = subprocess.run(
+                (
+                    "gh", "api", "--paginate", "--slurp",
+                    "repos/fol2/newsroom/issues/895/comments?per_page=100",
+                ),
+                check=True, capture_output=True, text=True, timeout=30,
+            ).stdout
+            pages = json.loads(raw)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            if attempt == 0:
+                time.sleep(0.25)
+                continue
+            # Exception class is useful without exposing command output or credentials.
+            raise GraphitiCampaignStop(
+                f"authority view is incomplete: {type(exc).__name__} after 2 reads"
+            ) from exc
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            stop("authority view is incomplete: malformed comment pages")
+        return [comment for page in pages for comment in page]
+    raise AssertionError("metadata read loop exhausted")
 
 
 def _write_exclusive(path: Path, payload: object, *, mode: int = 0o400) -> None:
@@ -467,9 +475,9 @@ def verify_consumption(
         raise
     except Exception as exc:
         raise GraphitiCampaignStop("authority view is incomplete") from exc
-    if prior_starts + len(events) > PROGRAMME_MAX_EVENTS:
+    if PROGRAMME_MAX_EVENTS is not None and prior_starts + len(events) > PROGRAMME_MAX_EVENTS:
         stop("cumulative event allowance exhausted")
-    if prior_reserved + spend_cap > PROGRAMME_MAX_SPEND:
+    if PROGRAMME_MAX_SPEND is not None and prior_reserved + spend_cap > PROGRAMME_MAX_SPEND:
         stop("cumulative spend allowance exhausted")
     marker = invocation_marker_path(evidence_root, packet_digest)
     output = campaign_output_dir(evidence_root, packet_digest)

@@ -471,6 +471,8 @@ def test_c_identity_consumption_and_lock_refusals(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr(executor, "PROGRAMME_MAX_EVENTS", 218)
+    monkeypatch.setattr(executor, "PROGRAMME_MAX_SPEND", 109_000_000)
     packet = _ready_packet(tmp_path / "stores", monkeypatch)
     packet_path = _write_packet(tmp_path / "packet", packet)
     evidence = tmp_path / "evidence"
@@ -943,3 +945,79 @@ def test_restriction_release_refuses_inexact_authority(mutation):
     release['body'] = json.dumps(body)
     with pytest.raises(executor.GraphitiCampaignStop):
         executor.verify_standing_grant(CommentView([_grant(), restriction, release]))
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.TimeoutExpired("gh", 30),
+    subprocess.CalledProcessError(1, "gh", stderr="SECRET"),
+    OSError("SECRET"),
+    json.JSONDecodeError("invalid", "", 0),
+])
+def test_comment_read_recovers_once_without_provider_retry(monkeypatch, failure):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise failure
+        return subprocess.CompletedProcess(args, 0, json.dumps([[_grant()], []]))
+
+    monkeypatch.setattr(executor.subprocess, "run", run)
+    monkeypatch.setattr(executor.time, "sleep", lambda _: None)
+    executor.verify_standing_grant(executor.default_list_comments)
+    assert len(calls) == 2
+    assert all(call[1]["timeout"] == 30 for call in calls)
+    assert "--slurp" in calls[0][0][0]
+
+
+def test_comment_read_failure_is_bounded_and_redacted(monkeypatch):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(1)
+        raise subprocess.CalledProcessError(1, "gh", stderr="SECRET")
+
+    monkeypatch.setattr(executor.subprocess, "run", run)
+    monkeypatch.setattr(executor.time, "sleep", lambda _: None)
+    with pytest.raises(executor.GraphitiCampaignStop) as caught:
+        executor.default_list_comments()
+    assert len(calls) == 2
+    assert "CalledProcessError after 2 reads" in str(caught.value)
+    assert "SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize("pages", [{}, [{}], [[_grant()], [_owner_comment("NEWSROOM_SIGNED_STOP")]]])
+def test_parsed_invalid_or_stop_view_never_retried(monkeypatch, pages):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess(args, 0, json.dumps(pages))
+
+    monkeypatch.setattr(executor.subprocess, "run", run)
+    with pytest.raises(executor.GraphitiCampaignStop):
+        executor.verify_standing_grant(executor.default_list_comments)
+    assert len(calls) == 1
+
+
+def test_owner_waiver_preserves_consumption_and_invocation_exclusion(tmp_path, monkeypatch):
+    packet = _ready_packet(tmp_path / "stores", monkeypatch)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    digest = str(packet["packet_digest"])
+    calls = []
+
+    def prior():
+        calls.append(1)
+        return 1_000_000, 10**15
+
+    args = dict(campaign=packet["bounded_campaign"], packet_digest=digest,
+                evidence_root=evidence, prior_consumption=prior,
+                attempted_ids=(), spent_digests=())
+    executor.verify_consumption(**args)
+    marker = executor.invocation_marker_path(evidence, digest)
+    marker.write_text("{}")
+    with pytest.raises(executor.GraphitiCampaignStop, match="invocation marker exists"):
+        executor.verify_consumption(**args)
+    assert len(calls) == 2
+    assert marker.read_text() == "{}"
