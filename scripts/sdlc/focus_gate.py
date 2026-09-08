@@ -80,7 +80,6 @@ _F4_PATTERNS = (
     "scripts/production_operational_admission.py",
     "newsroom/**/*credential*.py",
     "newsroom/**/*keychain*.py",
-    "newsroom/**/*publication*.py",
 )
 _SHARED_BREADTH_PATTERNS = (
     "pyproject.toml",
