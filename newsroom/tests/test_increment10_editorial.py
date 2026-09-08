@@ -602,6 +602,39 @@ def test_authenticated_policy_admits_and_reopens_native_story_version(
         )
         native = _native(system, evidence, registries)
         request = StoryVersionRequest(AggregateId.new(), 0, "story-1")
+
+        class ChangingRequest:
+            expected_aggregate_version = 0
+            idempotency_key = "changing-request"
+
+            def __init__(self):
+                self.first = AggregateId.new()
+                self.later = AggregateId.new()
+                self.calls = 0
+
+            @property
+            def story_id(self):
+                self.calls += 1
+                return self.first if self.calls == 1 else self.later
+
+        changing = ChangingRequest()
+        with pytest.raises(EditorialError, match="immutable Story Version request"):
+            native.admit_story_version(
+                changing,
+                package_admission_id=retained.package_admission_id,
+                decision_reference=decision_reference,
+                candidate_port=candidate_port,
+                proof=proof(),
+            )
+        assert changing.calls == 0
+        with pytest.raises(EditorialError, match="differ from Candidate"):
+            native.admit_story_version(
+                StoryVersionRequest(AggregateId.parse(version.candidate_id), 0, "alias"),
+                package_admission_id=retained.package_admission_id,
+                decision_reference=decision_reference,
+                candidate_port=candidate_port,
+                proof=proof(),
+            )
         receipt, story = native.admit_story_version(
             request,
             package_admission_id=retained.package_admission_id,
