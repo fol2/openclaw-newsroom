@@ -58,9 +58,10 @@ def _digest(value: object, field: str) -> str:
     return text
 
 
-def _epoch_seconds(value: object) -> None:
+def _epoch_seconds(value: object) -> int:
     if type(value) is not int or not 0 <= value <= MAX_SAFE_INTEGER:
         raise EvidenceIntakeError("invalid received_epoch_seconds")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,15 +282,14 @@ class EvidenceIntakeIngress:
         _text(receipt_id, "receipt_id")
         try:
             self.__connection.execute("BEGIN IMMEDIATE")
-            acknowledgement = self._verified_acknowledgement(receipt_id=receipt_id)
-            self.__connection.rollback()
-            return acknowledgement
+            return self._verified_acknowledgement(receipt_id=receipt_id)
         except (sqlite3.Error, EvidenceIntakeError) as exc:
-            if self.__connection.in_transaction:
-                self.__connection.rollback()
             if isinstance(exc, EvidenceIntakeError):
                 raise
             raise EvidenceIntakeError("Evidence Intake receipt read failed") from exc
+        finally:
+            if self.__connection.in_transaction:
+                self.__connection.rollback()
 
     def close(self) -> None:
         if not self.__closed:
@@ -540,7 +540,7 @@ class EvidenceIntakeIngress:
                 replay is None
                 or tuple(replay[:2])
                 != (expected_handoff_id, acknowledgement.acknowledgement_id)
-                or replay[2] < acknowledgement.received_epoch_seconds
+                or _epoch_seconds(replay[2]) < acknowledgement.received_epoch_seconds
             ):
                 raise EvidenceIntakeError("retained replay request binding differs")
         return acknowledgement
@@ -688,7 +688,7 @@ def _verify(connection: sqlite3.Connection, boundary_id: str) -> None:
             if (
                 acknowledgement is None
                 or row[1] != acknowledgement.handoff_id
-                or row[3] < acknowledgement.received_epoch_seconds
+                or _epoch_seconds(row[3]) < acknowledgement.received_epoch_seconds
             ):
                 raise EvidenceIntakeError("retained intake attempt differs")
             primary_attempts.add((str(row[0]), str(row[2]), int(row[3])))

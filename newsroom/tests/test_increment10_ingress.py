@@ -437,3 +437,55 @@ def test_unexpected_acknowledgement_failure_rolls_back_handoff(
     assert reopened.receipt_count == reopened.attempt_count == 1
     reopened.close()
     candidate_connection.close()
+
+
+def test_unexpected_receipt_failure_releases_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from newsroom.increment10 import ingress as module
+
+    candidate_connection, port, version = _candidate(tmp_path)
+    database = tmp_path / "intake.sqlite3"
+    receiver = open_evidence_intake_ingress(database)
+    accepted = _receive(receiver, candidate_connection, port, version, request_id="first")
+    original_identity = module._identity
+
+    def interrupted_identity(prefix: str, value: object) -> str:
+        raise RuntimeError("interrupted receipt validation")
+
+    monkeypatch.setattr(module, "_identity", interrupted_identity)
+    with pytest.raises(RuntimeError, match="interrupted receipt"):
+        receiver.receipt(accepted.receipt_id)
+    monkeypatch.setattr(module, "_identity", original_identity)
+    other = sqlite3.connect(database, timeout=0)
+    other.execute("BEGIN IMMEDIATE")
+    other.rollback()
+    other.close()
+    assert receiver.receipt(accepted.receipt_id) == accepted
+    assert _receive(
+        receiver, candidate_connection, port, version, request_id="next", at=2
+    ) == accepted
+    assert receiver.receipt_count == 1
+    assert receiver.attempt_count == 2
+    receiver.close()
+    candidate_connection.close()
+
+
+def test_retained_secondary_attempt_rejects_out_of_range_timestamp(tmp_path: Path) -> None:
+    candidate_connection, port, version = _candidate(tmp_path)
+    database = tmp_path / "intake.sqlite3"
+    receiver = open_evidence_intake_ingress(database)
+    accepted = _receive(receiver, candidate_connection, port, version, request_id="first")
+    other = sqlite3.connect(database)
+    other.execute(
+        "INSERT INTO evidence_intake_attempts VALUES (?,?,?,?)",
+        ("corrupt", accepted.handoff_id, accepted.acknowledgement_id, 2**63 - 1),
+    )
+    other.commit()
+    other.close()
+    with pytest.raises(EvidenceIntakeError, match="received_epoch_seconds"):
+        _receive(receiver, candidate_connection, port, version, request_id="corrupt", at=2)
+    receiver.close()
+    with pytest.raises(EvidenceIntakeError, match="received_epoch_seconds"):
+        open_evidence_intake_ingress(database)
+    candidate_connection.close()
