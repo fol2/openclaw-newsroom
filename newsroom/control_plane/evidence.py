@@ -1175,104 +1175,7 @@ class EvidencePackage:
 
     @property
     def digest(self) -> str:
-        base_digest = digest_bytes(
-            canonical_json_bytes(
-                {
-                    "candidate_id": self.candidate_id,
-                    "hypothesis_id": self.hypothesis_id,
-                    "signal_ids": list(self.signal_ids),
-                    "lead_ids": list(self.lead_ids),
-                    "source_ids": list(self.source_ids),
-                    "observation_digests": list(self.observation_digests),
-                    "passages": list(self.passages),
-                    "substantive_new_information": list(
-                        self.substantive_new_information
-                    ),
-                    "governed_claims": [
-                        {
-                            "claim_id": item.claim_id,
-                            "claim": item.claim,
-                            "passage_index": item.passage_index,
-                            "supporting_excerpt": item.supporting_excerpt,
-                            "source_ids": list(item.source_ids),
-                            "source_record_ids": list(item.source_record_ids),
-                            "source_authority_decision_ids": list(
-                                item.source_authority_decision_ids
-                            ),
-                            "rights_decision_ids": list(item.rights_decision_ids),
-                            "dependency_evidence_ids": list(
-                                item.dependency_evidence_ids
-                            ),
-                            "evidential_origin_ids": list(item.evidential_origin_ids),
-                            "authority_class": item.authority_class.value,
-                            "authority_scope": item.authority_scope,
-                            "status": item.status.value,
-                            "attribution": item.attribution,
-                            "rendered_assertion_zh_hant_hk": (
-                                item.rendered_assertion_zh_hant_hk
-                            ),
-                            "claim_role": item.claim_role,
-                            "semantic_relation_evidence_id": (
-                                item.semantic_relation_evidence_id
-                            ),
-                            "localised_factual_expressions": [
-                                list(value)
-                                for value in item.localised_factual_expressions
-                            ],
-                            "named_entity_evidence": [
-                                list(value) for value in item.named_entity_evidence
-                            ],
-                            "named_entities": list(item.named_entities),
-                            "rendered_named_entities": list(
-                                item.rendered_named_entities
-                            ),
-                            "quotations": list(item.quotations),
-                            "certainty": item.certainty,
-                            "originality_basis": item.originality_basis,
-                            "originality_policy_version": (
-                                item.originality_policy_version
-                            ),
-                            "admitted_use": item.admitted_use,
-                            "policy_version": item.policy_version,
-                        }
-                        for item in self.governed_claims
-                    ],
-                    "qualification_evidence": [
-                        {
-                            "test": item.test.value,
-                            "governed_claim_id": item.governed_claim_id,
-                            "qualification_record_id": item.qualification_record_id,
-                            "test_evidence": [
-                                list(value) for value in item.test_evidence
-                            ],
-                            "policy_version": item.policy_version,
-                        }
-                        for item in self.qualification_evidence
-                    ],
-                    "selection_rationale": self.selection_rationale,
-                    "geography": list(self.geography),
-                    "categories": list(self.categories),
-                    "evidence_gate_results": [
-                        list(item) for item in self.evidence_gate_results
-                    ],
-                    "evidence_gate_evidence": [
-                        {
-                            "gate": item.gate,
-                            "result": item.result,
-                            "governed_claim_ids": list(item.governed_claim_ids),
-                            "policy_version": item.policy_version,
-                        }
-                        for item in self.evidence_gate_evidence
-                    ],
-                    "freshness_result": self.freshness_result,
-                    "integrity_result": self.integrity_result,
-                    "explicit_exclusions": list(self.explicit_exclusions),
-                    "resolved_evidence_records": [
-                        list(item) for item in self.resolved_evidence_records
-                    ],
-                }
-            )
-        )
+        base_digest = digest_bytes(canonical_json_bytes(evidence_package_value(self)))
         if self.admitted_context is None:
             return base_digest
         return digest_bytes(
@@ -1283,6 +1186,108 @@ class EvidencePackage:
                 }
             )
         )
+
+
+def evidence_package_value(package: EvidencePackage) -> dict[str, object]:
+    """Return the established canonical package value without store authority."""
+
+    if type(package) is not EvidencePackage:
+        raise TypeError("package must be exact EvidencePackage")
+    return {
+        "candidate_id": package.candidate_id,
+        "hypothesis_id": package.hypothesis_id,
+        "signal_ids": list(package.signal_ids),
+        "lead_ids": list(package.lead_ids),
+        "source_ids": list(package.source_ids),
+        "observation_digests": list(package.observation_digests),
+        "passages": list(package.passages),
+        "substantive_new_information": list(
+            package.substantive_new_information
+        ),
+        "governed_claims": [
+            {
+                "claim_id": item.claim_id,
+                "claim": item.claim,
+                "passage_index": item.passage_index,
+                "supporting_excerpt": item.supporting_excerpt,
+                "source_ids": list(item.source_ids),
+                "source_record_ids": list(item.source_record_ids),
+                "source_authority_decision_ids": list(
+                    item.source_authority_decision_ids
+                ),
+                "rights_decision_ids": list(item.rights_decision_ids),
+                "dependency_evidence_ids": list(
+                    item.dependency_evidence_ids
+                ),
+                "evidential_origin_ids": list(item.evidential_origin_ids),
+                "authority_class": item.authority_class.value,
+                "authority_scope": item.authority_scope,
+                "status": item.status.value,
+                "attribution": item.attribution,
+                "rendered_assertion_zh_hant_hk": (
+                    item.rendered_assertion_zh_hant_hk
+                ),
+                "claim_role": item.claim_role,
+                "semantic_relation_evidence_id": (
+                    item.semantic_relation_evidence_id
+                ),
+                "localised_factual_expressions": [
+                    list(value)
+                    for value in item.localised_factual_expressions
+                ],
+                "named_entity_evidence": [
+                    list(value) for value in item.named_entity_evidence
+                ],
+                "named_entities": list(item.named_entities),
+                "rendered_named_entities": list(
+                    item.rendered_named_entities
+                ),
+                "quotations": list(item.quotations),
+                "certainty": item.certainty,
+                "originality_basis": item.originality_basis,
+                "originality_policy_version": (
+                    item.originality_policy_version
+                ),
+                "admitted_use": item.admitted_use,
+                "policy_version": item.policy_version,
+            }
+            for item in package.governed_claims
+        ],
+        "qualification_evidence": [
+            {
+                "test": item.test.value,
+                "governed_claim_id": item.governed_claim_id,
+                "qualification_record_id": item.qualification_record_id,
+                "test_evidence": [
+                    list(value) for value in item.test_evidence
+                ],
+                "policy_version": item.policy_version,
+            }
+            for item in package.qualification_evidence
+        ],
+        "selection_rationale": package.selection_rationale,
+        "geography": list(package.geography),
+        "categories": list(package.categories),
+        "evidence_gate_results": [
+            list(item) for item in package.evidence_gate_results
+        ],
+        "evidence_gate_evidence": [
+            {
+                "gate": item.gate,
+                "result": item.result,
+                "governed_claim_ids": list(item.governed_claim_ids),
+                "policy_version": item.policy_version,
+            }
+            for item in package.evidence_gate_evidence
+        ],
+        "freshness_result": package.freshness_result,
+        "integrity_result": package.integrity_result,
+        "explicit_exclusions": list(package.explicit_exclusions),
+        "resolved_evidence_records": [
+            list(item) for item in package.resolved_evidence_records
+        ],
+    }
+
 
 
 def package_for(candidate: StoryCandidateRecord) -> EvidencePackage:
@@ -1628,29 +1633,9 @@ def retained_package_for(
         connection.close()
 
 
-def _resolve_governed_records(
-    connection: sqlite3.Connection,
-    candidate: StoryCandidateRecord,
-    base: EvidencePackage,
+def _expected_governed_record_types(
     package: EvidencePackage,
-) -> tuple[tuple[str, str], ...] | None:
-    def record_id_set(value: object) -> set[str] | None:
-        if not isinstance(value, list) or not all(
-            isinstance(item, str) for item in value
-        ):
-            return None
-        return set(value)
-
-    def has_exact_source_ids(
-        record_ids: tuple[str, ...], expected_source_ids: tuple[str, ...]
-    ) -> bool:
-        source_ids = tuple(
-            records[record_id].get("source_id") for record_id in record_ids
-        )
-        return all(isinstance(source_id, str) for source_id in source_ids) and set(
-            source_ids
-        ) == set(expected_source_ids)
-
+) -> dict[str, str] | None:
     expected_types: dict[str, str] = {}
     for claim in package.governed_claims:
         for record_type, record_ids in (
@@ -1683,13 +1668,50 @@ def _resolve_governed_records(
                 return None
     if not expected_types:
         return None
-    placeholders = ",".join("?" for _item in expected_types)
-    rows = connection.execute(
-        "SELECT record_id, record_type, record_json, record_digest "
-        f"FROM proving_write_evidence_records WHERE record_id IN ({placeholders})",
-        tuple(sorted(expected_types)),
-    ).fetchall()
-    if len(rows) != len(expected_types):
+    return expected_types
+
+
+def validate_governed_evidence_records(
+    *,
+    candidate_id: str,
+    source_inventory: tuple[tuple[str, str], ...],
+    base_package_digest: str,
+    package: EvidencePackage,
+    retained_records: Sequence[tuple[object, object, object, object]],
+) -> tuple[tuple[str, str], ...] | None:
+    """Validate canonical, independently governed records without store coupling."""
+
+    def record_id_set(value: object) -> set[str] | None:
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            return None
+        return set(value)
+
+    def has_exact_source_ids(
+        record_ids: tuple[str, ...], expected_source_ids: tuple[str, ...]
+    ) -> bool:
+        source_ids = tuple(
+            records[record_id].get("source_id") for record_id in record_ids
+        )
+        return all(isinstance(source_id, str) for source_id in source_ids) and set(
+            source_ids
+        ) == set(expected_source_ids)
+
+    expected_types = _expected_governed_record_types(package)
+    if expected_types is None:
+        return None
+    rows = tuple(
+        row
+        for row in retained_records
+        if len(row) == 4 and row[0] in expected_types
+    )
+    row_ids = tuple(row[0] for row in rows)
+    if (
+        len(rows) != len(expected_types)
+        or len(set(row_ids)) != len(row_ids)
+        or set(row_ids) != set(expected_types)
+    ):
         return None
     records: dict[str, dict[str, object]] = {}
     digests: list[tuple[str, str]] = []
@@ -1708,15 +1730,15 @@ def _resolve_governed_records(
             canonical_json_bytes(record).decode("utf-8") != record_raw
             or record.get("record_id") != record_id
             or record.get("record_type") != record_type
-            or record.get("candidate_id") != candidate.candidate_id
-            or record.get("base_package_digest") != base.digest
+            or record.get("candidate_id") != candidate_id
+            or record.get("base_package_digest") != base_package_digest
             or record.get("status") != "CURRENT"
             or set(record) != _RECORD_FIELDS_BY_TYPE.get(record_type)
         ):
             return None
         records[record_id] = record
         digests.append((record_id, record_digest))
-    source_urls = {(item.source_id, item.canonical_url) for item in candidate.items}
+    source_urls = set(source_inventory)
     required_source_record_string_fields = (
         "source_id",
         "canonical_url",
@@ -1733,15 +1755,15 @@ def _resolve_governed_records(
         "originating_artefact_digest",
     )
     for claim in package.governed_claims:
-        if claim.passage_index >= len(candidate.items):
+        if claim.passage_index >= len(source_inventory):
             return None
         source_records = [records[record_id] for record_id in claim.source_record_ids]
         if not has_exact_source_ids(claim.source_record_ids, claim.source_ids):
             return None
-        passage_item = candidate.items[claim.passage_index]
+        passage_source_id, passage_url = source_inventory[claim.passage_index]
         if not any(
-            record.get("source_id") == passage_item.source_id
-            and record.get("canonical_url") == passage_item.canonical_url
+            record.get("source_id") == passage_source_id
+            and record.get("canonical_url") == passage_url
             for record in source_records
         ):
             return None
@@ -1842,8 +1864,8 @@ def _resolve_governed_records(
             rendered_text = claim.rendered_named_entities[index]
             record = records[record_id]
             if record != {
-                "base_package_digest": base.digest,
-                "candidate_id": candidate.candidate_id,
+                "base_package_digest": base_package_digest,
+                "candidate_id": candidate_id,
                 "canonical_entity_id": digest_bytes(f"{entity_type}:{text}".encode()),
                 "entity_type": entity_type,
                 "evidence_span_digest": digest_bytes(text.encode("utf-8")),
@@ -1860,8 +1882,8 @@ def _resolve_governed_records(
                 return None
         semantic_record = records[claim.semantic_relation_evidence_id]
         if semantic_record != {
-            "base_package_digest": base.digest,
-            "candidate_id": candidate.candidate_id,
+            "base_package_digest": base_package_digest,
+            "candidate_id": candidate_id,
             "claim_digest": digest_bytes(claim.claim.encode("utf-8")),
             "governed_claim_id": claim.claim_id,
             "record_id": claim.semantic_relation_evidence_id,
@@ -1923,3 +1945,31 @@ def _resolve_governed_records(
         ):
             return None
     return tuple(sorted(digests))
+
+
+def _resolve_governed_records(
+    connection: sqlite3.Connection,
+    candidate: StoryCandidateRecord,
+    base: EvidencePackage,
+    package: EvidencePackage,
+) -> tuple[tuple[str, str], ...] | None:
+    expected_types = _expected_governed_record_types(package)
+    if expected_types is None:
+        return None
+    record_ids = tuple(sorted(expected_types))
+    placeholders = ",".join("?" for _ in record_ids)
+    rows = connection.execute(
+        "SELECT record_id, record_type, record_json, record_digest "
+        "FROM proving_write_evidence_records "
+        f"WHERE record_id IN ({placeholders})",
+        record_ids,
+    ).fetchall()
+    return validate_governed_evidence_records(
+        candidate_id=candidate.candidate_id,
+        source_inventory=tuple(
+            (item.source_id, item.canonical_url) for item in candidate.items
+        ),
+        base_package_digest=base.digest,
+        package=package,
+        retained_records=tuple(tuple(row) for row in rows),
+    )
