@@ -89,21 +89,27 @@ Inspect `telemetry()` and the retained exact-cohort reconciliation receipt.
 These public operations do not enter extraction or source intake. Legacy
 per-proposal rights/projection reconciliation is not the exact-cohort finaliser.
 
-### Corrected admission-authorisation configuration
+### Resume retained admission after a correction
 
-An `AUTHZ_SCOPE_MISSING` admission failure is not permission to widen extraction
-authority or retry a consumed event. After the exact configuration correction
-has focused evidence, the existing authenticated `ControlPlaneCommandService`
-exposes `recover_graphiti_admission_authorization()` for one exact first-failure
-dead letter. It binds the ingest, proposal key, expected request digest and
-remediation evidence digest. Only the Hermes principal may invoke it.
+After a deterministic admission correction has focused evidence, the existing
+authenticated `ControlPlaneCommandService.resume_graphiti_admission()` makes
+one exact dead letter eligible for the ordinary consumer again. Bind the ingest,
+proposal key, expected request digest, failed-attempt count, exact error and
+remediation evidence digest. Only the Hermes principal may invoke it. This is
+admission continuation, not permission to retry extraction or a consumed event.
 
 The command retains its recovery receipt in the existing reconciliation-command
 journal atomically with making that one item `READY`. It preserves the prior
 error and failed-attempt counter; it neither creates an admission decision nor
 changes the event, provider attempt or spend. A repeated identical command
-returns the retained receipt, not another recovery. Other failure classes,
-changed identities, existing effects and subsequent failures stay closed.
+returns the retained receipt, not another recovery. A stale failure fingerprint,
+changed remediation for the same failure, active claim, retained admission
+decision, projection, tombstone or receipt-integrity hold is rejected. A later
+failure requires its own exact fingerprint and evidenced correction; the old
+command cannot reactivate it. Mention/proposal commands already committed by a
+partial attempt replay their existing idempotency keys before the one decision.
+The first-failure `recover_graphiti_admission_authorization()` entry retains its
+original receipt identity and delegates to the same implementation.
 
 Continue with the exact admission-only operations above, using the corrected
 governed system and the existing rights, command and projection checks. Preserve

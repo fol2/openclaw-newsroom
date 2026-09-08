@@ -50,6 +50,10 @@ _GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_SCHEMA = (
 _GRAPHITI_ADMISSION_AUTHORIZATION_ERROR = (
     "AuthorizationDenied: authorization denied: AUTHZ_SCOPE_MISSING"
 )
+_GRAPHITI_ADMISSION_RESUME_COMMAND_TYPE = "RESUME_GRAPHITI_ADMISSION"
+_GRAPHITI_ADMISSION_RESUME_SCHEMA = (
+    "newsroom.control-plane.graphiti-admission-resume.v1"
+)
 
 
 class _VerifiedAuthentication(Protocol):
@@ -71,6 +75,8 @@ def _validate_graphiti_admission_recovery_receipt(
     command_digest: str,
     caller_principal: str,
     writer_principal: str,
+    command_type: str,
+    schema: str,
 ) -> dict[str, object]:
     try:
         receipt = json.loads(receipt_json)
@@ -83,12 +89,10 @@ def _validate_graphiti_admission_recovery_receipt(
             "retained Graphiti admission recovery receipt is invalid"
         ) from exc
     if (
-        receipt.get("schema")
-        != _GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_SCHEMA
+        receipt.get("schema") != schema
         or receipt.get("idempotency_key") != idempotency_key
         or receipt.get("command_digest") != command_digest
-        or receipt.get("command_type")
-        != _GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_COMMAND_TYPE
+        or receipt.get("command_type") != command_type
         or receipt.get("authenticated_principal") != caller_principal
         or receipt.get("writer_principal") != writer_principal
         or supplied_digest != digest_canonical(unsigned)
@@ -192,17 +196,109 @@ class ControlPlaneCommandService:
         remediation_evidence_digest: str,
         proof: AuthenticationProof,
     ) -> dict[str, object]:
-        """Return one exact first-attempt authorisation failure to READY."""
+        """Compatibility command for the original missing-scope failure."""
 
+        command_type = _GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_COMMAND_TYPE
+        return self._resume_graphiti_admission(
+            unpublished_store=unpublished_store,
+            ingest_id=ingest_id,
+            proposal_key=proposal_key,
+            expected_request_digest=expected_request_digest,
+            expected_attempt_count=1,
+            expected_error=_GRAPHITI_ADMISSION_AUTHORIZATION_ERROR,
+            remediation_evidence_digest=remediation_evidence_digest,
+            proof=proof,
+            command_type=command_type,
+            schema=_GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_SCHEMA,
+            idempotency_key=digest_canonical(
+                {"command_type": command_type, "proposal_key": proposal_key}
+            ),
+            command_digest=digest_canonical(
+                {
+                    "ingest_id": ingest_id,
+                    "proposal_key": proposal_key,
+                    "expected_request_digest": expected_request_digest,
+                    "remediation_evidence_digest": remediation_evidence_digest,
+                }
+            ),
+        )
+
+    def resume_graphiti_admission(
+        self,
+        *,
+        unpublished_store: str,
+        ingest_id: str,
+        proposal_key: str,
+        expected_request_digest: str,
+        expected_attempt_count: int,
+        expected_error: str,
+        remediation_evidence_digest: str,
+        proof: AuthenticationProof,
+    ) -> dict[str, object]:
+        """Resume one exact unclaimed dead-letter failure epoch."""
+
+        command_type = _GRAPHITI_ADMISSION_RESUME_COMMAND_TYPE
+        epoch = {
+            "proposal_key": proposal_key,
+            "request_digest": expected_request_digest,
+            "attempt_count": expected_attempt_count,
+            "error": expected_error,
+        }
+        return self._resume_graphiti_admission(
+            unpublished_store=unpublished_store,
+            ingest_id=ingest_id,
+            proposal_key=proposal_key,
+            expected_request_digest=expected_request_digest,
+            expected_attempt_count=expected_attempt_count,
+            expected_error=expected_error,
+            remediation_evidence_digest=remediation_evidence_digest,
+            proof=proof,
+            command_type=command_type,
+            schema=_GRAPHITI_ADMISSION_RESUME_SCHEMA,
+            idempotency_key=digest_canonical(
+                {"command_type": command_type, "failure_epoch": epoch}
+            ),
+            command_digest=digest_canonical(
+                {
+                    "ingest_id": ingest_id,
+                    "failure_epoch": epoch,
+                    "remediation_evidence_digest": remediation_evidence_digest,
+                }
+            ),
+        )
+
+    def _resume_graphiti_admission(
+        self,
+        *,
+        unpublished_store: str,
+        ingest_id: str,
+        proposal_key: str,
+        expected_request_digest: str,
+        expected_attempt_count: int,
+        expected_error: str,
+        remediation_evidence_digest: str,
+        proof: AuthenticationProof,
+        command_type: str,
+        schema: str,
+        idempotency_key: str,
+        command_digest: str,
+    ) -> dict[str, object]:
         now = self._clock()
         authentication = self._authenticator.authenticate(proof, now=now)
         authentication.require_current(now)
         if authentication.principal_id != HERMES_COMMAND_PRINCIPAL:
             raise PermissionError(
-                "Graphiti admission authorisation recovery requires the "
-                "Hermes principal"
+                "Graphiti admission recovery requires the Hermes principal"
             )
-        if not ingest_id or not proposal_key:
+        if (
+            not ingest_id
+            or not proposal_key
+            or isinstance(expected_attempt_count, bool)
+            or not isinstance(expected_attempt_count, int)
+            or expected_attempt_count < 1
+            or not isinstance(expected_error, str)
+            or not expected_error
+        ):
             raise GraphitiAdmissionConsumerError(
                 "Graphiti admission recovery identity is incomplete"
             )
@@ -216,19 +312,6 @@ class ControlPlaneCommandService:
             )
         except (TypeError, ValueError) as exc:
             raise GraphitiAdmissionConsumerError(str(exc)) from exc
-
-        command_type = _GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_COMMAND_TYPE
-        idempotency_key = digest_canonical(
-            {"command_type": command_type, "proposal_key": proposal_key}
-        )
-        command_digest = digest_canonical(
-            {
-                "ingest_id": ingest_id,
-                "proposal_key": proposal_key,
-                "expected_request_digest": expected_request_digest,
-                "remediation_evidence_digest": remediation_evidence_digest,
-            }
-        )
         recovered_at = now.to_text()
         store_path = (
             Path(assert_private_store(unpublished_store)).expanduser().resolve()
@@ -260,6 +343,8 @@ class ControlPlaneCommandService:
                     command_digest=command_digest,
                     caller_principal=authentication.principal_id,
                     writer_principal=self.principal,
+                    command_type=command_type,
+                    schema=schema,
                 )
                 connection.commit()
                 return receipt
@@ -275,7 +360,7 @@ class ControlPlaneCommandService:
                 JOIN unpublished_graphiti_receipts AS receipt USING(ingest_id)
                 WHERE queue.proposal_key=? AND queue.ingest_id=?
                   AND queue.request_digest=? AND queue.state='DEAD_LETTER'
-                  AND queue.attempt_count=1 AND queue.last_error=?
+                  AND queue.attempt_count=? AND queue.last_error=?
                   AND queue.claim_owner IS NULL AND queue.claim_until IS NULL
                   AND ingest.outcome='COMPLETE'
                   AND ingest.receipt_digest=queue.source_receipt_digest
@@ -294,7 +379,7 @@ class ControlPlaneCommandService:
                 """,
                 (
                     proposal_key, ingest_id, expected_request_digest,
-                    _GRAPHITI_ADMISSION_AUTHORIZATION_ERROR,
+                    expected_attempt_count, expected_error,
                 ),
             ).fetchone()
             if row is None:
@@ -347,7 +432,7 @@ class ControlPlaneCommandService:
                 )
 
             receipt: dict[str, object] = {
-                "schema": _GRAPHITI_ADMISSION_AUTHORIZATION_RECOVERY_SCHEMA,
+                "schema": schema,
                 "idempotency_key": idempotency_key,
                 "command_digest": command_digest,
                 "command_type": command_type,
@@ -361,8 +446,8 @@ class ControlPlaneCommandService:
                 "remediation_evidence_digest": remediation_evidence_digest,
                 "prior_failure": {
                     "state": "DEAD_LETTER",
-                    "attempt_count": 1,
-                    "last_error": _GRAPHITI_ADMISSION_AUTHORIZATION_ERROR,
+                    "attempt_count": expected_attempt_count,
+                    "last_error": expected_error,
                     "claim_owner": None,
                     "claim_until": None,
                 },
@@ -373,9 +458,9 @@ class ControlPlaneCommandService:
             updated = connection.execute(
                 "UPDATE unpublished_graphiti_admission_queue "
                 "SET state='READY',updated_at=? WHERE proposal_key=? "
-                "AND state='DEAD_LETTER' AND attempt_count=1 AND last_error=? "
+                "AND state='DEAD_LETTER' AND attempt_count=? AND last_error=? "
                 "AND claim_owner IS NULL AND claim_until IS NULL",
-                (recovered_at, proposal_key, _GRAPHITI_ADMISSION_AUTHORIZATION_ERROR),
+                (recovered_at, proposal_key, expected_attempt_count, expected_error),
             )
             if updated.rowcount != 1:
                 raise GraphitiAdmissionConsumerError(

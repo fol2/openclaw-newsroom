@@ -45,7 +45,9 @@ def _service(*, principal: str = "newsroom.hermes") -> ControlPlaneCommandServic
     )
 
 
-def _failed_request(path: Path) -> tuple[str, str, str]:
+def _failed_request(
+    path: Path, *, attempt_count: int = 1, error: str = ERROR
+) -> tuple[str, str, str]:
     connection = connect(str(path))
     draft = _draft("entity.0001", ExtractionProposalKind.ENTITY_MENTION)
     receipt = _seed_receipt(connection, draft)
@@ -62,8 +64,8 @@ def _failed_request(path: Path) -> tuple[str, str, str]:
     ).fetchone()
     connection.execute(
         "UPDATE unpublished_graphiti_admission_queue "
-        "SET state='DEAD_LETTER',attempt_count=1,last_error=?",
-        (ERROR,),
+        "SET state='DEAD_LETTER',attempt_count=?,last_error=?",
+        (attempt_count, error),
     )
     connection.commit()
     connection.close()
@@ -84,6 +86,28 @@ def _recover(
         ingest_id=ingest_id,
         proposal_key=proposal_key,
         expected_request_digest=request_digest,
+        remediation_evidence_digest=remediation_digest,
+        proof=PROOF,
+    )
+
+
+def _resume(
+    path: Path,
+    ingest_id: str,
+    proposal_key: str,
+    request_digest: str,
+    *,
+    attempt_count: int,
+    error: str,
+    remediation_digest: str = REMEDIATION_DIGEST,
+) -> dict[str, object]:
+    return _service().resume_graphiti_admission(
+        unpublished_store=str(path),
+        ingest_id=ingest_id,
+        proposal_key=proposal_key,
+        expected_request_digest=request_digest,
+        expected_attempt_count=attempt_count,
+        expected_error=error,
         remediation_evidence_digest=remediation_digest,
         proof=PROOF,
     )
@@ -159,6 +183,118 @@ def test_exact_authorization_failure_recovers_once_and_replay_is_read_only(
             request_digest,
             remediation_digest=digest_canonical({"remediation": "different"}),
         )
+
+
+def test_resume_binds_second_failure_epoch_and_replay_is_read_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "resume.sqlite3"
+    error = (
+        "GraphitiAdmissionConsumerError: entity decision command differs "
+        "from the retained authority proposal"
+    )
+    ingest_id, proposal_key, request_digest = _failed_request(path)
+    _recover(path, ingest_id, proposal_key, request_digest)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE unpublished_graphiti_admission_queue "
+        "SET state='DEAD_LETTER',attempt_count=2,last_error=?",
+        (error,),
+    )
+    connection.commit()
+    connection.close()
+
+    receipt = _resume(
+        path,
+        ingest_id,
+        proposal_key,
+        request_digest,
+        attempt_count=2,
+        error=error,
+    )
+
+    connection = sqlite3.connect(path)
+    assert connection.execute(
+        "SELECT state,attempt_count,last_error FROM "
+        "unpublished_graphiti_admission_queue"
+    ).fetchone() == ("READY", 2, error)
+    assert receipt["schema"] == "newsroom.control-plane.graphiti-admission-resume.v1"
+    assert receipt["command_type"] == "RESUME_GRAPHITI_ADMISSION"
+    assert receipt["prior_failure"] == {
+        "state": "DEAD_LETTER",
+        "attempt_count": 2,
+        "last_error": error,
+        "claim_owner": None,
+        "claim_until": None,
+    }
+    assert connection.execute(
+        "SELECT COUNT(*) FROM unpublished_reconciliation_commands"
+    ).fetchone()[0] == 2
+    connection.execute(
+        "UPDATE unpublished_graphiti_admission_queue "
+        "SET state='DEAD_LETTER',attempt_count=3,last_error='later',updated_at='later'"
+    )
+    connection.commit()
+    connection.close()
+
+    assert _resume(
+        path,
+        ingest_id,
+        proposal_key,
+        request_digest,
+        attempt_count=2,
+        error=error,
+    ) == receipt
+    connection = sqlite3.connect(path)
+    assert connection.execute(
+        "SELECT state,attempt_count,last_error,updated_at FROM "
+        "unpublished_graphiti_admission_queue"
+    ).fetchone() == ("DEAD_LETTER", 3, "later", "later")
+    connection.close()
+
+    with pytest.raises(GraphitiAdmissionConsumerError, match="identity was reused"):
+        _resume(
+            path,
+            ingest_id,
+            proposal_key,
+            request_digest,
+            attempt_count=2,
+            error=error,
+            remediation_digest=digest_canonical({"remediation": "changed"}),
+        )
+
+
+@pytest.mark.parametrize("stale", ("attempt", "error", "request"))
+def test_resume_rejects_stale_failure_epoch(tmp_path: Path, stale: str) -> None:
+    path = tmp_path / f"stale-{stale}.sqlite3"
+    error = "GraphitiAdmissionConsumerError: fixed failure"
+    ingest_id, proposal_key, request_digest = _failed_request(
+        path, attempt_count=2, error=error
+    )
+
+    with pytest.raises(GraphitiAdmissionConsumerError):
+        _resume(
+            path,
+            ingest_id,
+            proposal_key,
+            (
+                digest_canonical({"request": "stale"})
+                if stale == "request"
+                else request_digest
+            ),
+            attempt_count=1 if stale == "attempt" else 2,
+            error="stale" if stale == "error" else error,
+        )
+
+    connection = sqlite3.connect(path)
+    assert connection.execute(
+        "SELECT state,attempt_count,last_error FROM "
+        "unpublished_graphiti_admission_queue"
+    ).fetchone() == ("DEAD_LETTER", 2, error)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM unpublished_reconciliation_commands"
+    ).fetchone()[0] == 0
+    connection.close()
 
 
 def test_recovery_requires_authenticated_hermes(tmp_path: Path) -> None:
@@ -273,7 +409,10 @@ def test_recovery_denies_any_non_exact_failure(
 
 def test_receipt_insert_failure_rolls_back_queue_recovery(tmp_path: Path) -> None:
     path = tmp_path / "rollback.sqlite3"
-    ingest_id, proposal_key, request_digest = _failed_request(path)
+    error = "GraphitiAdmissionConsumerError: fixed failure"
+    ingest_id, proposal_key, request_digest = _failed_request(
+        path, attempt_count=2, error=error
+    )
     connection = sqlite3.connect(path)
     connection.execute(
         "CREATE TRIGGER reject_recovery_receipt "
@@ -284,13 +423,20 @@ def test_receipt_insert_failure_rolls_back_queue_recovery(tmp_path: Path) -> Non
     connection.close()
 
     with pytest.raises(sqlite3.IntegrityError, match="fixture receipt failure"):
-        _recover(path, ingest_id, proposal_key, request_digest)
+        _resume(
+            path,
+            ingest_id,
+            proposal_key,
+            request_digest,
+            attempt_count=2,
+            error=error,
+        )
 
     connection = sqlite3.connect(path)
     assert connection.execute(
         "SELECT state,attempt_count,last_error "
         "FROM unpublished_graphiti_admission_queue"
-    ).fetchone() == ("DEAD_LETTER", 1, ERROR)
+    ).fetchone() == ("DEAD_LETTER", 2, error)
     assert connection.execute(
         "SELECT COUNT(*) FROM unpublished_reconciliation_commands"
     ).fetchone()[0] == 0

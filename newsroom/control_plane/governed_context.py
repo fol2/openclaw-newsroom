@@ -381,7 +381,7 @@ class GovernedContext:
                 and item.degraded == self.degraded
                 and item.currency_read_at == self.read_at
                 and item.admission_authority_version
-                == item.projection_authority_watermark
+                <= item.projection_authority_watermark
                 and 0
                 < item.projection_authority_watermark
                 <= self.contiguous_projection_watermark
@@ -841,6 +841,7 @@ class GovernedContextHydrator:
         ).fetchall())
         reconciliation_row = reconciliation_rows[0] if reconciliation_rows else None
         generation_id: str | None = None
+        exact_generation_receipts = False
         active_projection_snapshot: tuple[tuple[str, int, str], ...] = ()
         if telemetry.admitted_count or reconciliation_row is not None:
             if reconciliation_row is None:
@@ -865,6 +866,7 @@ class GovernedContextHydrator:
                             telemetry.contiguous_projection_watermark
                         ),
                     )
+                    exact_generation_receipts = True
                 else:
                     active_effect_ids = tuple(
                         str(row[0]) for row in active_projection_snapshot
@@ -1049,7 +1051,13 @@ class GovernedContextHydrator:
                     or request.proposal_key != decision.proposal_key
                     or projection.proposal_key != request.proposal_key
                     or projection.decision_id != decision.decision_id
-                    or projection.authority_watermark != decision.authority_ledger_seq
+                    or (
+                        projection.authority_watermark
+                        < decision.authority_ledger_seq
+                        if exact_generation_receipts
+                        else projection.authority_watermark
+                        != decision.authority_ledger_seq
+                    )
                     or projection.trust_scope != "ADMITTED"
                 ):
                     return self._hold(
@@ -1076,7 +1084,20 @@ class GovernedContextHydrator:
                     )
                 lineage = request.source_lineage
                 passage_metadata = {
-                    str(value["passage_id"]): EvidencePassageLineage.from_value(value)
+                    str(value["passage_id"]): EvidencePassageLineage.from_value(
+                        {
+                            field: value[field]
+                            for field in (
+                                "passage_id",
+                                "admission_id",
+                                "access_decision_id",
+                                "byte_offset",
+                                "byte_length",
+                                "blob_digest",
+                                "text_digest",
+                            )
+                        }
+                    )
                     for value in request.evidence_passages
                 }
                 passages_list: list[EvidencePassageLineage] = []
