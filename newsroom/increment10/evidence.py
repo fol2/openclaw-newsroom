@@ -224,7 +224,7 @@ class GovernedEvidencePackages:
         if type(candidate_port) is not StoryCandidateReadPort:
             raise EvidencePackageError("authenticated Candidate read port required")
         try:
-            version = candidate_port.require_retained_version_in_transaction(
+            version = candidate_port.require_retained_version(
                 acknowledgement.candidate_version_id
             )
         except Exception as exc:

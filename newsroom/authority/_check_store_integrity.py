@@ -385,6 +385,8 @@ class _CheckIntegrityMixin:
                 conn, str(occurrence["representation_id"])
             )
             error = _outcome_observed_item_error(
+                self,
+                conn,
                 outcome.request,
                 revision_item_id=str(revision["item_id"]),
                 representation_digest=str(

@@ -546,12 +546,14 @@ class _CandidateStore(_EventAuthorityStore):
             else StoryCandidateVersion.from_canonical_bytes(bytes(row[0]))
         )
 
-    def _producers(self, manifest, proof):
+    def _producers_from_refs(
+        self, hypothesis_version_id, relationship_assessment_digest, proof
+    ):
         snapshot = self._lineage.require_current_producers_in_transaction(
-            manifest.hypothesis_version_id, proof=proof
+            hypothesis_version_id, proof=proof
         )
         relationship = self._lineage.require_retained_relationship_in_transaction(
-            manifest.relationship_assessment_digest
+            relationship_assessment_digest
         )
         disposition_ids = tuple(
             sorted(
@@ -579,6 +581,36 @@ class _CandidateStore(_EventAuthorityStore):
             dispositions,
             tuple(zip(*discovery, strict=True)),
         )
+
+    def _producers(self, manifest, proof):
+        return self._producers_from_refs(
+            manifest.hypothesis_version_id,
+            manifest.relationship_assessment_digest,
+            proof,
+        )
+
+    def build_manifest(
+        self,
+        hypothesis_version_id: str,
+        relationship_assessment_digest: str,
+        collision: CurrentCollisionEligibilityDecision,
+        *,
+        proof: AuthenticationProof,
+    ):
+        if type(collision) is not CurrentCollisionEligibilityDecision:
+            raise CandidateContractError("Candidate collision decision differs")
+        if not self._connection.in_transaction:
+            with self._lock, self._transaction():
+                return self.build_manifest(
+                    hypothesis_version_id,
+                    relationship_assessment_digest,
+                    collision,
+                    proof=proof,
+                )
+        producers = self._producers_from_refs(
+            hypothesis_version_id, relationship_assessment_digest, proof
+        )
+        return self._manifest(producers, collision)
 
     @staticmethod
     def _manifest(producers, collision):
@@ -1064,6 +1096,8 @@ def _create_story_candidate_read_port(
     command_registry: CommandRegistry,
     payload_schemas: PayloadSchemaRegistry,
     clock: Callable[[], UtcTimestamp] = UtcTimestamp.now,
+    command_service_version: str = "increment6-candidate-v1",
+    bounded_version: Callable[[str], StoryCandidateVersion] | None = None,
 ) -> StoryCandidateReadPort:
     """Bind complete Candidate reads to one caller-owned transaction."""
 
@@ -1101,7 +1135,7 @@ def _create_story_candidate_read_port(
         verifier._lock = threading.RLock()
         verifier._command_registry = commands
         verifier._payload_schemas = schemas
-        verifier._command_service_version = "increment6-candidate-v1"
+        verifier._command_service_version = command_service_version
         verifier._lineage = lineage
         verifier._dispositions = ProposalDispositionStore(
             connection, retrieval_authority, authenticator
@@ -1109,7 +1143,9 @@ def _create_story_candidate_read_port(
         private = _StoryCandidateReadAuthority(
             _READ_AUTHORITY_TOKEN, connection, verifier
         )
-        port = _compose_story_candidate_read_port(private)
+        port = _compose_story_candidate_read_port(
+            private, bounded_version=bounded_version
+        )
         if type(port) is not StoryCandidateReadPort:
             raise CandidateContractError(
                 "Candidate read-port factory returned a forged port"

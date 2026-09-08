@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 from newsroom.authority import (
     AggregateId,
@@ -110,6 +111,7 @@ class SurfacePayload:
     withdrawal_status: Literal["ACTIVE"]
     content_language: str
     renderer_version: str
+    licence_attributions: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind not in _SURFACE_KINDS:
@@ -137,6 +139,16 @@ class SurfacePayload:
             or self.content_language != CONTENT_LANGUAGE
         ):
             raise PublicationError("surface publication fields differ")
+        if (type(self.licence_attributions) is not tuple
+            or any(type(item) is not tuple or len(item) != 3
+                   or any(type(value) is not str for value in item)
+                   for item in self.licence_attributions)
+            or self.licence_attributions != tuple(sorted(set(self.licence_attributions)))):
+            raise PublicationError("surface licence attributions differ")
+        for source_id, statement, url in self.licence_attributions:
+            _text(source_id, statement, url)
+            if source_id not in {item[0] for item in self.source_references} or urlsplit(url).scheme != "https":
+                raise PublicationError("surface licence source binding differs")
         if self.payload_id != digest_bytes(
             canonical_json_bytes(self.value(include_identity=False))
         ):
@@ -161,6 +173,8 @@ class SurfacePayload:
             "content_language": self.content_language,
             "renderer_version": self.renderer_version,
         }
+        if self.licence_attributions:
+            value["licence_attributions"] = [list(item) for item in self.licence_attributions]
         if include_identity:
             value["payload_id"] = self.payload_id
         return value
@@ -170,6 +184,8 @@ class SurfacePayload:
 
     @classmethod
     def create(cls, **values) -> SurfacePayload:
+        if not values.get("licence_attributions"):
+            values.pop("licence_attributions", None)
         identity = {"schema_identity": SURFACE_SCHEMA, **_surface_value(values)}
         return cls(payload_id=digest_bytes(canonical_json_bytes(identity)), **values)
 
@@ -429,6 +445,7 @@ class OfflinePublication:
         surface_admission_definition_digest: str,
         transaction_admission_definition_digest: str,
         command_definition_digest: str,
+        source_licence_policy: tuple[tuple[str, str, str], ...] = (),
     ) -> None:
         if not all(
             type(value) is expected
@@ -453,6 +470,14 @@ class OfflinePublication:
         )
         if target_capabilities != LAUNCH_CAPABILITIES:
             raise PublicationError("launch target capabilities differ")
+        if type(source_licence_policy) is not tuple or any(
+            type(item) is not tuple or len(item) != 3
+            or any(type(value) is not str or not value for value in item)
+            or urlsplit(item[2]).scheme != "https"
+            for item in source_licence_policy
+        ):
+            raise PublicationError("source licence policy differs")
+        self._source_licence_policy = source_licence_policy
         self._objects = objects
         self._commands = commands
         self._events = events
@@ -484,7 +509,7 @@ class OfflinePublication:
         surfaces: tuple[SurfacePayload, ...] = ()
         admissions: tuple[ObjectAdmissionId, ...] = ()
         if request.outcome == "AUTO_PUBLISH":
-            surfaces = _render(story, sources)
+            surfaces = _render(story, sources, self._source_licence_policy)
             admissions = tuple(
                 self._admit_surface(surface, proof=proof) for surface in surfaces
             )
@@ -577,7 +602,7 @@ class OfflinePublication:
         surfaces: tuple[SurfacePayload, ...] = ()
         admissions: tuple[ObjectAdmissionId, ...] = ()
         if transaction.bundle is not None:
-            surfaces = _render(story, sources)
+            surfaces = _render(story, sources, self._source_licence_policy)
             admissions = tuple(item[1] for item in transaction.bundle.surface_payloads)
             for surface, admission_id in zip(surfaces, admissions, strict=True):
                 material = self._objects.hydrate(
@@ -765,7 +790,8 @@ class OfflinePublication:
 
 
 def _render(
-    story: StoryVersion, sources: tuple[tuple[str, str], ...]
+    story: StoryVersion, sources: tuple[tuple[str, str], ...],
+    source_licence_policy: tuple[tuple[str, str, str], ...] = (),
 ) -> tuple[SurfacePayload, SurfacePayload]:
     prefix = "【未出版】"
     if not story.copy.title.startswith(prefix) or story.copy.title.count(prefix) != 1:
@@ -785,6 +811,15 @@ def _render(
         "content_language": CONTENT_LANGUAGE,
         "renderer_version": "newsroom.public-surface.v1",
     }
+    attributions = tuple(sorted({
+        (source_id, statement, licence_url)
+        for source_id, source_url in sources
+        for host, statement, licence_url in source_licence_policy
+        if urlsplit(source_url).scheme == "https" and urlsplit(source_url).netloc == host
+    }))
+    if attributions:
+        common["licence_attributions"] = attributions
+        common["renderer_version"] = "newsroom.private-licensed-surface.v1"
     article_links = tuple(
         (
             item.governed_claim_id,

@@ -398,6 +398,32 @@ class CurrentCollisionReceiptEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeCurrentCollisionReceiptEvidence:
+    """Receipts from the native Story Candidate authority reader."""
+
+    request_digest: str
+    execution_receipt_bytes: bytes
+    authority_receipt_bytes: bytes
+
+    def __post_init__(self) -> None:
+        _require_digest(self.request_digest, field="native_collision_request_digest")
+        for name in ("execution_receipt_bytes", "authority_receipt_bytes"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes) or not value:
+                raise CollisionEligibilityContractError(
+                    f"native collision {name} are required"
+                )
+
+    @property
+    def execution_receipt_digest(self) -> str:
+        return digest_bytes(self.execution_receipt_bytes)
+
+    @property
+    def authority_receipt_digest(self) -> str:
+        return digest_bytes(self.authority_receipt_bytes)
+
+
+@dataclass(frozen=True, slots=True)
 class TrustedCurrentCollisionAuthorityContext:
     """Trusted current authority position supplied by the enclosing boundary.
 
@@ -516,11 +542,14 @@ class TrustedCurrentCollisionAuthorityContext:
 class CurrentCollisionAuthoritySnapshot:
     """One live snapshot returned by the trusted authority provider."""
 
-    evidence: CurrentCollisionReceiptEvidence
+    evidence: CurrentCollisionReceiptEvidence | NativeCurrentCollisionReceiptEvidence
     trusted_context: TrustedCurrentCollisionAuthorityContext
 
     def __post_init__(self) -> None:
-        if not isinstance(self.evidence, CurrentCollisionReceiptEvidence):
+        if not isinstance(
+            self.evidence,
+            (CurrentCollisionReceiptEvidence, NativeCurrentCollisionReceiptEvidence),
+        ):
             raise CollisionEligibilityContractError(
                 "current authority snapshot evidence must be typed"
             )
@@ -1225,6 +1254,178 @@ def decide_current_collision_eligibility(
     )
 
 
+_NATIVE_EXECUTION_KEYS = {
+    "schema_version", "request_digest", "authority_receipt_digest",
+    "authorization_receipt_digest", "authorization_decision_id",
+    "port_registry_digest", "port_id", "generation_id",
+    "authority_watermark", "query_valid_time", "serving_time", "outcome",
+}
+_NATIVE_AUTHORITY_KEYS = {
+    "schema_version", "request_digest", "authority_scope_id",
+    "authority_profile_id", "adapter_config_digest", "generation_id",
+    "authority_watermark", "query_valid_time", "serving_time",
+    "collision_namespace", "collision_key_digest", "collision_state",
+    "candidate_id", "candidate_version_id", "candidate_version_digest",
+    "candidate_semantic_scope_digest", "subject_id", "subject_version_id",
+    "subject_version_digest", "outcome",
+}
+
+
+def _native_integrity_decision(
+    request: CurrentCollisionEligibilityRequest,
+    evidence: NativeCurrentCollisionReceiptEvidence,
+    context: TrustedCurrentCollisionAuthorityContext,
+) -> CurrentCollisionEligibilityDecision:
+    return CurrentCollisionEligibilityDecision(
+        request, context, CollisionEligibilityOutcome.INTEGRITY_BLOCKED,
+        CollisionEligibilityReason.AUTHORITY_RECEIPT_INVALID,
+        evidence.execution_receipt_digest, evidence.authority_receipt_digest,
+        None, None, None, None,
+    )
+
+
+def decide_native_current_collision_eligibility(
+    *,
+    request: CurrentCollisionEligibilityRequest,
+    evidence: NativeCurrentCollisionReceiptEvidence,
+    trusted_context: TrustedCurrentCollisionAuthorityContext,
+) -> CurrentCollisionEligibilityDecision:
+    """Validate one native live read without claiming the Increment 5 adapter."""
+
+    if not isinstance(request, CurrentCollisionEligibilityRequest):
+        raise TypeError("collision eligibility request must be typed")
+    if not isinstance(evidence, NativeCurrentCollisionReceiptEvidence):
+        raise TypeError("native collision evidence must be typed")
+    if not isinstance(trusted_context, TrustedCurrentCollisionAuthorityContext):
+        raise TypeError("trusted current authority context must be typed")
+    try:
+        execution = _decode_canonical_object(
+            evidence.execution_receipt_bytes, field="native_collision_execution"
+        )
+        authority = _decode_canonical_object(
+            evidence.authority_receipt_bytes, field="native_collision_authority"
+        )
+        _strict_keys(execution, required=_NATIVE_EXECUTION_KEYS,
+                     field="native_collision_execution")
+        _strict_keys(authority, required=_NATIVE_AUTHORITY_KEYS,
+                     field="native_collision_authority")
+        state = CollisionState(authority["collision_state"])
+        candidate = authority["candidate_id"]
+        candidate_position = (
+            authority["candidate_version_id"],
+            authority["candidate_version_digest"],
+            authority["candidate_semantic_scope_digest"],
+        )
+        if state is CollisionState.OCCUPIED:
+            _require_token(candidate, field="native_collision_candidate")
+            _require_token(candidate_position[0], field="native_collision_version")
+            _require_digest(candidate_position[1], field="native_collision_version")
+            _require_digest(candidate_position[2], field="native_collision_scope")
+        elif state is not CollisionState.UNOCCUPIED or candidate is not None or any(
+            candidate_position
+        ):
+            raise CollisionEligibilityContractError(
+                "native collision Candidate position is invalid"
+            )
+    except (CollisionEligibilityContractError, KeyError, TypeError, ValueError):
+        return _native_integrity_decision(request, evidence, trusted_context)
+
+    binding = request.binding
+    expected_authority = {
+        "schema_version": "newsroom.increment6.native-collision-authority.v1",
+        "request_digest": evidence.request_digest,
+        "authority_scope_id": trusted_context.authority_scope_id,
+        "authority_profile_id": trusted_context.authority_profile_id,
+        "adapter_config_digest": trusted_context.adapter_config_digest,
+        "generation_id": trusted_context.generation_id,
+        "authority_watermark": trusted_context.authority_watermark,
+        "query_valid_time": trusted_context.query_valid_time,
+        "serving_time": trusted_context.serving_time,
+        "collision_namespace": binding.collision_namespace,
+        "collision_key_digest": binding.collision_key_digest,
+        "collision_state": state.value,
+        "candidate_id": candidate,
+        "candidate_version_id": candidate_position[0],
+        "candidate_version_digest": candidate_position[1],
+        "candidate_semantic_scope_digest": candidate_position[2],
+        "subject_id": binding.subject_id,
+        "subject_version_id": binding.subject_version_id,
+        "subject_version_digest": binding.subject_version_digest,
+        "outcome": "COMPLETE",
+    }
+    expected_execution = {
+        "schema_version": "newsroom.increment6.native-collision-execution.v1",
+        "request_digest": evidence.request_digest,
+        "authority_receipt_digest": evidence.authority_receipt_digest,
+        "authorization_receipt_digest": trusted_context.authorization_receipt_digest,
+        "authorization_decision_id": trusted_context.authorization_decision_id,
+        "port_registry_digest": trusted_context.port_registry_digest,
+        "port_id": trusted_context.port_id,
+        "generation_id": trusted_context.generation_id,
+        "authority_watermark": trusted_context.authority_watermark,
+        "query_valid_time": trusted_context.query_valid_time,
+        "serving_time": trusted_context.serving_time,
+        "outcome": "COMPLETE",
+    }
+    if (
+        evidence.request_digest != request.named_request_digest
+        or authority != expected_authority
+        or execution != expected_execution
+    ):
+        return _native_integrity_decision(request, evidence, trusted_context)
+
+    if trusted_context.generation_id != binding.generation_id:
+        outcome, reason = (
+            CollisionEligibilityOutcome.BINDING_MISMATCH,
+            CollisionEligibilityReason.GENERATION_BINDING_DIFFERS,
+        )
+    elif trusted_context.authority_watermark != binding.authority_watermark:
+        outcome, reason = (
+            CollisionEligibilityOutcome.BINDING_MISMATCH,
+            CollisionEligibilityReason.WATERMARK_BINDING_DIFFERS,
+        )
+    elif (
+        trusted_context.query_valid_time != binding.query_valid_time
+        or trusted_context.serving_time != binding.serving_time
+    ):
+        outcome, reason = (
+            CollisionEligibilityOutcome.BINDING_MISMATCH,
+            CollisionEligibilityReason.TIME_BINDING_DIFFERS,
+        )
+    elif (
+        binding.operation is CandidateUseOperation.ADMIT_NEW_CANDIDATE
+        and state is CollisionState.UNOCCUPIED
+    ):
+        outcome, reason = (
+            CollisionEligibilityOutcome.ELIGIBLE,
+            CollisionEligibilityReason.CURRENT_SLOT_UNOCCUPIED,
+        )
+    elif (
+        binding.operation is CandidateUseOperation.USE_CURRENT_CANDIDATE
+        and state is CollisionState.OCCUPIED
+        and candidate == binding.expected_candidate_id
+    ):
+        outcome, reason = (
+            CollisionEligibilityOutcome.ELIGIBLE,
+            CollisionEligibilityReason.CURRENT_CANDIDATE_MATCH,
+        )
+    else:
+        outcome = CollisionEligibilityOutcome.COLLISION_CONFLICT
+        reason = (
+            CollisionEligibilityReason.SLOT_ALREADY_OCCUPIED
+            if binding.operation is CandidateUseOperation.ADMIT_NEW_CANDIDATE
+            else CollisionEligibilityReason.EXPECTED_CANDIDATE_ABSENT
+            if state is CollisionState.UNOCCUPIED
+            else CollisionEligibilityReason.CURRENT_CANDIDATE_DIFFERS
+        )
+    return CurrentCollisionEligibilityDecision(
+        request, trusted_context, outcome, reason,
+        evidence.execution_receipt_digest, evidence.authority_receipt_digest,
+        NamedAuthorityExecutionOutcome.COMPLETE,
+        trusted_context.authority_watermark, state, candidate,
+    )
+
+
 class CurrentCollisionEligibilityBlocked(RuntimeError):
     """The pre-effect seam rejected one exact Candidate-use operation."""
 
@@ -1273,11 +1474,16 @@ class CurrentCollisionEffectEnforcer:
             raise TypeError(
                 "current authority provider must return a typed snapshot"
             )
-        decision = decide_current_collision_eligibility(
-            request=request,
-            evidence=snapshot.evidence,
-            trusted_context=snapshot.trusted_context,
-        )
+        if isinstance(snapshot.evidence, NativeCurrentCollisionReceiptEvidence):
+            decision = decide_native_current_collision_eligibility(
+                request=request, evidence=snapshot.evidence,
+                trusted_context=snapshot.trusted_context,
+            )
+        else:
+            decision = decide_current_collision_eligibility(
+                request=request, evidence=snapshot.evidence,
+                trusted_context=snapshot.trusted_context,
+            )
         if not self._trusted_boundary.accepts(snapshot.trusted_context):
             return replace(
                 decision,
@@ -1332,7 +1538,9 @@ __all__ = [
     "CurrentCollisionEligibilityDecision",
     "CurrentCollisionEligibilityRequest",
     "CurrentCollisionReceiptEvidence",
+    "NativeCurrentCollisionReceiptEvidence",
     "TrustedCurrentCollisionAuthorityContext",
     "TrustedCurrentCollisionAuthorityBoundary",
     "decide_current_collision_eligibility",
+    "decide_native_current_collision_eligibility",
 ]

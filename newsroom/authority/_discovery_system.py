@@ -158,6 +158,7 @@ def open_governed_discovery_authority_system(
                 version_details=source_boundary.version_details,
                 item=source_boundary.item,
                 revision=source_boundary.revision,
+                representation=source_boundary.representation,
                 occurrences=source_boundary.occurrences,
             ),
             checks=GovernedChecks(

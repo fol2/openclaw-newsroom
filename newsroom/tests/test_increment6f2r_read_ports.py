@@ -56,6 +56,7 @@ def test_read_port_types_are_token_gated_and_expose_only_reads() -> None:
     assert candidate_names == {
         "require_current_head_in_transaction",
         "require_retained_candidate_in_transaction",
+        "require_retained_version",
         "require_retained_version_in_transaction",
         "verify_retained_integrity_in_transaction",
     }

@@ -54,6 +54,8 @@ class _CheckStoreCommitMixin(
                 replayed=False,
             )
             observed_error = _outcome_observed_item_error(
+                self,
+                self._connection,
                 outcome_record.request,
                 revision_item_id=str(revision["item_id"]),
                 representation_digest=str(

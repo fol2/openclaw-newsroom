@@ -1671,31 +1671,52 @@ CONT_DISABLED_CAPABILITIES = (
 )
 
 
-def _grok_writer_command(path: str, schema: str) -> tuple[str, ...]:
-    replacements = {"REQUEST": path, "SCHEMA": schema, "SYSTEM": CONT_WRITER_SYSTEM_INSTRUCTION}
+def _grok_json_command(
+    path: str, schema: str, system_instruction: str
+) -> tuple[str, ...]:
+    replacements = {
+        "REQUEST": path,
+        "SCHEMA": schema,
+        "SYSTEM": system_instruction,
+    }
     return (
         GROK_BIN,
         *(replacements.get(value, value) for value in _GROK_WRITER_SEMANTIC_FLAGS),
     )
 
 
-def run_grok_cli(prompt: str) -> WriterCliExecution:
+def _run_grok_json(
+    prompt: str,
+    *,
+    schema: dict[str, object],
+    system_instruction: str,
+    temporary_prefix: str,
+) -> WriterCliExecution:
     auth = _minimal_grok_auth_bytes()
     _prove_grok_hermetic_capabilities(auth)
-    schema = canonical_json_bytes(WRITER_SCHEMA).decode("utf-8")
-    with tempfile.TemporaryDirectory(prefix="newsroom-grok-writer-") as root:
+    schema_text = canonical_json_bytes(schema).decode("utf-8")
+    with tempfile.TemporaryDirectory(prefix=temporary_prefix) as root:
         workspace = _hermetic_workspace(root, binary=GROK_BIN)
         _install_minimal_grok_auth(workspace, auth)
         path = os.path.join(workspace.request, "prompt.txt")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(prompt)
         raw = _run(
-            _grok_writer_command(path, schema),
+            _grok_json_command(path, schema_text, system_instruction),
             timeout=300,
             cwd=workspace.cwd,
             environment=workspace.environment,
         )
         return _parse_grok_writer_output(raw)
+
+
+def run_grok_cli(prompt: str) -> WriterCliExecution:
+    return _run_grok_json(
+        prompt,
+        schema=WRITER_SCHEMA,
+        system_instruction=CONT_WRITER_SYSTEM_INSTRUCTION,
+        temporary_prefix="newsroom-grok-writer-",
+    )
 
 
 def run_cursor_agent_cli(prompt: str) -> WriterCliExecution:

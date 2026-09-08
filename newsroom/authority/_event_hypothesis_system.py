@@ -931,7 +931,7 @@ class _HypothesisStore:
                 "SELECT actor_identity_digest,recorded_at FROM event_hypotheses_v2 WHERE hypothesis_id=?",
                 (hypothesis_id,),
             ).fetchone()
-            if identity_row != (
+            if identity_row is None or tuple(identity_row) != (
                 versions[0].actor_identity_digest,
                 versions[0].recorded_at,
             ):

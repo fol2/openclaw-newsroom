@@ -59,9 +59,15 @@ class ProposalRoute(StrEnum):
     CORRECTION_CANDIDATE = "CORRECTION_CANDIDATE"
 
 
-class FixtureWorkerKind(StrEnum):
+class WorkerKind(StrEnum):
     FAKE = "FAKE"
     REPLAY = "REPLAY"
+    AUTONOMOUS_DETERMINISTIC = "AUTONOMOUS_DETERMINISTIC"
+
+
+# Retained import compatibility for the accepted fixture contracts.  New
+# production code names the complete enum truthfully as WorkerKind.
+FixtureWorkerKind = WorkerKind
 
 
 class CitationSourceKind(StrEnum):
@@ -326,7 +332,7 @@ class RetrievalContextBinding:
 class WorkerAttemptBinding:
     attempt_id: str
     attempt_digest: str
-    worker_kind: FixtureWorkerKind
+    worker_kind: WorkerKind
     worker_version: str
     input_digest: str
     work_item_version_digest: str
@@ -347,8 +353,8 @@ class WorkerAttemptBinding:
             },
             "worker_attempt_binding",
         )
-        worker_kind = _enum(FixtureWorkerKind, item["worker_kind"], "worker_kind")
-        assert isinstance(worker_kind, FixtureWorkerKind)
+        worker_kind = _enum(WorkerKind, item["worker_kind"], "worker_kind")
+        assert isinstance(worker_kind, WorkerKind)
         return cls(
             attempt_id=_token(item["attempt_id"], "attempt_id"),
             attempt_digest=_digest(item["attempt_digest"], "attempt_digest"),
@@ -1207,6 +1213,7 @@ __all__ = [
     "SupplementalAction",
     "TriageProposal",
     "WatchAction",
+    "WorkerKind",
     "WorkerAttemptBinding",
     "WorkItemBinding",
 ]

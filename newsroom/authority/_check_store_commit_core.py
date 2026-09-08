@@ -463,6 +463,9 @@ class _CheckStoreCommitCoreMixin:
                         item.item_digest,
                         str(
                             _observed_item_id(
+                                self,
+                                conn,
+                                request_id=str(request.request_id),
                                 definition_id=str(request.definition_id),
                                 item_key=item.item_key,
                             )

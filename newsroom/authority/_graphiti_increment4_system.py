@@ -27,6 +27,8 @@ from newsroom.sources.policy import (
 from newsroom.sources.types import SourceRegistryReadPolicy
 
 from ._capability import _CapabilityIssuer
+from ._check_store_support import _CHECK_RECORD_SPECS
+from ._discovery_store import _DISCOVERY_RECORD_SPECS, _DiscoveryAuthorityStore
 from ._editorial_relation_boundary import _EditorialRelationBoundary
 from ._editorial_relation_facade import GovernedEditorialRelations
 from ._entity_boundary import _EntityBoundary
@@ -51,7 +53,6 @@ from ._object_cas import _GovernedCAS
 from ._object_store import _GovernedObjectAuthorityStore
 from ._object_system import GovernedObjects, _ObjectBoundary
 from ._projection_system import _ProjectionBoundary
-from ._source_registry_store import _SourceRegistryAuthorityStore
 from ._source_registry_store_common import _SourceRegistryStoreSupport
 from ._source_registry_system import GovernedSources, _SourceRegistryBoundary
 from .object_policy import (
@@ -67,7 +68,7 @@ from .types import UtcTimestamp
 
 
 class _GraphitiIncrement4AuthorityStore(
-    _SourceRegistryAuthorityStore,
+    _DiscoveryAuthorityStore,
     _GraphitiAdapterAuthorityStore,
     _Increment4ProjectionAuthorityStore,
     _GovernedObjectAuthorityStore,
@@ -151,6 +152,16 @@ class _GraphitiIncrement4AuthorityStore(
         canonical_bytes: bytes,
         canonical_digest: str,
     ) -> sqlite3.Row:
+        if command_type in _CHECK_RECORD_SPECS or command_type in _DISCOVERY_RECORD_SPECS:
+            return _DiscoveryAuthorityStore._validate_record_envelope.__func__(
+                cls,
+                conn,
+                row,
+                command_type=command_type,
+                aggregate_id=aggregate_id,
+                canonical_bytes=canonical_bytes,
+                canonical_digest=canonical_digest,
+            )
         support = (
             _SourceRegistryStoreSupport
             if command_type in SOURCE_REGISTRY_COMMAND_TYPES
@@ -167,6 +178,7 @@ class _GraphitiIncrement4AuthorityStore(
 
 
 _SYSTEM_CONSTRUCTION_TOKEN = object()
+_AUTHORITY_COMPOSITION_TOKEN = object()
 
 
 class GovernedGraphitiIncrement4AuthoritySystem:
@@ -183,6 +195,7 @@ class GovernedGraphitiIncrement4AuthoritySystem:
         "__authority_store_path",
         "__graph_destination_id",
         "__close",
+        "__composition",
     )
 
     def __init__(
@@ -200,6 +213,7 @@ class GovernedGraphitiIncrement4AuthoritySystem:
         authority_store_path: Path,
         graph_destination_id: str,
         close: Callable[[], None],
+        composition: tuple[object, ...] = (),
         _construction_token: object,
     ) -> None:
         if _construction_token is not _SYSTEM_CONSTRUCTION_TOKEN:
@@ -220,6 +234,14 @@ class GovernedGraphitiIncrement4AuthoritySystem:
         )
         self.__graph_destination_id = graph_destination_id
         self.__close = close
+        self.__composition = composition
+
+    def _authority_composition(self, token: object) -> tuple[object, ...]:
+        """Return authority-private components for the cumulative Hermes opener."""
+
+        if token is not _AUTHORITY_COMPOSITION_TOKEN:
+            raise TypeError("authority composition access is private")
+        return self.__composition
 
     @property
     def graphiti(self) -> GovernedGraphitiProposalAdapter:
@@ -481,6 +503,7 @@ def _open_with_adapter(
                 version_details=source_boundary.version_details,
                 item=source_boundary.item,
                 revision=source_boundary.revision,
+                representation=source_boundary.representation,
                 occurrences=source_boundary.occurrences,
             ),
             graphiti=GovernedGraphitiProposalAdapter(
@@ -570,6 +593,7 @@ def _open_with_adapter(
             authority_store_path=path,
             graph_destination_id=graph_destination_id,
             close=close,
+            composition=(store, command_service, cas, issuer, merged_registry, merged_schemas),
             _construction_token=_SYSTEM_CONSTRUCTION_TOKEN,
         )
     except Exception:

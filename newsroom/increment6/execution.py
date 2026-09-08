@@ -27,7 +27,7 @@ from newsroom.increment6.outcomes import (
     ContractEffect,
     PrioritySelection,
 )
-from newsroom.increment6.proposals import FixtureWorkerKind, WorkerAttemptBinding
+from newsroom.increment6.proposals import WorkerAttemptBinding, WorkerKind
 from newsroom.increment6.scheduling import (
     CapacityAllocationDisposition,
     CapacityItemAllocation,
@@ -624,7 +624,7 @@ class WorkerAttempt:
     ordinal: int
     previous_attempt_id: str | None
     previous_attempt_digest: str | None
-    worker_kind: FixtureWorkerKind
+    worker_kind: WorkerKind
     worker_version: str
     input_digest: str
     idempotency_key: str
@@ -640,7 +640,7 @@ class WorkerAttempt:
         member: ExecutionBatchMember,
         ordinal: int,
         previous_attempt: WorkerAttempt | None = None,
-        worker_kind: FixtureWorkerKind,
+        worker_kind: WorkerKind,
         worker_version: str,
         input_digest: str,
     ) -> Self:
@@ -663,7 +663,7 @@ class WorkerAttempt:
         retrieval_context_digest = member.retrieval_context_digest
         priority_digest = member.priority_digest
         _integer(ordinal, "attempt ordinal")
-        if type(worker_kind) is not FixtureWorkerKind:
+        if type(worker_kind) is not WorkerKind:
             raise ExecutionContractError("worker kind must be typed")
         _token(worker_version, "worker version")
         _digest(input_digest, "attempt input digest")
@@ -730,7 +730,7 @@ class WorkerAttempt:
         _digest(self.input_digest, "attempt input digest")
         _digest(self.semantic_request_digest, "semantic request digest")
         _integer(self.ordinal, "attempt ordinal")
-        if type(self.worker_kind) is not FixtureWorkerKind:
+        if type(self.worker_kind) is not WorkerKind:
             raise ExecutionContractError("worker kind must be typed")
         _digest(self.priority_digest, "attempt priority digest")
         request_value = {
@@ -868,7 +868,7 @@ class WorkerAttempt:
             "Worker Attempt",
         )
         try:
-            worker_kind = FixtureWorkerKind(item["worker_kind"])
+            worker_kind = WorkerKind(item["worker_kind"])
             authority = ContractAuthority(item["authority"])
             effect = ContractEffect(item["effect"])
         except Exception as exc:

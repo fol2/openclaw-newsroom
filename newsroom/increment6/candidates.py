@@ -1657,14 +1657,24 @@ _READ_PORT_TOKEN = object()
 class StoryCandidateReadPort:
     """Narrow transaction-bound read seam for retained Candidate authority."""
 
-    __slots__ = ("__authority",)
+    __slots__ = ("__authority", "__bounded_version")
 
-    def __init__(self, token: object, authority: object) -> None:
+    def __init__(
+        self,
+        token: object,
+        authority: object,
+        bounded_version: Callable[[str], StoryCandidateVersion] | None = None,
+    ) -> None:
         if token is not _READ_PORT_TOKEN:
             raise CandidateContractError(
                 "Candidate read port construction is authority-private"
             )
         object.__setattr__(self, "_StoryCandidateReadPort__authority", authority)
+        if bounded_version is not None and not callable(bounded_version):
+            raise CandidateContractError("Candidate bounded reader differs")
+        object.__setattr__(
+            self, "_StoryCandidateReadPort__bounded_version", bounded_version
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("StoryCandidateReadPort is immutable")
@@ -1701,6 +1711,21 @@ class StoryCandidateReadPort:
             StoryCandidateVersion,
         )
 
+    def require_retained_version(self, version_id: str) -> StoryCandidateVersion:
+        if self.__bounded_version is None:
+            return self.require_retained_version_in_transaction(version_id)
+        message = "Candidate require_retained_version returned a forged result"
+        value = _normalise(lambda: self.__bounded_version(version_id), message)
+        _require(type(value) is StoryCandidateVersion, message)
+        return value
+
+    def _with_bounded_version(
+        self, reader: Callable[[str], StoryCandidateVersion]
+    ) -> StoryCandidateReadPort:
+        return StoryCandidateReadPort(
+            _READ_PORT_TOKEN, self.__authority, bounded_version=reader
+        )
+
     def require_current_head_in_transaction(
         self, candidate_id: str, *, proof: object
     ) -> StoryCandidateVersion:
@@ -1715,10 +1740,16 @@ class StoryCandidateReadPort:
         return value
 
 
-def _compose_story_candidate_read_port(authority: object) -> StoryCandidateReadPort:
+def _compose_story_candidate_read_port(
+    authority: object,
+    *,
+    bounded_version: Callable[[str], StoryCandidateVersion] | None = None,
+) -> StoryCandidateReadPort:
     """Private constructor used only by the checked Candidate authority."""
 
-    return StoryCandidateReadPort(_READ_PORT_TOKEN, authority)
+    return StoryCandidateReadPort(
+        _READ_PORT_TOKEN, authority, bounded_version=bounded_version
+    )
 
 
 class StoryCandidateAuthority:

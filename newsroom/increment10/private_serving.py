@@ -58,6 +58,7 @@ SERVING_RETENTION_SCOPE = "publication.audit"
 
 _KINDS = ("ARTICLE", "FEED_CARD")
 _TOKEN = object()
+_READ_PROOF_TOKEN = object()
 
 
 class PrivateServingError(ValueError):
@@ -397,6 +398,100 @@ class AcknowledgedServing:
             UtcTimestamp.parse(self.acknowledgement.first_private_effect_at).value,
         ):
             raise PrivateServingError("primary feed acknowledgement time differs")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PrivateServingReadProof:
+    """Opaque proof that retained authority acknowledged exact private rows."""
+
+    evidence_receipt: EvidenceReceipt
+    attempt_receipt: AttemptReceipt
+    serving: AcknowledgedServing
+
+    def __init__(
+        self,
+        token: object,
+        evidence_receipt: EvidenceReceipt,
+        attempt_receipt: AttemptReceipt,
+        serving: AcknowledgedServing,
+    ) -> None:
+        if token is not _READ_PROOF_TOKEN or not all(
+            type(value) is expected
+            for value, expected in (
+                (evidence_receipt, EvidenceReceipt),
+                (attempt_receipt, AttemptReceipt),
+                (serving, AcknowledgedServing),
+            )
+        ):
+            raise PrivateServingError("private-serving read proof is forged")
+        if (
+            evidence_receipt.evidence_aggregate_id
+            != _aggregate_for(attempt_receipt.batch_id)
+            or serving.acknowledgement.batch_id != attempt_receipt.batch_id
+            or tuple(row.operation_id for row in serving.rows)
+            != serving.acknowledgement.operation_ids
+            or any(
+                digest_bytes(row.payload_bytes) != row.payload_digest
+                for row in serving.rows
+            )
+        ):
+            raise PrivateServingError("private-serving read proof differs")
+        object.__setattr__(self, "evidence_receipt", evidence_receipt)
+        object.__setattr__(self, "attempt_receipt", attempt_receipt)
+        object.__setattr__(self, "serving", serving)
+
+
+class PrivateServingReadPort:
+    """ACK-only consumer over an existing query-only private projection."""
+
+    __slots__ = ("_connection", "_proof")
+
+    def __init__(
+        self,
+        token: object,
+        *,
+        connection: sqlite3.Connection,
+        proof: PrivateServingReadProof | None,
+    ) -> None:
+        if (
+            token is not _TOKEN
+            or type(connection) is not sqlite3.Connection
+            or (proof is not None and type(proof) is not PrivateServingReadProof)
+        ):
+            raise PrivateServingError("private-serving reader construction differs")
+        self._connection = connection
+        self._proof = proof
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def acknowledged_rows(self) -> AcknowledgedServing | None:
+        """Return only rows covered by the retained authoritative ACK proof."""
+
+        if self._proof is None:
+            return None
+        expected = self._proof.serving
+        rows = tuple(
+            self._query(row.operation_key)
+            for row in expected.rows
+        )
+        actual_rows = tuple(row for row in rows if row is not None)
+        if actual_rows != expected.rows:
+            raise PrivateServingError("acknowledged private payload differs")
+        return AcknowledgedServing(
+            expected.acknowledgement,
+            expected.primary_feed_published_at,
+            actual_rows,
+        )
+
+    def _query(self, operation_key: str) -> ProjectionRow | None:
+        row = self._connection.execute(
+            "SELECT operation_key,operation_id,attempt_id,surface_kind,payload_id,"
+            "payload_digest,payload_bytes,applied_at FROM private_serving_payloads "
+            "WHERE operation_key=?",
+            (operation_key,),
+        ).fetchone()
+        return None if row is None else ProjectionRow(*tuple(row))
 
 
 class PrivateServingDelivery:
@@ -785,6 +880,35 @@ class PrivateServingDelivery:
             tuple(rows),
         )
 
+    def acknowledged_read_proof(
+        self,
+        evidence_receipt: EvidenceReceipt,
+        attempt_receipt: AttemptReceipt,
+        *,
+        publication_receipt: PublicationReceipt,
+        story_receipt: StoryVersionReceipt,
+        candidate_port: StoryCandidateReadPort,
+        proof: AuthenticationProof,
+    ) -> PrivateServingReadProof | None:
+        """Narrow a verified retained ACK into a query-only consumer proof."""
+
+        serving = self.acknowledged_rows(
+            evidence_receipt,
+            attempt_receipt,
+            publication_receipt=publication_receipt,
+            story_receipt=story_receipt,
+            candidate_port=candidate_port,
+            proof=proof,
+        )
+        if serving is None:
+            return None
+        return PrivateServingReadProof(
+            _READ_PROOF_TOKEN,
+            evidence_receipt,
+            attempt_receipt,
+            serving,
+        )
+
     def _build_batch(self, receipt, transaction) -> AttemptBatch:
         if (
             transaction.bundle is None
@@ -1086,14 +1210,8 @@ def open_private_serving_delivery(
         path.chmod(0o600)
     connection.row_factory = sqlite3.Row
     try:
-        projection_identity = digest_bytes(
-            canonical_json_bytes(
-                {
-                    "path": str(path),
-                    "target_id": target_id,
-                    "target_context_digest": target_context_digest,
-                }
-            )
+        projection_identity = _projection_identity(
+            path, target_id, target_context_digest
         )
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
@@ -1173,6 +1291,74 @@ def open_private_serving_delivery(
     except Exception:
         connection.close()
         raise
+
+
+def open_private_serving_read_port(
+    path: str | Path,
+    *,
+    target_id: str,
+    target_context_digest: str,
+    proof: PrivateServingReadProof | None,
+) -> PrivateServingReadPort:
+    """Open an existing projection without acquiring any write authority."""
+
+    raw_path = str(path)
+    if raw_path == ":memory:" or raw_path.startswith("file:"):
+        raise PrivateServingError("private-serving reader requires a file target")
+    _texts(target_id)
+    _digests(target_context_digest)
+    target = Path(path).expanduser().resolve()
+    if not target.is_file():
+        raise PrivateServingError("private-serving target is missing")
+    connection = sqlite3.connect(
+        f"{target.as_uri()}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        metadata = connection.execute(
+            "SELECT schema_version,target_id,target_context_digest,"
+            "projection_identity_digest,store_path FROM private_serving_metadata "
+            "WHERE singleton=1"
+        ).fetchone()
+        if (
+            connection.execute("PRAGMA query_only").fetchone()[0] != 1
+            or tuple(metadata or ())
+            != (
+                "private-serving-projection-v1",
+                target_id,
+                target_context_digest,
+                _projection_identity(target, target_id, target_context_digest),
+                str(target),
+            )
+            or (
+                proof is not None
+                and proof.serving.acknowledgement.target_id != target_id
+            )
+        ):
+            raise PrivateServingError("private-serving reader binding differs")
+        return PrivateServingReadPort(
+            _TOKEN,
+            connection=connection,
+            proof=proof,
+        )
+    except Exception:
+        connection.close()
+        raise
+
+
+def _projection_identity(path: Path, target_id: str, context: str) -> str:
+    return digest_bytes(
+        canonical_json_bytes(
+            {
+                "path": str(path),
+                "target_id": target_id,
+                "target_context_digest": context,
+            }
+        )
+    )
 
 
 def _attempt(operation, *, adapter, context, projection):

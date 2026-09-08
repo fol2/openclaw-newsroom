@@ -57,6 +57,8 @@ _AGENDA_OPEN_TRANSITIONS = frozenset(
 )
 
 def _outcome_observed_item_error(
+    store: Any,
+    conn: sqlite3.Connection,
     outcome: CheckOutcomeRequest,
     *,
     revision_item_id: str,
@@ -69,6 +71,9 @@ def _outcome_observed_item_error(
     matches = []
     for observed in outcome.observed_items:
         expected_item_id = _observed_item_id(
+            store,
+            conn,
+            request_id=str(outcome.request_id),
             definition_id=str(outcome.definition_id),
             item_key=observed.item_key,
         )
@@ -85,8 +90,40 @@ def _outcome_observed_item_error(
     return None
 
 
-def _observed_item_id(*, definition_id: str, item_key: str) -> SourceItemId:
+def _observed_item_id(
+    store: Any,
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    definition_id: str,
+    item_key: str,
+) -> SourceItemId:
     """Derive the proposal-admission Source Item identity for one item key."""
+
+    request = conn.execute(
+        "SELECT trigger_kind FROM check_requests WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    if request is None:
+        raise AuthorityPersistenceError("Check Outcome Request is not retained")
+    if str(request["trigger_kind"]) == "DELIVERED_INPUT":
+        rows = conn.execute(
+            "SELECT * FROM source_items WHERE definition_id=? AND identity_digest=?",
+            (definition_id, item_key),
+        ).fetchall()
+        if len(rows) != 1:
+            raise AuthorityPersistenceError(
+                "delivered Check item is not one exact retained Source Item"
+            )
+        retained = store._source_item_from_row(conn, rows[0], replayed=False)
+        if (
+            str(retained.request.definition_id) != definition_id
+            or retained.request.identity_digest != item_key
+        ):
+            raise AuthorityPersistenceError(
+                "delivered Check item differs from retained Source Item"
+            )
+        return retained.request.item_id
 
     return deterministic_uuid4(
         SourceItemId,
