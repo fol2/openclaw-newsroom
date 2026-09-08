@@ -43,6 +43,7 @@ from newsroom.control_plane.graphiti_admission import (
 from newsroom.control_plane.graphiti_events import GraphitiProcessResult
 from newsroom.control_plane.graphiti_steady_state import (
     GraphitiCampaignRuntime,
+    PRE_FRONTIER_BACKLOG_HOLD_REASON,
     _exact_admission_reconciliation,
     _mint_graphiti_campaign_runtime,
     graphiti_graph_destination_identity,
@@ -694,6 +695,7 @@ def _campaign_operational_partition_snapshot(
     authority_store: str,
     observed_at: datetime,
     unpublished_connection: sqlite3.Connection | None = None,
+    pre_frontier_hold_watermark: int | None = None,
 ) -> dict[str, object]:
     """Read the shared exact operational partition without selecting work."""
 
@@ -720,6 +722,7 @@ def _campaign_operational_partition_snapshot(
             unpublished_connection,
             authority=connections[1],
             observed_at=observed_at,
+            pre_frontier_hold_watermark=pre_frontier_hold_watermark,
         )
     finally:
         for connection in reversed(owned):
@@ -2017,12 +2020,23 @@ def run_bounded_campaign(
         if operational_before is None:
             raise GraphitiCampaignStop("campaign initial partition is missing")
         completed_at = clock()
+        # Retain the selected policy through completion, not a broader legacy
+        # backlog that reappears merely because the frontier is now terminal.
+        hold_policy = {}
+        if any(
+            hold.get("reason") == PRE_FRONTIER_BACKLOG_HOLD_REASON
+            for hold in operational_before.get("holds", ())
+        ):
+            hold_policy["pre_frontier_hold_watermark"] = max(
+                int(event["ledger_seq"]) for event in events
+            )
         operational_after = _campaign_operational_partition_snapshot(
             proving_store=proving_store,
             unpublished_store=unpublished_store,
             authority_store=authority_path,
             observed_at=completed_at,
             unpublished_connection=connection,
+            **hold_policy,
         )
         objective_evidence = _campaign_completion_evidence(
             connection,
