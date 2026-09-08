@@ -3,12 +3,16 @@
 **Status:** Proposed — owner review required
 **Owner:** Product owner
 **Prepared:** 2026-07-24
-**Canonical language:** English
+**Canonical language:** UK English
 **Review base:** `main@5fcd8bc862e552961b6b147572879e79c7266931`
 **Parent programme:** [`2026-07-16-005-native-graphrag-production-implementation.md`](2026-07-16-005-native-graphrag-production-implementation.md)
 **Immediate predecessor package:** [`2026-07-24-008-increment-2-complete-fixture-readiness.md`](2026-07-24-008-increment-2-complete-fixture-readiness.md)
 **Canonical specification map:** [`../specs/editorial-automation/README.md`](../specs/editorial-automation/README.md)
 **Implementation authority:** None. This document prepares dependency, review, evidence and stop boundaries. It does not authorise code, source access, Graphiti, models, embeddings, search, spending, shadow, canary, publication, production activation or legacy retirement.
+
+**Currentness:** The Increment 11 section was reconciled on 2026-09-08 after
+PRE151. Earlier increment snapshots remain historical; current issue intent,
+Accepted ADRs/specifications and `AGENTS.md`/`REVIEW.md` govern current work.
 
 ## 1. Purpose
 
@@ -24,15 +28,15 @@ This is a readiness ladder, not a claim that every later increment is implementa
 
 1. Increment numbers are merge and verification boundaries, not independently activatable product stages.
 2. No increment inherits authority from the prior increment. Exact source, adapter, model, prompt, embedding, provider, Profile and deployment versions qualify separately.
-3. A future issue may exist while blocked, but no implementation branch begins until its entry gate is satisfied.
-4. Every implementation PR lists exact Accepted specifications and requirement IDs, exclusions, deferrals, evidence and rollback.
+3. Separate ordinary readiness/local engineering work authorised by the current issue from its blocked live or production effects. A production entry gate is not a prohibition on reconciling evidence or preparing a scope proposal.
+4. Use the current issue as change intent and reference affected Accepted contracts, exclusions, evidence and any relevant rollback; do not duplicate an implementation-complete issue into a new packet.
 5. SQLite and governed objects remain authority. Graph, vector and full-text systems remain rebuildable projections.
 6. Models, Graphiti, workers and retrieval systems propose or provide context. Deterministic or authorised controllers commit.
 7. GraphRAG remains mandatory in complete live shadow, canary and production, but never becomes editorial or publication authority.
 8. Failure, staleness, gaps and unavailable dependencies remain explicit; they never become no news, no prior match or editorial rejection.
-9. Every exact-head merge requires the repository’s applicable machine gates, actual-service evidence, current-head substantive review, zero unresolved P1/P2 findings and zero unresolved review threads.
+9. Follow the current `AGENTS.md` and `REVIEW.md`: deterministic Focus routing, one observed exact-head Focus success and one clean feature-complete review for ordinary merges. Actual-service evidence is conditional on the changed boundary; Full Repository Health is independent.
 10. Production activation, Operational Admission, Evidence Intake canary, publication authority and legacy retirement remain separate owner decisions.
-11. Later work may be re-partitioned into smaller PRs after current-head design review, but may not weaken these entry, stop or completion boundaries.
+11. Default to one issue, branch and ordinary PR per coherent change. Split only for an independent merge, rollback, owner, dependency or release boundary, not per gate or machine.
 
 ## 3. Dependency chain
 
@@ -55,10 +59,10 @@ Increment 9 production-equivalent integrated shadow
     ↓ accepted Evidence Intake authority and canary plan
 Increment 10 governed Evidence Intake canary
     ↓ accepted publication/activation authority and explicit owner decision
-Increment 11 production activation and legacy retirement
+Increment 11 bounded Hermes production activation
 ```
 
-The accepted programme permits carefully justified overlap after shared contracts merge. The default execution posture in this ladder is stricter: a blocked increment does not start until its predecessor closes, unless the owner explicitly authorises a bounded cross-cutting review unit and records why it cannot create premature runtime authority.
+The accepted programme permits justified overlap after shared contracts merge. Current issue intent determines ordinary development scope; predecessor evidence and exact effect authority still govern live and production starts. Planning or merging an ordinary change does not activate an increment.
 
 ---
 
@@ -644,100 +648,71 @@ Do not begin production activation or legacy retirement until Increment 10 close
 
 ---
 
-# Increment 11 — Production activation and legacy retirement
+# Increment 11 — Bounded Hermes production activation
 
-**Readiness state:** Activation checklist prepared; implementation and activation blocked
-**Dependency:** Increment 10 completed with qualifying outcome
-**Normative blocker:** Publication-facing specifications remain Draft unless separately accepted or explicitly authorised
-**Owner gate:** One explicit activation decision binding every mandatory relational and GraphRAG version
+**Current readiness delta and first-scope proposal:** [issue #151](https://github.com/fol2/newsroom/issues/151)
+**PRE151 dependency:** [#895 complete](https://github.com/fol2/newsroom/issues/895#issuecomment-5583562931); this is not production admission
+**Readiness state:** Documentary reconciliation authorised; live qualification and activation retain their exact entry controls
+**Specification status:** All eight publication-facing specifications are Accepted as checked on `fe01aee037f85f5a25f727810b17b730a1007ee9`; production policy and evidence currentness are separate
+**Owner gate:** Formal 11R and exact production activation remain subject to #564 and the applicable admission/activation decisions
 
 ## Objective
 
-Activate one exact admitted Newsroom deployment with mandatory GraphRAG and governed downstream authority, then drain and retire the legacy Brave/RSS/GDELT/per-link Gemini/destructive-merge/quota paths under explicit compatibility, rollback and audit controls.
+Activate one exact admitted Hermes deployment with mandatory GraphRAG and governed downstream authority. The first public target is the integrated app-serving system and native readers. [ADR 0009](../adr/0009-legacy-operational-newsroom-dead.md) declares the legacy operational stack dead: no compatibility period, dual-write or historical import. Separately authorised tree deletion does not block 11B. RSS/Atom remains a valid Source Definition transport.
 
-## Required accepted authority
+## Reuse and actual remaining evidence
 
-Before implementation or activation, the owner must accept or explicitly authorise applicable requirements from:
+The eight publication-facing specifications no longer present a Draft-status blocker. Their Accepted requirements still govern autonomy, evidence, presentation, rights/visuals, sensitive content, lifecycle/audit, publication engineering and quality/change control. Do not confuse accepted text with qualified production values or a deployed adapter.
 
-- autonomy and publication control;
-- story eligibility and evidence;
-- content generation and presentation;
-- rights and visuals;
-- sensitive content and escalation;
-- publication lifecycle and audit;
-- publication engineering and projection control; and
-- quality evaluation and change control.
+The #557 decision inventory and 9Q qualification mechanisms are complete; #760 implements the production-admission mechanism. PRE151 proves the bounded admitted-only Graphiti outcome. None supplies a production freeze, a qualifying shadow/live-canary closeout, current production admission or an activation instruction by inheritance.
 
-The current Draft status of those documents means the master roadmap alone cannot supply final public-effect authority.
+Use #151 for the exact remaining delta: deployment/Operational Profile and seven evaluated identities; current runtime, rights/terms, credentials and egress; qualifying shadow/canary; production coverage and spend accounting; recovery and public-effect readiness; and the actual admission/activation decisions. Reuse evidence with valid identity/provenance. The twenty First I/O records and sixteen production-admission checks are separate inventories, not thirty-six new engineering milestones.
 
-## Prepared activation packet
+The completed PRE151 cohort does not turn visible historical holds into terminal production coverage or settle unrelated spend. Production coverage and accounting must satisfy their own typed contracts; scope changes require explicit qualification, not omitted rows or invented zero balances.
 
-The explicit activation decision must bind:
+## Activation binding
 
-- command service and authentication/authorisation versions;
-- SQLite schema, migrations, object store, audit and backup versions;
-- source portfolio, adapters, rights and Operational Profiles;
-- ontology, Neo4j, projectors, Graphiti, entity/relation admission and indexes;
-- model, prompt, embedding, chunking, normalisation and retrieval versions;
-- triage, outcome, Candidate and Evidence Intake versions;
-- evidence, drafting, validation, publication and correction authorities;
-- deployment manifest, secrets, networks, licences and intended hardware;
-- monitoring, alerts, on-call ownership, capacity and budgets;
-- canary evidence and unresolved accepted risks;
-- activation scope, start time, stop conditions and rollback target;
-- legacy read, write, import and dual-write policy;
-- data migration or deliberate non-migration decision;
-- public-effect reconciliation and incident procedure; and
-- legacy drain and retirement criteria.
+One exact manifest and its evidence must bind:
 
-A manifest missing, disabling, faking or incompatibly replacing mandatory GraphRAG is invalid.
+- command/authentication versions, schema/migrations, authoritative objects and store identity;
+- source portfolio, Operational Profile, rights, credentials and egress;
+- ontology, real Neo4j, governed projectors, isolated Graphiti proposals, admission and indexes;
+- models, prompts, embeddings, chunking, normalisation and production retrieval;
+- triage/Candidate, Evidence Intake, publication adapters and handoff non-effect identities;
+- the Accepted publication specifications and their applicable production policy values;
+- deployment hardware, service roles, capacity, monitoring, incident controls and finite allocations;
+- qualifying shadow/canary evidence and tested, identity-matched backup/restore/rollback; and
+- exact activation scope, start/stop conditions, public-effect reconciliation and recovery target.
 
-## Prepared review units
+A manifest missing, disabling, faking or incompatibly replacing mandatory GraphRAG is invalid. A no-writer daemon cycle is only runtime qualification, not a complete GraphRAG shadow, canary or production slice. The existing complete path and #151's smallest scope proposal remain the reference; do not introduce a graphless first-production stage.
 
-### 11R — Accepted activation and retirement plan
+## Review and effect boundaries
 
-Documentation and explicit owner decision only.
+These labels do not require a separate issue or PR per item:
 
-### 11A — Production manifest and readiness enforcement
+- **11R — Formal activation-plan decision:** the separate owner decision after the qualifying evidence and production admission required by #564. Readiness reconciliation or a scope proposal is not this decision.
+- **11A — Exact manifest and readiness enforcement:** reuse the implemented contracts; change only demonstrated gaps in identity, GraphRAG, role, schema or recovery enforcement.
+- **11B — Bounded production activation:** activate only the exact approved scope with acknowledgement, reconciliation, containment, monitoring and rollback. No implicit expansion follows success.
+- **11C — New-system pending-effect reconciliation:** not legacy drain, compatibility, dual-write or historical import.
+- **11D — Remaining in-scope retirement decision:** only for components actually still in scope; dead legacy code deletion is separate and not a prerequisite to 11B.
 
-Implement exact-version validation, required GraphRAG components, secrets and role checks, schema compatibility, backup/restore readiness, no-fake checks and rollback target validation.
+## Entry and completion
 
-### 11B — Bounded production activation
+The current owner instruction permits #151's readiness reconciliation and first-scope proposal without first approving the finished activation plan. Ordinary changes follow current Focus Gates and one feature-complete review, not repeated research/review councils or Full Repository Health in the critical path.
 
-Activate only the exact approved scope with public-effect reconciliation, containment, monitoring and rollback. No implicit expansion follows a successful start.
+Actual live qualification and production entry retain the accepted #564 sequence: exact minimum Hermes runtime and freeze/First I/O records; a `SCOPED_OPERATIONAL_ELIGIBILITY` shadow; an `ELIGIBLE_FOR_ACTIVATION_PLANNING` live Evidence Intake canary; current production admission binding the seven identities; then a separate formal 11R decision and exact activation authority. Current rights, security, coverage, spend and tested recovery/public-effect controls remain required at their affected boundaries. The historical Increment 10 `BLOCKED_ACTIVE_COVERAGE` fixture disposition is not rewritten by PRE151.
 
-### 11C — Legacy drain and compatibility period
-
-Stop legacy creation of new authority, reconcile pending jobs and external effects, preserve audit and required historical access, and avoid silent dual write. Historical import requires its own idempotent adapter and decision.
-
-### 11D — Legacy retirement decision
-
-Retire each legacy component only after explicit criteria pass. Preserve required rollback artefacts, records and public correction capability. Retirement is not inferred from low use or elapsed time.
-
-## Entry gate
-
-Increment 11 remains blocked until:
-
-- Increment 10 closes with qualifying evidence;
-- all required public-effect specifications are Accepted or explicitly authorised;
-- every exact component has current Evaluation and Operational Admission;
-- the activation and retirement plan is owner-approved;
-- rollback, restore, correction and incident procedures are tested; and
-- unresolved Active coverage, rights, licence, security or capacity blockers are absent or explicitly accepted where allowed.
-
-## Completion gate
-
-Increment 11 closes only after the exact target deployment is activated under explicit owner authority, public effects reconcile correctly, required monitoring and rollback remain healthy, legacy work is safely drained, retirement criteria pass and the final repository status accurately states what is active, retained, deprecated and removed.
+Close #151 only after its exact approved deployment scope is activated, public effects reconcile, monitoring/recovery remain healthy and signed closeout accurately states active, held and excluded scope. Legacy resurrection or deletion is not an added completion requirement. Full seal under 60 seconds remains a non-blocking efficiency backlog, not a new planning or PRE151 gate.
 
 ## Stop boundary
 
-No further automatic expansion, new source, locality, model, provider, publication surface or public-effect scope is inherited from activation. Every material change returns to accepted change-control, evaluation, Operational Admission, canary and activation boundaries.
+This roadmap update performs no live/provider operation, production-admission mint, activation, publication, deletion or public dispatch. No successful bounded start grants automatic expansion to another source, locality, model, provider, publication surface or public-effect scope. Material changes return only to the affected accepted change-control, evaluation and effect boundaries.
 
 ---
 
 ## 4. Prepared issue posture
 
-The recommended GitHub issue state is:
+The earlier prepared issue snapshots are retained below, except for the reconciled Increment 11 entry. Current issues, not these historical snapshots, determine live status:
 
 - Increment 2: open and ready for owner review; implementation blocked until the Increment 2 readiness package is accepted.
 - Increment 3: open, `Prepared / blocked by Increment 2`.
@@ -748,9 +723,9 @@ The recommended GitHub issue state is:
 - Increment 8: open, `Prepared / blocked by Increment 7 and numerical Evaluation/Operational Plan decisions`.
 - Increment 9: open, `Decision packet prepared / blocked by Increment 8 and separate owner-approved shadow plan`.
 - Increment 10: open, `Contract gate prepared / blocked by Increment 9 and accepted Evidence Intake authority`.
-- Increment 11: open, `Activation checklist prepared / blocked by Increment 10 and accepted publication/activation authority`.
+- Increment 11: open; current readiness delta and proposed first scope are in #151. PRE151 is complete; formal production qualification/admission and activation are distinct outstanding boundaries.
 
-Blocked issues must not be represented as in progress, executable or production-authorised.
+A blocked production effect must not be represented as authorised. Separately scoped readiness/local engineering may proceed under current issue intent without claiming the production gate has passed.
 
 ## 5. Programme-level completion rule
 
@@ -759,5 +734,5 @@ The accepted programme is not “finished” merely because documents and blocke
 1. Increments 2–8 are implemented, reviewed and merged with exact evidence;
 2. Increment 9 completes an owner-approved production-equivalent shadow with an explicit qualifying decision;
 3. Increment 10 completes a governed Evidence Intake canary under accepted authority;
-4. Increment 11 receives explicit production activation authority and safely retires the legacy system; and
+4. Increment 11 receives exact production activation authority and completes its approved Hermes scope, with any genuinely in-scope retirement handled under ADR 0009; and
 5. every Accepted requirement traces to code, configuration, evidence, control or a documented retained procedure with no unresolved blocker hidden by aggregate success.
