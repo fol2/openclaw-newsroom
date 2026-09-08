@@ -9,6 +9,7 @@ import pytest
 
 from newsroom.authority import (
     AuthenticationProof,
+    IdempotencyIdentityConflict,
     ObjectLimits,
     StaticAuthenticator,
     StaticAuthorizer,
@@ -97,9 +98,8 @@ def test_operational_graphiti_write_scopes_follow_canonical_commands() -> None:
     }
 
 
-def _unit() -> CorpusIngestUnit:
+def _unit(*, item_key: str = "current-item") -> CorpusIngestUnit:
     source_id = "UK-01"
-    item_key = "current-item"
     headline = "Current headline"
     body = "Current body with exact retained bytes."
     canonical_url = "https://example.test/current-item"
@@ -1329,5 +1329,85 @@ def test_operational_generation_identity_resumes_across_observation_times(
             bootstrap=bootstrap,
             configuration=configuration,
         )[0] != stable_id
+    finally:
+        system.close()
+
+
+def test_frontier_bootstrap_replays_source_version_when_proving_run_changes(
+    tmp_path: Path,
+) -> None:
+    retained = _unit()
+    system = _open_operational_test_system(tmp_path)
+    try:
+        bootstrap_operational_authority(system, proof=_PROOF, plan=_plan(retained))
+        frontier = replace(
+            _unit(item_key="frontier-item"), proving_run_id="rights-run-2"
+        )
+        rights = {**_rights(), "rights_authority_run_id": "rights-run-2"}
+        with pytest.raises(IdempotencyIdentityConflict):
+            system.sources.record_definition_version(
+                _source_requests(frontier, rights)[1], proof=_PROOF
+            )
+        with sqlite3.connect(tmp_path / "authority.sqlite3") as authority:
+            before = authority.execute(
+                "SELECT canonical_bytes FROM source_definition_versions"
+            ).fetchall()
+        plan = replace(
+            _plan(frontier),
+            candidate_events=(
+                {
+                    "kind": "FRESH_EVENT",
+                    "ledger_seq": 2,
+                    "event_id": digest_canonical({"event": "frontier"}),
+                    "manifest_digest": digest_canonical({"manifest": "frontier"}),
+                    "ingest_ids": [frontier.ingest_id],
+                },
+            ),
+            units=(frontier,),
+            rights_by_source=((frontier.source_id, rights),),
+            revision_predecessors=_revision_predecessor_bindings((frontier,)),
+            cohort_digest=digest_canonical({"cohort": "frontier"}),
+            plan_digest=digest_canonical({"plan": "frontier"}),
+        )
+        second, binder = bootstrap_operational_authority(
+            system, proof=_PROOF, plan=plan
+        )
+        rebound = binder(frontier)
+        access = next(
+            record
+            for record in rebound.authority.records
+            if record["record_type"] == "OBJECT_ACCESS_DECISION"
+        )
+        assert second.bound_units[0].ingest_id == frontier.ingest_id
+        assert access["rights_authority_run_id"] == "rights-run-2"
+        with sqlite3.connect(tmp_path / "authority.sqlite3") as authority:
+            assert (
+                authority.execute(
+                    "SELECT canonical_bytes FROM source_definition_versions"
+                ).fetchall()
+                == before
+            )
+        with pytest.raises(
+            GraphitiOperationalReadinessError,
+            match="explicit rights-packet change",
+        ):
+            bootstrap_operational_authority(
+                system,
+                proof=_PROOF,
+                plan=replace(
+                    plan,
+                    rights_by_source=(
+                        (
+                            frontier.source_id,
+                            {
+                                **rights,
+                                "packet_digest": digest_canonical(
+                                    {"rights": "changed"}
+                                ),
+                            },
+                        ),
+                    ),
+                ),
+            )
     finally:
         system.close()
