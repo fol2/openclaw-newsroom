@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import sqlite3
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
+from newsroom.authority.canonical import canonical_json_bytes
 from newsroom.authority.story_candidate_system import _create_story_candidate_read_port
 from newsroom.increment10.ingress import (
     NON_PUBLIC_EVIDENCE_INTAKE_BOUNDARY,
     EvidenceIntakeError,
+    EvidenceIntakeIngress,
+    IntakeAcknowledgement,
     open_evidence_intake_ingress,
 )
 from newsroom.tests import test_increment6e2_candidate_store as candidate_fixture
@@ -87,6 +91,52 @@ def test_receive_binds_exact_authority_version_and_is_receipt_only(
     assert ingress.receipt(acknowledgement.receipt_id) == acknowledgement
     ingress.close()
     candidate_connection.close()
+
+
+def test_ingress_construction_is_factory_private() -> None:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    with pytest.raises(EvidenceIntakeError, match="construction is private"):
+        EvidenceIntakeIngress(
+            object(), connection, NON_PUBLIC_EVIDENCE_INTAKE_BOUNDARY
+        )
+    connection.close()
+
+
+def test_factory_rejects_ephemeral_sqlite() -> None:
+    with pytest.raises(EvidenceIntakeError, match="file-backed"):
+        open_evidence_intake_ingress(":memory:")
+
+
+def test_acknowledgement_rejects_forged_handoff_and_receipt_identity() -> None:
+    value = {
+        "request_id": "request-1",
+        "handoff_id": "intake-handoff:sha256:" + "0" * 64,
+        "receipt_id": "intake-receipt:sha256:" + "1" * 64,
+        "candidate_version_id": "candidate-version-1",
+        "candidate_version_digest": "sha256:" + "2" * 64,
+        "governing_manifest_digest": "sha256:" + "3" * 64,
+        "boundary_id": NON_PUBLIC_EVIDENCE_INTAKE_BOUNDARY,
+        "received_epoch_seconds": 1,
+    }
+    acknowledgement_id = (
+        "intake-acknowledgement:sha256:"
+        + sha256(
+            canonical_json_bytes(
+                {
+                    name: value[name]
+                    for name in (
+                        "request_id",
+                        "handoff_id",
+                        "receipt_id",
+                        "received_epoch_seconds",
+                    )
+                }
+            )
+        ).hexdigest()
+    )
+
+    with pytest.raises(EvidenceIntakeError, match="Handoff identity"):
+        IntakeAcknowledgement(acknowledgement_id, **value)
 
 
 def test_manifest_mismatch_and_public_boundary_fail_before_receipt(
@@ -214,6 +264,89 @@ def test_request_identity_cannot_cross_candidate_versions(tmp_path: Path) -> Non
     candidate_connection.close()
 
 
+def test_open_handle_rejects_cross_receipt_corruption_without_history_change(
+    tmp_path: Path,
+) -> None:
+    candidate_connection, port, versions = _candidates(
+        tmp_path, "record-1", "record-2"
+    )
+    database = tmp_path / "intake.sqlite3"
+    ingress = open_evidence_intake_ingress(database)
+    first = _receive(
+        ingress,
+        candidate_connection,
+        port,
+        versions[0],
+        request_id="request-1",
+        at=1,
+    )
+    second = _receive(
+        ingress,
+        candidate_connection,
+        port,
+        versions[1],
+        request_id="request-2",
+        at=2,
+    )
+
+    external = sqlite3.connect(database)
+    second_bytes = external.execute(
+        "SELECT canonical_bytes FROM evidence_intake_acknowledgements "
+        "WHERE acknowledgement_id=?",
+        (second.acknowledgement_id,),
+    ).fetchone()[0]
+    external.execute(
+        "UPDATE evidence_intake_acknowledgements SET canonical_bytes=? "
+        "WHERE acknowledgement_id=?",
+        (second_bytes, first.acknowledgement_id),
+    )
+    external.commit()
+    before = tuple(
+        external.execute(
+            "SELECT request_id,handoff_id,acknowledgement_id,"
+            "observed_epoch_seconds FROM evidence_intake_attempts "
+            "ORDER BY request_id"
+        )
+    )
+    external.close()
+
+    with pytest.raises(EvidenceIntakeError, match="retained acknowledgement"):
+        ingress.receipt(first.receipt_id)
+    with pytest.raises(EvidenceIntakeError, match="retained acknowledgement"):
+        _receive(
+            ingress,
+            candidate_connection,
+            port,
+            versions[0],
+            request_id="request-1",
+            at=3,
+        )
+    with pytest.raises(EvidenceIntakeError, match="retained acknowledgement"):
+        _receive(
+            ingress,
+            candidate_connection,
+            port,
+            versions[0],
+            request_id="request-retry",
+            at=3,
+        )
+
+    assert ingress.receipt_count == 2
+    assert ingress.attempt_count == 2
+    unchanged = sqlite3.connect(database)
+    after = tuple(
+        unchanged.execute(
+            "SELECT request_id,handoff_id,acknowledgement_id,"
+            "observed_epoch_seconds FROM evidence_intake_attempts "
+            "ORDER BY request_id"
+        )
+    )
+    unchanged.close()
+    assert after == before
+    ingress.close()
+    candidate_connection.close()
+
+
 def test_reopen_rejects_retained_logical_corruption(tmp_path: Path) -> None:
     candidate_connection, port, version = _candidate(tmp_path)
     database = tmp_path / "intake.sqlite3"
@@ -233,5 +366,23 @@ def test_reopen_rejects_retained_logical_corruption(tmp_path: Path) -> None:
     connection.close()
 
     with pytest.raises(EvidenceIntakeError, match="retained intake"):
+        open_evidence_intake_ingress(database)
+    candidate_connection.close()
+
+
+def test_reopen_rejects_handoff_without_acknowledgement(tmp_path: Path) -> None:
+    candidate_connection, port, version = _candidate(tmp_path)
+    database = tmp_path / "intake.sqlite3"
+    ingress = open_evidence_intake_ingress(database)
+    _receive(ingress, candidate_connection, port, version, request_id="request-1")
+    ingress.close()
+
+    connection = sqlite3.connect(database)
+    connection.execute("DELETE FROM evidence_intake_attempts")
+    connection.execute("DELETE FROM evidence_intake_acknowledgements")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(EvidenceIntakeError, match="acknowledgement coverage"):
         open_evidence_intake_ingress(database)
     candidate_connection.close()

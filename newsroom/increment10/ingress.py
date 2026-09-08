@@ -21,6 +21,7 @@ _ACKNOWLEDGEMENT_SCHEMA = "newsroom.increment10.evidence-intake-acknowledgement.
 _APPLICATION_ID = 0x4E524549
 _SCHEMA_VERSION = 1
 _DIGEST_PREFIX = "sha256:"
+_INGRESS_TOKEN = object()
 
 
 class EvidenceIntakeError(ValueError):
@@ -89,6 +90,20 @@ class IntakeAcknowledgement:
             or self.received_epoch_seconds < 0
         ):
             raise EvidenceIntakeError("invalid received_epoch_seconds")
+        expected_handoff = _identity(
+            "intake-handoff",
+            {
+                "candidate_version_id": self.candidate_version_id,
+                "boundary_id": self.boundary_id,
+            },
+        )
+        if self.handoff_id != expected_handoff:
+            raise EvidenceIntakeError("acknowledgement Handoff identity differs")
+        expected_receipt = _identity(
+            "intake-receipt", {"handoff_id": expected_handoff}
+        )
+        if self.receipt_id != expected_receipt:
+            raise EvidenceIntakeError("acknowledgement receipt identity differs")
         expected = _identity(
             "intake-acknowledgement",
             {
@@ -186,7 +201,11 @@ class EvidenceIntakeIngress:
 
     __slots__ = ("__connection", "__boundary_id", "__closed")
 
-    def __init__(self, connection: sqlite3.Connection, boundary_id: str) -> None:
+    def __init__(
+        self, token: object, connection: sqlite3.Connection, boundary_id: str
+    ) -> None:
+        if token is not _INGRESS_TOKEN:
+            raise EvidenceIntakeError("Evidence Intake construction is private")
         self.__connection = connection
         self.__boundary_id = boundary_id
         self.__closed = False
@@ -256,15 +275,17 @@ class EvidenceIntakeIngress:
     def receipt(self, receipt_id: str) -> IntakeAcknowledgement:
         self._require_open()
         _text(receipt_id, "receipt_id")
-        row = self.__connection.execute(
-            "SELECT a.canonical_bytes FROM evidence_intake_acknowledgements a "
-            "JOIN evidence_intake_handoffs h ON h.handoff_id=a.handoff_id "
-            "WHERE h.receipt_id=?",
-            (receipt_id,),
-        ).fetchone()
-        if row is None:
-            raise EvidenceIntakeError("receipt is absent")
-        return IntakeAcknowledgement.from_canonical_bytes(bytes(row[0]))
+        try:
+            self.__connection.execute("BEGIN IMMEDIATE")
+            acknowledgement = self._verified_acknowledgement(receipt_id=receipt_id)
+            self.__connection.rollback()
+            return acknowledgement
+        except (sqlite3.Error, EvidenceIntakeError) as exc:
+            if self.__connection.in_transaction:
+                self.__connection.rollback()
+            if isinstance(exc, EvidenceIntakeError):
+                raise
+            raise EvidenceIntakeError("Evidence Intake receipt read failed") from exc
 
     def close(self) -> None:
         if not self.__closed:
@@ -309,12 +330,16 @@ class EvidenceIntakeIngress:
             if prior_request is not None:
                 if str(prior_request[0]) != handoff_id:
                     raise EvidenceIntakeError("request identity conflicts")
-                acknowledgement = self._acknowledgement(str(prior_request[1]))
+                acknowledgement = self._verified_acknowledgement(
+                    acknowledgement_id=str(prior_request[1]),
+                    expected_version=version,
+                    expected_request_id=request_id,
+                )
                 self.__connection.rollback()
                 return acknowledgement
 
             retained = self.__connection.execute(
-                "SELECT canonical_bytes FROM evidence_intake_handoffs "
+                "SELECT handoff_id FROM evidence_intake_handoffs "
                 "WHERE candidate_version_id=?",
                 (version.version_id,),
             ).fetchone()
@@ -363,9 +388,12 @@ class EvidenceIntakeIngress:
                     ),
                 )
             else:
-                if bytes(retained[0]) != handoff_bytes:
+                if str(retained[0]) != handoff_id:
                     raise EvidenceIntakeError("semantic intake duplicate conflicts")
-                acknowledgement = self._acknowledgement_for_handoff(handoff_id)
+                acknowledgement = self._verified_acknowledgement(
+                    handoff_id=handoff_id,
+                    expected_version=version,
+                )
                 if received_epoch_seconds < acknowledgement.received_epoch_seconds:
                     raise EvidenceIntakeError("replay precedes the retained receipt")
 
@@ -387,27 +415,130 @@ class EvidenceIntakeIngress:
                 raise
             raise EvidenceIntakeError("Evidence Intake transaction failed") from exc
 
-    def _acknowledgement(self, acknowledgement_id: str) -> IntakeAcknowledgement:
-        row = self.__connection.execute(
-            "SELECT canonical_bytes FROM evidence_intake_acknowledgements "
-            "WHERE acknowledgement_id=?",
-            (acknowledgement_id,),
-        ).fetchone()
-        if row is None:
-            raise EvidenceIntakeError("retained acknowledgement is absent")
-        return IntakeAcknowledgement.from_canonical_bytes(bytes(row[0]))
-
-    def _acknowledgement_for_handoff(
-        self, handoff_id: str
+    def _verified_acknowledgement(
+        self,
+        *,
+        acknowledgement_id: str | None = None,
+        handoff_id: str | None = None,
+        receipt_id: str | None = None,
+        expected_version: StoryCandidateVersion | None = None,
+        expected_request_id: str | None = None,
     ) -> IntakeAcknowledgement:
+        locators = tuple(
+            (column, value)
+            for column, value in (
+                ("a.acknowledgement_id", acknowledgement_id),
+                ("a.handoff_id", handoff_id),
+                ("h.receipt_id", receipt_id),
+            )
+            if value is not None
+        )
+        if len(locators) != 1:
+            raise EvidenceIntakeError("exactly one receipt locator is required")
+        column, value = locators[0]
         row = self.__connection.execute(
-            "SELECT canonical_bytes FROM evidence_intake_acknowledgements "
-            "WHERE handoff_id=?",
-            (handoff_id,),
+            "SELECT a.acknowledgement_id,a.handoff_id,a.canonical_bytes,"
+            "a.canonical_digest,h.candidate_version_id,"
+            "h.candidate_version_bytes,h.candidate_version_digest,"
+            "h.governing_manifest_digest,h.boundary_id,h.receipt_id,"
+            "h.canonical_bytes,h.canonical_digest "
+            "FROM evidence_intake_acknowledgements a "
+            "JOIN evidence_intake_handoffs h ON h.handoff_id=a.handoff_id "
+            f"WHERE {column}=?",
+            (value,),
         ).fetchone()
         if row is None:
             raise EvidenceIntakeError("retained acknowledgement is absent")
-        return IntakeAcknowledgement.from_canonical_bytes(bytes(row[0]))
+        try:
+            acknowledgement = IntakeAcknowledgement.from_canonical_bytes(
+                bytes(row[2])
+            )
+            version = StoryCandidateVersion.from_canonical_bytes(bytes(row[5]))
+        except (EvidenceIntakeError, CandidateContractError) as exc:
+            raise EvidenceIntakeError(
+                "retained acknowledgement content is corrupt"
+            ) from exc
+        expected_handoff_id = _identity(
+            "intake-handoff",
+            {
+                "candidate_version_id": version.version_id,
+                "boundary_id": self.__boundary_id,
+            },
+        )
+        expected_receipt_id = _identity(
+            "intake-receipt", {"handoff_id": expected_handoff_id}
+        )
+        handoff_bytes = canonical_json_bytes(
+            {
+                "handoff_id": expected_handoff_id,
+                "candidate_version_id": version.version_id,
+                "candidate_version_digest": version.canonical_digest,
+                "governing_manifest_digest": (
+                    version.governing_manifest.canonical_digest
+                ),
+                "boundary_id": self.__boundary_id,
+                "receipt_id": expected_receipt_id,
+            }
+        )
+        if (
+            tuple(row[:2])
+            != (acknowledgement.acknowledgement_id, expected_handoff_id)
+            or row[3] != digest_bytes(acknowledgement.canonical_bytes)
+            or tuple(row[4:])
+            != (
+                version.version_id,
+                version.canonical_bytes,
+                version.canonical_digest,
+                version.governing_manifest.canonical_digest,
+                self.__boundary_id,
+                expected_receipt_id,
+                handoff_bytes,
+                digest_bytes(handoff_bytes),
+            )
+            or (
+                acknowledgement.handoff_id,
+                acknowledgement.receipt_id,
+                acknowledgement.candidate_version_id,
+                acknowledgement.candidate_version_digest,
+                acknowledgement.governing_manifest_digest,
+                acknowledgement.boundary_id,
+            )
+            != (
+                expected_handoff_id,
+                expected_receipt_id,
+                version.version_id,
+                version.canonical_digest,
+                version.governing_manifest.canonical_digest,
+                self.__boundary_id,
+            )
+            or (expected_version is not None and version != expected_version)
+        ):
+            raise EvidenceIntakeError("retained acknowledgement binding differs")
+        primary = self.__connection.execute(
+            "SELECT handoff_id,acknowledgement_id,observed_epoch_seconds "
+            "FROM evidence_intake_attempts WHERE request_id=?",
+            (acknowledgement.request_id,),
+        ).fetchone()
+        if primary != (
+            expected_handoff_id,
+            acknowledgement.acknowledgement_id,
+            acknowledgement.received_epoch_seconds,
+        ):
+            raise EvidenceIntakeError("retained primary request binding differs")
+        if expected_request_id is not None:
+            replay = self.__connection.execute(
+                "SELECT handoff_id,acknowledgement_id,observed_epoch_seconds "
+                "FROM evidence_intake_attempts WHERE request_id=?",
+                (expected_request_id,),
+            ).fetchone()
+            if (
+                replay is None
+                or tuple(replay[:2])
+                != (expected_handoff_id, acknowledgement.acknowledgement_id)
+                or replay[2] < acknowledgement.received_epoch_seconds
+            ):
+                raise EvidenceIntakeError("retained replay request binding differs")
+        return acknowledgement
 
 
 def _install(connection: sqlite3.Connection, boundary_id: str) -> None:
@@ -441,6 +572,9 @@ def _verify(connection: sqlite3.Connection, boundary_id: str) -> None:
             or connection.execute("PRAGMA user_version").fetchone()[0]
             != _SCHEMA_VERSION
             or connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1
+            or str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            != "wal"
+            or connection.execute("PRAGMA synchronous").fetchone()[0] != 2
             or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok"
             or connection.execute("PRAGMA foreign_key_check").fetchone() is not None
         ):
@@ -532,6 +666,13 @@ def _verify(connection: sqlite3.Connection, boundary_id: str) -> None:
             ):
                 raise EvidenceIntakeError("retained intake acknowledgement differs")
             acknowledgements[acknowledgement.acknowledgement_id] = acknowledgement
+        if set(handoffs) != {
+            acknowledgement.handoff_id
+            for acknowledgement in acknowledgements.values()
+        }:
+            raise EvidenceIntakeError(
+                "retained intake acknowledgement coverage differs"
+            )
 
         primary_attempts: set[tuple[str, str, int]] = set()
         for row in connection.execute(
@@ -579,9 +720,18 @@ def open_evidence_intake_ingress(
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA busy_timeout=5000")
+        main_file = next(
+            row[2]
+            for row in connection.execute("PRAGMA database_list")
+            if row[1] == "main"
+        )
+        if not main_file:
+            raise EvidenceIntakeError(
+                "Evidence Intake requires a file-backed SQLite database"
+            )
         _install(connection, boundary_id)
         _verify(connection, boundary_id)
-        return EvidenceIntakeIngress(connection, boundary_id)
+        return EvidenceIntakeIngress(_INGRESS_TOKEN, connection, boundary_id)
     except EvidenceIntakeError:
         if connection is not None:
             connection.close()
