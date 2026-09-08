@@ -386,3 +386,54 @@ def test_reopen_rejects_handoff_without_acknowledgement(tmp_path: Path) -> None:
     with pytest.raises(EvidenceIntakeError, match="acknowledgement coverage"):
         open_evidence_intake_ingress(database)
     candidate_connection.close()
+
+
+def test_out_of_range_timestamp_cannot_poison_following_receive(tmp_path: Path) -> None:
+    candidate_connection, port, version = _candidate(tmp_path)
+    ingress = open_evidence_intake_ingress(tmp_path / "intake.sqlite3")
+    for index, invalid in enumerate((True, -1, 1.5, 2**53, 2**63)):
+        with pytest.raises(EvidenceIntakeError, match="received_epoch_seconds"):
+            _receive(
+                ingress, candidate_connection, port, version,
+                request_id=f"invalid-{index}", at=invalid,
+            )
+        assert ingress.receipt_count == ingress.attempt_count == 0
+    accepted = _receive(
+        ingress, candidate_connection, port, version, request_id="valid", at=1
+    )
+    assert ingress.receipt(accepted.receipt_id) == accepted
+    ingress.close()
+    candidate_connection.close()
+
+
+def test_unexpected_acknowledgement_failure_rolls_back_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from newsroom.increment10 import ingress as module
+
+    candidate_connection, port, version = _candidate(tmp_path)
+    database = tmp_path / "intake.sqlite3"
+    receiver = open_evidence_intake_ingress(database)
+    original_identity = module._identity
+    fail_once = True
+
+    def interrupted_identity(prefix: str, value: object) -> str:
+        nonlocal fail_once
+        if prefix == "intake-acknowledgement" and fail_once:
+            fail_once = False
+            raise RuntimeError("interrupted after Handoff insert")
+        return original_identity(prefix, value)
+
+    monkeypatch.setattr(module, "_identity", interrupted_identity)
+    with pytest.raises(RuntimeError, match="after Handoff insert"):
+        _receive(receiver, candidate_connection, port, version, request_id="failed")
+    assert receiver.receipt_count == receiver.attempt_count == 0
+    accepted = _receive(
+        receiver, candidate_connection, port, version, request_id="valid", at=2
+    )
+    receiver.close()
+    reopened = open_evidence_intake_ingress(database)
+    assert reopened.receipt(accepted.receipt_id) == accepted
+    assert reopened.receipt_count == reopened.attempt_count == 1
+    reopened.close()
+    candidate_connection.close()

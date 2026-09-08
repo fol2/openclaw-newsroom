@@ -9,7 +9,11 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
-from newsroom.authority.canonical import canonical_json_bytes, digest_bytes
+from newsroom.authority.canonical import (
+    MAX_SAFE_INTEGER,
+    canonical_json_bytes,
+    digest_bytes,
+)
 from newsroom.increment6.candidates import (
     CandidateContractError,
     StoryCandidateReadPort,
@@ -54,6 +58,11 @@ def _digest(value: object, field: str) -> str:
     return text
 
 
+def _epoch_seconds(value: object) -> None:
+    if type(value) is not int or not 0 <= value <= MAX_SAFE_INTEGER:
+        raise EvidenceIntakeError("invalid received_epoch_seconds")
+
+
 @dataclass(frozen=True, slots=True)
 class IntakeAcknowledgement:
     """Receipt for pinned admitted discovery input, with no effect authority."""
@@ -85,11 +94,7 @@ class IntakeAcknowledgement:
             raise EvidenceIntakeError(
                 "acknowledgement is outside the non-public boundary"
             )
-        if (
-            type(self.received_epoch_seconds) is not int
-            or self.received_epoch_seconds < 0
-        ):
-            raise EvidenceIntakeError("invalid received_epoch_seconds")
+        _epoch_seconds(self.received_epoch_seconds)
         expected_handoff = _identity(
             "intake-handoff",
             {
@@ -256,8 +261,7 @@ class EvidenceIntakeIngress:
                 "request differs from the retained non-public boundary"
             )
         _text(request_id, "request_id")
-        if type(received_epoch_seconds) is not int or received_epoch_seconds < 0:
-            raise EvidenceIntakeError("invalid received_epoch_seconds")
+        _epoch_seconds(received_epoch_seconds)
 
         try:
             version = candidate_port.require_retained_version_in_transaction(
@@ -409,11 +413,12 @@ class EvidenceIntakeIngress:
             self.__connection.commit()
             return acknowledgement
         except (sqlite3.Error, EvidenceIntakeError) as exc:
-            if self.__connection.in_transaction:
-                self.__connection.rollback()
             if isinstance(exc, EvidenceIntakeError):
                 raise
             raise EvidenceIntakeError("Evidence Intake transaction failed") from exc
+        finally:
+            if self.__connection.in_transaction:
+                self.__connection.rollback()
 
     def _verified_acknowledgement(
         self,
