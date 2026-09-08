@@ -1423,6 +1423,7 @@ def _historical_partition(
     resolved_units: tuple[CorpusIngestUnit, ...] = (),
     unit_resolution_available: bool = True,
     excluded_event_ids: frozenset[str] = frozenset(),
+    pre_frontier_hold_watermark: int | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Partition every effective landed revision without provider effects."""
 
@@ -1734,9 +1735,21 @@ def _historical_partition(
         int(candidate["ledger_seq"]) for candidate in candidate_events
     }
     pre_frontier_held: set[int] = set()
-    if frontier_ledger_seq in candidate_sequences:
+    if pre_frontier_hold_watermark is not None:
+        if (
+            type(pre_frontier_hold_watermark) is not int
+            or pre_frontier_hold_watermark not in events_by_ledger
+        ):
+            raise GraphitiEventReconciliationError(
+                "sealed frontier hold watermark is invalid"
+            )
+        frontier_ledger_seq = pre_frontier_hold_watermark
+    if (
+        pre_frontier_hold_watermark is not None
+        or frontier_ledger_seq in candidate_sequences
+    ):
         pre_frontier_held = {
-            seq for seq in candidate_sequences if seq != frontier_ledger_seq
+            seq for seq in candidate_sequences if seq < frontier_ledger_seq
         }
         candidate_events = _hold_current_preflight_candidates(
             assignments=assignments,
@@ -1835,11 +1848,12 @@ def graphiti_operational_partition_snapshot(
     *,
     authority: sqlite3.Connection,
     observed_at: datetime,
+    pre_frontier_hold_watermark: int | None = None,
 ) -> dict[str, object]:
     """Return the existing exact dispatch partition as bounded campaign evidence.
 
-    Bindable pre-frontier QUEUED stays held when the current event-ledger
-    frontier is itself a FRESH candidate. The event rows are not drained.
+    Bindable pre-frontier QUEUED stays held while the frontier is FRESH.
+    A completing campaign pins that same cut-off; later arrivals stay visible.
     """
 
     if observed_at.tzinfo is None:
@@ -1874,6 +1888,7 @@ def graphiti_operational_partition_snapshot(
         event_gap_decisions=gap_decisions,
         resolved_units=resolved_units,
         excluded_event_ids=excluded_event_ids,
+        pre_frontier_hold_watermark=pre_frontier_hold_watermark,
     )
 
     accepted_accounting_blockers = {

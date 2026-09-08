@@ -29,6 +29,7 @@ from newsroom.control_plane.graphiti_admission import (
     GraphitiGovernedDecision,
     GraphitiProjectionReconciliationReceipt,
 )
+from newsroom.control_plane.graphiti_event_reconciliation import GraphitiEventReconciliationError
 from newsroom.control_plane.graphiti_events import (
     GRAPHITI_EVENT_PROJECTION_GENERATION,
     GRAPHITI_EVENT_PROJECTOR_VERSION,
@@ -1729,9 +1730,11 @@ def _queued_rows(connection: sqlite3.Connection) -> list[tuple[object, ...]]:
     ]
 
 
+@pytest.mark.parametrize("frontier_state", ["CONFIGURATION_HELD", "DEAD_LETTER"])
 def test_empty_actionable_then_frontier_supply_excludes_old_bindable_queued(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    frontier_state: str,
 ) -> None:
     proving, _unpublished, connection = _stores(tmp_path)
     _nonterminal_obligation(
@@ -1790,6 +1793,48 @@ def test_empty_actionable_then_frontier_supply_excludes_old_bindable_queued(
     assert [item["ledger_seq"] for item in supplied["holds"]] == [1]
     assert supplied["holds"][0]["reason"] == PRE_FRONTIER_BACKLOG_HOLD_REASON
     assert _queued_rows(connection) == [(1, "QUEUED", 0), (2, "QUEUED", 0)]
+    connection.execute(
+        "UPDATE unpublished_graphiti_revision_events SET state=?,attempt_count=1 WHERE ledger_seq=2",
+        (frontier_state,),
+    )
+    connection.commit()
+    after = graphiti_operational_partition_snapshot(
+        proving_connection, connection, authority=authority, observed_at=NOW,
+        pre_frontier_hold_watermark=2,
+    )
+    assert after["actionable"] == []
+    assert after["holds"][0]["reason"] == PRE_FRONTIER_BACKLOG_HOLD_REASON
+    assert _queued_rows(connection)[0] == (1, "QUEUED", 0)
+    for invalid_pin in (True, "2", 999):
+        with pytest.raises(GraphitiEventReconciliationError, match="watermark is invalid"):
+            graphiti_operational_partition_snapshot(
+                proving_connection, connection, authority=authority, observed_at=NOW,
+                pre_frontier_hold_watermark=invalid_pin,
+            )
+    # The original cut-off does not suppress arrivals or missing-event gaps.
+    _nonterminal_obligation(connection, ledger_seq=3, item_key="arrival", ingest_id="arrival-ingest")
+    _nonterminal_obligation(connection, ledger_seq=4, item_key="later-arrival", ingest_id="later-ingest")
+    _nonterminal_obligation(connection, ledger_seq=5, item_key="gap", ingest_id="gap-ingest", with_event=False)
+    connection.commit()
+    monkeypatch.setattr(
+        "newsroom.control_plane.graphiti_steady_state.load_graphiti_units_from_connection",
+        lambda _connection, *, evaluated_at: tuple(
+            _current_unit(item_key=key, ingest_id=ingest)
+            for key, ingest in (
+                ("old-backlog", "old-ingest"), ("frontier", "frontier-ingest"),
+                ("arrival", "arrival-ingest"), ("later-arrival", "later-ingest"), ("gap", "gap-ingest"),
+            )
+        ),
+    )
+    with_arrivals = graphiti_operational_partition_snapshot(
+        proving_connection, connection, authority=authority, observed_at=NOW,
+        pre_frontier_hold_watermark=2,
+    )
+    assert [(item["ledger_seq"], item["kind"]) for item in with_arrivals["actionable"]] == [
+        (3, "FRESH_EVENT"), (4, "FRESH_EVENT"), (5, "PROJECT_EVENT_GAP"),
+    ]
+    assert with_arrivals["holds"][0]["reason"] == PRE_FRONTIER_BACKLOG_HOLD_REASON
+
     authority.close()
     proving_connection.close()
     connection.close()

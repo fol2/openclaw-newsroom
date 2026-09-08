@@ -1223,6 +1223,8 @@ def _operational_snapshot(
 
 def _campaign_completion_fixture(
     tmp_path: Path,
+    *,
+    with_pre_frontier_hold: bool = False,
 ) -> tuple[
     sqlite3.Connection,
     datetime,
@@ -1234,6 +1236,13 @@ def _campaign_completion_fixture(
 
     start = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
     connection = worker.connect(str(tmp_path / "unpublished.sqlite3"))
+    if with_pre_frontier_hold:
+        _insert_campaign_event(
+            connection,
+            ledger_seq=6,
+            state="QUEUED",
+            landed_at=start - timedelta(seconds=6),
+        )
     event_id = _insert_campaign_event(
         connection,
         ledger_seq=7,
@@ -1535,6 +1544,49 @@ def test_campaign_completion_reports_legitimate_hold_without_failing(
     connection.close()
 
 
+def test_campaign_completion_accepts_retained_pre_frontier_queued_hold(
+    tmp_path: Path,
+) -> None:
+    from scripts import hermes_graphiti_worker as worker
+
+    connection, start, event, before, _after = _campaign_completion_fixture(
+        tmp_path,
+        with_pre_frontier_hold=True,
+    )
+    hold = {
+        "ledger_seq": 6,
+        "event_id": "sha256:" + f"{6:064x}",
+        "reason": worker.PRE_FRONTIER_BACKLOG_HOLD_REASON,
+    }
+    before = _operational_snapshot(
+        observed_at=start,
+        actionable=before["actionable"],
+        holds=[hold],
+    )
+    after = _operational_snapshot(
+        observed_at=start + timedelta(seconds=10),
+        actionable=[],
+        holds=[hold],
+    )
+
+    evidence = _completion_evidence(
+        connection,
+        event=event,
+        before=before,
+        after=after,
+    )
+
+    states = connection.execute(
+        "SELECT ledger_seq,state FROM unpublished_graphiti_revision_events "
+        "ORDER BY ledger_seq"
+    ).fetchall()
+    assert states == [(6, "QUEUED"), (7, "TERMINAL")]
+    assert evidence["watermark"]["terminal_ledger_seq"] == 7
+    assert evidence["backlog"]["remaining_actionable_at_watermark"] == []
+    assert evidence["backlog"]["holds"] == [hold]
+    connection.close()
+
+
 @pytest.mark.parametrize("kind", ["PROJECT_EVENT_GAP", "UNCLASSIFIED_GAP"])
 def test_campaign_completion_stops_on_actionable_event_gap(
     tmp_path: Path,
@@ -1800,27 +1852,40 @@ def _campaign_resolved_units(campaign: Mapping[str, object]):
 @pytest.mark.parametrize(
     (
         "extra_fresh_candidate",
+        "pre_frontier_hold",
         "processing_seconds",
         "expected_sleeps",
         "expected_dispatch_budgets",
+        "expected_partition_watermarks",
     ),
     [
-        (False, 0.25, [0.75], [120.0, 119.0]),
-        (False, 1.25, [], [120.0, 118.75]),
-        (True, 0.0, [], []),
+        (False, False, 0.25, [0.75], [120.0, 119.0], [None, None]),
+        (False, False, 1.25, [], [120.0, 118.75], [None, None]),
+        (True, False, 0.0, [], [], [None]),
+        (False, True, 0.0, [1.0], [120.0, 119.0], [None, 3]),
     ],
-    ids=["fast-events", "slow-events", "fresh-candidate-race"],
+    ids=[
+        "fast-events",
+        "slow-events",
+        "fresh-candidate-race",
+        "retained-pre-frontier-hold",
+    ],
 )
 def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     extra_fresh_candidate: bool,
+    pre_frontier_hold: bool,
     processing_seconds: float,
     expected_sleeps: list[float],
     expected_dispatch_budgets: list[float],
+    expected_partition_watermarks: list[int | None],
 ) -> None:
     from scripts import hermes_graphiti_worker as worker
 
     campaign = _campaign()
+    if pre_frontier_hold:
+        for event in campaign["cohort"]["events"]:
+            event["ledger_seq"] += 1
     partition_events = list(campaign["cohort"]["events"])
     if extra_fresh_candidate:
         partition_events.append(
@@ -1843,6 +1908,7 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
     }
     calls: list[tuple[str, object]] = []
     dispatch_budgets: list[float] = []
+    partition_watermarks: list[int | None] = []
     corpus_loads = 0
 
     class FakeMonotonic:
@@ -1870,9 +1936,14 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
     def qualify(**kwargs: object) -> dict[str, object]:
         event_id = str(kwargs["event_id"])
         suffix = event_id.removeprefix("event-")
+        campaign_event = next(
+            event
+            for event in campaign["cohort"]["events"]
+            if event["event_id"] == event_id
+        )
         return {
             "event_id": event_id,
-            "ledger_seq": int(suffix),
+            "ledger_seq": campaign_event["ledger_seq"],
             "event_manifest_digest": f"manifest-{suffix}",
             "resolved_units": [{"ingest_id": f"ingest-{suffix}"}],
         }
@@ -1884,6 +1955,11 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
 
     def consume(**kwargs: object) -> GraphitiProcessResult:
         event_id = str(kwargs["event_id"])
+        campaign_event = next(
+            event
+            for event in campaign["cohort"]["events"]
+            if event["event_id"] == event_id
+        )
         calls.append(("extract", event_id))
         dispatch_budgets.append(float(kwargs["max_dispatch_seconds"]))
         assert kwargs["defer_graphiti_admission"] is True
@@ -1895,7 +1971,7 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
         monotonic.advance(processing_seconds)
         return GraphitiProcessResult(
             event_id,
-            int(event_id.removeprefix("event-")),
+            int(campaign_event["ledger_seq"]),
             "TERMINAL",
             1,
         )
@@ -1917,10 +1993,26 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
         "_assert_fresh_campaign_ingests",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        worker,
-        "_campaign_operational_partition_snapshot",
-        lambda **_kwargs: _operational_snapshot(
+
+    def operational_partition(**kwargs: object) -> dict[str, object]:
+        watermark = kwargs.get("pre_frontier_hold_watermark")
+        assert watermark is None or isinstance(watermark, int)
+        if watermark is not None:
+            assert [item for item in calls if item[0] == "extract"] == [
+                ("extract", "event-1"),
+                ("extract", "event-2"),
+            ]
+        partition_watermarks.append(watermark)
+        holds = []
+        if len(partition_watermarks) == 1 and pre_frontier_hold:
+            holds.append(
+                {
+                    "ledger_seq": 1,
+                    "event_id": "held-event",
+                    "reason": worker.PRE_FRONTIER_BACKLOG_HOLD_REASON,
+                }
+            )
+        return _operational_snapshot(
             observed_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
             actionable=[
                 _fresh_actionable(
@@ -1929,7 +2021,13 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
                 )
                 for event in partition_events
             ],
-        ),
+            holds=holds,
+        )
+
+    monkeypatch.setattr(
+        worker,
+        "_campaign_operational_partition_snapshot",
+        operational_partition,
     )
     monkeypatch.setattr(worker, "consume_next_graphiti_event", consume)
     monkeypatch.setattr(
@@ -2046,6 +2144,7 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
         }
         assert monotonic.sleeps == expected_sleeps
         assert dispatch_budgets == expected_dispatch_budgets
+        assert partition_watermarks == expected_partition_watermarks
         assert corpus_loads == 1
         connection.close()
         return
@@ -2072,6 +2171,7 @@ def test_bounded_campaign_requires_exact_candidate_snapshot_before_dispatch(
     assert report["success_objectives"] == objective_evidence
     assert monotonic.sleeps == expected_sleeps
     assert dispatch_budgets == expected_dispatch_budgets
+    assert partition_watermarks == expected_partition_watermarks
     assert corpus_loads == 1
     assert [item["state"] for item in report["events"]] == [
         "EXTRACTION_TERMINAL_CAMPAIGN_PENDING",
