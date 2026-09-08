@@ -303,6 +303,12 @@ def test_native_candidate_receipt_to_governed_package_reopens(tmp_path: Path) ->
     opaque_package_id = _admit(
         objects, "evidence.package", b"{}", "opaque-package"
     )
+    extra_record_id = _admit(
+        objects,
+        "evidence.record",
+        canonical_json_bytes({"record_id": "extra", "record_type": "RIGHTS_DECISION"}),
+        "extra-record",
+    )
     facade = _facade(objects, ingress, policies)
 
     candidate_connection.execute("BEGIN IMMEDIATE")
@@ -329,14 +335,30 @@ def test_native_candidate_receipt_to_governed_package_reopens(tmp_path: Path) ->
                 record_admission_ids=record_ids,
                 proof=proof(),
             )
+        with pytest.raises(EvidencePackageError, match="governed evidence records"):
+            facade.retain(
+                package,
+                receipt_id=acknowledgement.receipt_id,
+                candidate_port=candidate_port,
+                source_admission_ids=(source_id,),
+                record_admission_ids=record_ids + (extra_record_id,),
+                proof=proof(),
+            )
+        mutable_source_ids = list(package.source_ids)
+        mutable_package = replace(
+            package, source_ids=mutable_source_ids, passages=list(package.passages)
+        )
         retained = facade.retain(
-            package,
+            mutable_package,
             receipt_id=acknowledgement.receipt_id,
             candidate_port=candidate_port,
             source_admission_ids=(source_id,),
             record_admission_ids=record_ids,
             proof=proof(),
         )
+        mutable_source_ids.append("mutated-after-retain")
+        assert retained.package.source_ids == package.source_ids
+        assert retained.package.passages == package.passages
         replayed = facade.retain(
             package,
             receipt_id=acknowledgement.receipt_id,

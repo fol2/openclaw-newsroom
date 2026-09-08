@@ -213,6 +213,7 @@ class GovernedEvidencePackages:
     ) -> tuple[EvidencePackage, bytes]:
         if type(package) is not EvidencePackage or package.admitted_context is not None:
             raise EvidencePackageError("native package must use exact evidence values")
+        package = _package_from_value(evidence_package_value(package))
         if type(candidate_port) is not StoryCandidateReadPort:
             raise EvidencePackageError("authenticated Candidate read port required")
         try:

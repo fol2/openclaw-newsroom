@@ -1701,11 +1701,14 @@ def validate_governed_evidence_records(
     expected_types = _expected_governed_record_types(package)
     if expected_types is None:
         return None
-    rows = tuple(
-        row
-        for row in retained_records
-        if len(row) == 4 and row[0] in expected_types
-    )
+    rows = tuple(retained_records)
+    if any(
+        not isinstance(row, (tuple, list))
+        or len(row) != 4
+        or type(row[0]) is not str
+        for row in rows
+    ):
+        return None
     row_ids = tuple(row[0] for row in rows)
     if (
         len(rows) != len(expected_types)
